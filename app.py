@@ -42,7 +42,7 @@ from starlette.middleware.gzip import GZipMiddleware
 from dotenv import load_dotenv
 import yaml
 import pexpect
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageOps, ImageSequence, UnidentifiedImageError
 
 from codex_partner import APP_NAME, APP_VERSION
 from codex_partner.commands import SLASH_ALIASES, SLASH_COMMAND_BY_NAME, SLASH_COMMANDS, parse_slash_command
@@ -2395,7 +2395,9 @@ def websocket_auth_session(websocket: WebSocket) -> Optional[dict[str, Any]]:
 
 def profile_avatar_path(username: str) -> Path:
     profile_id = hashlib.sha256(username.encode("utf-8")).hexdigest()
-    return DATA_DIR / "profiles" / f"{profile_id}.webp"
+    root = DATA_DIR / "profiles" / profile_id
+    gif = root.with_suffix(".gif")
+    return gif if gif.is_file() else root.with_suffix(".webp")
 
 
 def profile_snapshot(username: str) -> dict[str, Any]:
@@ -2408,20 +2410,40 @@ def profile_snapshot(username: str) -> dict[str, Any]:
     }
 
 
-def avatar_webp(data_url: str) -> bytes:
+def avatar_file(data_url: str) -> tuple[bytes, str]:
     match = re.fullmatch(r"data:image/[A-Za-z0-9.+-]+;base64,([A-Za-z0-9+/=\r\n]+)", data_url.strip())
     if not match:
         raise HTTPException(400, "Avatar must be a base64 image")
     try:
         raw = base64.b64decode(match.group(1), validate=True)
         with Image.open(io.BytesIO(raw)) as source:
+            if getattr(source, "is_animated", False) and getattr(source, "n_frames", 1) > 1:
+                frames = []
+                durations = []
+                default_duration = int(source.info.get("duration", 100) or 100)
+                for frame in ImageSequence.Iterator(source):
+                    rendered = frame.convert("RGBA")
+                    rendered.thumbnail((512, 512), Image.Resampling.LANCZOS)
+                    frames.append(rendered.copy())
+                    durations.append(max(20, int(frame.info.get("duration", default_duration) or default_duration)))
+                output = io.BytesIO()
+                frames[0].save(
+                    output,
+                    "GIF",
+                    save_all=True,
+                    append_images=frames[1:],
+                    duration=durations,
+                    loop=int(source.info.get("loop", 0) or 0),
+                    disposal=2,
+                )
+                return output.getvalue(), ".gif"
             image = ImageOps.exif_transpose(source)
             image.thumbnail((512, 512), Image.Resampling.LANCZOS)
             if image.mode not in {"RGB", "RGBA"}:
                 image = image.convert("RGBA" if "transparency" in image.info else "RGB")
             output = io.BytesIO()
             image.save(output, "WEBP", quality=88, method=4)
-            return output.getvalue()
+            return output.getvalue(), ".webp"
     except (binascii.Error, UnidentifiedImageError, OSError, ValueError) as exc:
         raise HTTPException(415, "Avatar is not a supported image") from exc
 
@@ -3327,18 +3349,22 @@ async def get_profile_avatar(session: Any = Depends(auth)):
     path = profile_avatar_path(session["username"])
     if not path.is_file():
         raise HTTPException(404, "Avatar not found")
-    return FileResponse(path, media_type="image/webp", headers={"Cache-Control": "private, max-age=31536000, immutable"})
+    media_type = "image/gif" if path.suffix == ".gif" else "image/webp"
+    return FileResponse(path, media_type=media_type, headers={"Cache-Control": "private, max-age=31536000, immutable"})
 
 
 @app.put("/api/profile/avatar")
 async def update_profile_avatar(payload: AvatarIn, session: Any = Depends(auth)):
-    path = profile_avatar_path(session["username"])
+    content, suffix = avatar_file(payload.data_url)
+    profile_id = hashlib.sha256(session["username"].encode("utf-8")).hexdigest()
+    path = DATA_DIR / "profiles" / f"{profile_id}{suffix}"
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     path.parent.chmod(0o700)
     temporary = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
-    temporary.write_bytes(avatar_webp(payload.data_url))
+    temporary.write_bytes(content)
     temporary.chmod(0o600)
     temporary.replace(path)
+    path.with_suffix(".webp" if suffix == ".gif" else ".gif").unlink(missing_ok=True)
     profile = profile_snapshot(session["username"])
     await broadcast_profile(session["username"], profile)
     return profile

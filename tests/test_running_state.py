@@ -43,9 +43,10 @@ class RunningStateTests(unittest.TestCase):
 
     def test_avatar_is_persisted_per_login_and_broadcast_to_matching_devices(self):
         image = self.app.Image.new("RGB", (32, 32), "#ffd83e")
+        second_frame = self.app.Image.new("RGB", (32, 32), "#2f9e73")
         source = io.BytesIO()
-        image.save(source, "PNG")
-        data_url = "data:image/png;base64," + base64.b64encode(source.getvalue()).decode()
+        image.save(source, "GIF", save_all=True, append_images=[second_frame], duration=[80, 120], loop=0)
+        data_url = "data:image/gif;base64," + base64.b64encode(source.getvalue()).decode()
 
         class Socket:
             def __init__(self):
@@ -66,6 +67,11 @@ class RunningStateTests(unittest.TestCase):
             path = self.app.profile_avatar_path("avatar-user")
             self.assertTrue(path.is_file())
             self.assertEqual(0o600, path.stat().st_mode & 0o777)
+            with self.app.Image.open(path) as saved:
+                self.assertTrue(saved.is_animated)
+                self.assertEqual(2, saved.n_frames)
+            response = asyncio.run(self.app.get_profile_avatar({"username": "avatar-user"}))
+            self.assertEqual("image/gif", response.media_type)
             self.assertTrue(result["avatar_url"].startswith("/api/profile/avatar?v="))
             self.assertEqual("profile_updated", own_device.payloads[-1]["type"])
             self.assertFalse(other_user.payloads)
