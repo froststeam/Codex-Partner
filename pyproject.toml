@@ -8,6 +8,16 @@ version = "0.0.1"
 description = "A self-hosted web interface for managing persistent Codex tasks."
 readme = "README.md"
 requires-python = ">=3.10"
+keywords = ["codex", "agent", "task-management", "self-hosted"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Web Environment",
+  "Framework :: FastAPI",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: User Interfaces",
+]
 dependencies = [
   "fastapi>=0.110",
   "uvicorn[standard]>=0.27",
@@ -17,6 +27,11 @@ dependencies = [
   "python-dotenv>=1.0",
   "Pillow>=10.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/froststeam/Codex-Partner"
+Repository = "https://github.com/froststeam/Codex-Partner.git"
+Issues = "https://github.com/froststeam/Codex-Partner/issues"
 
 [project.scripts]
 codex-partner = "codex_partner.cli:main"

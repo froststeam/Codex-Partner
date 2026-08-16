@@ -2,7 +2,7 @@
 
 Codex Partner is a self-hosted control panel for long-running Codex work. It keeps one native Codex thread alive and lets terminals, browsers, and multiple devices interact with the same task.
 
-![Codex Partner task workspace](docs/codex-partner.png)
+![Codex Partner task workspace](https://raw.githubusercontent.com/froststeam/Codex-Partner/main/docs/codex-partner.png)
 
 ## Why
 
