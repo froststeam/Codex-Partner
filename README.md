@@ -86,4 +86,4 @@ View logs with `journalctl --user -u codex-partner.service -f`. To keep it runni
 
 Create a session, choose a workspace and model, then send a message. Messages sent during an active turn queue automatically. Set a Goal to let Codex Partner keep resuming unfinished work. Reopen the same session from any connected device to continue the same thread.
 
-Type `/help` in the message input for commands. Press `` ` `` to toggle the terminal, `Shift+N` / `Shift+P` to switch sessions, and `Ctrl/Cmd+K` to focus the composer.
+Type `/help` in the message input for commands. Press `` ` `` to toggle the terminal, `Shift+N` / `Shift+P` to switch sessions, and `Ctrl/Cmd+K` to focus or unfocus the composer.

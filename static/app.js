@@ -467,7 +467,13 @@ document.addEventListener("keydown", event => {
   toggleTerminalShortcut();
 }, true);
 document.addEventListener("keydown", event => {
-  if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "k") { event.preventDefault(); $("#message-input").focus(); return; }
+  if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "k") {
+    event.preventDefault();
+    const input = $("#message-input");
+    if (document.activeElement === input) input.blur();
+    else input.focus();
+    return;
+  }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n" && !event.shiftKey) { event.preventDefault(); createQuickSession(); }
   const target = event.target;
   const editing = target instanceof HTMLElement && target.closest("input, textarea, select, [contenteditable=\"true\"]");
