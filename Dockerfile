@@ -14,7 +14,7 @@ RUN python -m pip wheel --no-cache-dir --wheel-dir /wheels .
 FROM python:3.12-slim AS runtime
 
 ARG CODEX_VERSION=latest
-ARG APP_VERSION=0.0.1
+ARG APP_VERSION=0.0.2
 
 LABEL org.opencontainers.image.title="Codex Partner" \
       org.opencontainers.image.description="Self-hosted management for persistent Codex tasks" \
@@ -64,7 +64,7 @@ EXPOSE 8787
 STOPSIGNAL SIGTERM
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD ["python", "-c", "import os,urllib.request; port=os.getenv('CODEX_DASHBOARD_PORT','8787'); token=os.getenv('CODEX_DASHBOARD_TOKEN',''); headers={'Authorization':'Bearer '+token} if token else {}; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:'+port+'/api/health',headers=headers),timeout=4).read()"]
+  CMD ["python", "-c", "import os,urllib.request; port=os.getenv('CODEX_DASHBOARD_PORT','8787'); urllib.request.urlopen('http://127.0.0.1:'+port+'/api/live',timeout=4).read()"]
 
 ENTRYPOINT ["tini", "--"]
 CMD ["codex-partner"]

@@ -74,6 +74,11 @@ class SSHConnectIn(BaseModel):
     password: Optional[SecretStr] = None
 
 
+class SSHLoginIn(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: SecretStr
+
+
 class SkillIn(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     description: str = ""

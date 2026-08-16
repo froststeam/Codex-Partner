@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Codex Partner</title>
-  <link rel="stylesheet" href="/styles.css?v=20260816-model-picker" />
+  <link rel="stylesheet" href="/styles.css?v=20260816-composer-hitbox" />
   <link rel="stylesheet" href="/mascot-dance.css?v=20260816-game-sprites" />
   <link rel="stylesheet" href="/vendor/toastui-editor/toastui-editor.css" />
   <link rel="stylesheet" href="/vendor/toastui-editor/toastui-editor-dark.css" />
@@ -50,6 +50,7 @@
   <div id="panel" class="panel" aria-hidden="true"><div class="panel-inner"><button id="close-panel" class="close">×</button><div id="panel-content"></div></div></div>
   <div id="terminal-window" class="terminal-window" aria-hidden="true"><section class="terminal-shell" role="dialog" aria-modal="true" aria-labelledby="terminal-title"><header class="terminal-head"><div><span id="terminal-eyebrow" class="eyebrow">远程 Shell</span><h2 id="terminal-title">远程终端</h2><small id="terminal-cwd">未连接</small></div><div class="terminal-head-actions"><span id="terminal-status" class="terminal-status">未连接</span><button id="terminal-close" class="icon-action" title="关闭终端">×</button></div></header><div id="terminal-screen" class="terminal-screen" aria-label="远程终端输出"></div><footer class="terminal-foot"><span id="terminal-hint">点击终端后输入 · Enter 执行 · Ctrl+C 中断</span><button id="terminal-reconnect" class="secondary">重连</button></footer></section></div>
   <input id="workspace-upload-input" type="file" multiple hidden /><input id="user-avatar-file" type="file" accept="image/*" hidden />
+  <dialog id="ssh-login-dialog" class="app-dialog ssh-login-dialog" aria-labelledby="ssh-login-title"><form id="ssh-login-form"><div class="app-dialog-heading"><span class="mascot mascot-inline" aria-hidden="true"><i></i><b></b><em></em></span><div><h2 id="ssh-login-title">连接 Codex Partner</h2><p id="ssh-login-message">使用这台服务器的 SSH 账户登录。</p></div></div><div class="ssh-login-server"><span aria-hidden="true">&gt;_</span><strong id="ssh-login-server">SSH · 当前服务器</strong></div><label><span id="ssh-login-username-label">SSH 用户名</span><input id="ssh-login-username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required /></label><label><span id="ssh-login-password-label">SSH 密码</span><input id="ssh-login-password" name="password" type="password" autocomplete="current-password" required /></label><p id="ssh-login-error" class="ssh-login-error" role="alert"></p><div class="app-dialog-actions"><button type="submit" class="primary" id="ssh-login-submit">连接</button></div></form></dialog>
   <dialog id="app-dialog" class="app-dialog" aria-labelledby="app-dialog-title"><form id="app-dialog-form"><div class="app-dialog-heading"><span class="mascot mascot-inline" aria-hidden="true"><i></i><b></b><em></em></span><div><h2 id="app-dialog-title"></h2><p id="app-dialog-message"></p></div></div><label id="app-dialog-field" hidden><span id="app-dialog-label"></span><input id="app-dialog-input" autocomplete="off" /></label><div class="app-dialog-actions"><button type="button" class="secondary" id="app-dialog-cancel"></button><button type="submit" class="primary" id="app-dialog-confirm"></button></div></form></dialog>
   <div id="toast" class="toast" role="status"></div>
   <script src="/vendor/xterm/xterm.js"></script>
@@ -61,10 +62,10 @@
   <script src="/vendor/i18next/i18next.min.js"></script>
   <script src="/vendor/ace/ace.js"></script>
   <script src="/vendor/ace/ext-modelist.js"></script>
-  <script src="/core.js?v=20260816-status-reconcile"></script>
+  <script src="/core.js?v=20260816-release-002"></script>
   <script src="/mascot-dance.js?v=20260816-game-sprites"></script>
   <script src="/editor.js?v=20260816-game-sprites"></script>
-  <script src="/conversation.js?v=20260816-model-picker"></script>
+  <script src="/conversation.js?v=20260816-ssh-auth"></script>
   <script src="/settings.js?v=20260816-game-sprites"></script>
   <script src="/app.js?v=20260816-status-reconcile"></script>
 </body>

@@ -17,6 +17,7 @@ import pty
 import platform
 import re
 import signal
+import secrets
 import shlex
 import shutil
 import sqlite3
@@ -34,9 +35,8 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, StreamingResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.middleware.gzip import GZipMiddleware
 from dotenv import load_dotenv
 import yaml
@@ -65,6 +65,7 @@ from codex_partner.schemas import (
     ProviderVerifyIn,
     QuickTaskCreate,
     SSHConnectIn,
+    SSHLoginIn,
     SkillIn,
     SlashCommandIn,
     TaskCreate,
@@ -73,6 +74,7 @@ from codex_partner.schemas import (
     TaskPatch,
     WorkspaceFileUpdate,
 )
+from codex_partner.ssh_auth import LoginThrottle, verify_ssh_password
 
 try:
     import tomllib
@@ -88,7 +90,12 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "dashboard.sqlite3"
 CODEX_HOME = Path(os.getenv("CODEX_HOME", str(Path.home() / ".codex"))).expanduser().resolve()
 CODEX_MEMORY_DIR = CODEX_HOME / "memories"
-TOKEN = os.getenv("CODEX_DASHBOARD_TOKEN", "").strip()
+AUTH_MODE = os.getenv("CODEX_DASHBOARD_AUTH", "ssh").strip().lower()
+if AUTH_MODE not in {"ssh", "none"}:
+    raise RuntimeError("CODEX_DASHBOARD_AUTH must be 'ssh' or 'none'")
+AUTH_COOKIE = "codex_partner_session"
+AUTH_SESSION_TTL = max(300, int(os.getenv("CODEX_DASHBOARD_AUTH_TTL", "43200")))
+AUTH_SSH_HOST = os.getenv("CODEX_DASHBOARD_AUTH_SSH_HOST", "127.0.0.1").strip() or "127.0.0.1"
 CODEX_APP_SERVER_ENABLED = os.getenv("CODEX_APP_SERVER", "1").lower() not in {"0", "false", "no"}
 AUTO_RESUME = os.getenv("CODEX_DASHBOARD_AUTO_RESUME", "1").lower() not in {"0", "false", "no"}
 app_shutting_down = False
@@ -108,6 +115,7 @@ def configured_port(name: str, default: int) -> int:
 
 DASHBOARD_HOST = os.getenv("CODEX_DASHBOARD_HOST", "127.0.0.1").strip() or "127.0.0.1"
 DASHBOARD_PORT = configured_port("CODEX_DASHBOARD_PORT", 8787)
+AUTH_SSH_PORT = configured_port("CODEX_DASHBOARD_AUTH_SSH_PORT", 22)
 SSH_BIN = shutil.which("ssh") or "ssh"
 SSH_CONFIG = Path.home() / ".ssh/config"
 SSH_FIXED_HOST = os.getenv("CODEX_DASHBOARD_SSH_HOST", "").strip()
@@ -372,7 +380,8 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
-bearer = HTTPBearer(auto_error=False)
+auth_sessions: dict[str, dict[str, Any]] = {}
+login_throttle = LoginThrottle()
 running: dict[str, asyncio.subprocess.Process] = {}
 running_lock = asyncio.Lock()
 task_clients: dict[str, set[WebSocket]] = {}
@@ -2356,9 +2365,33 @@ async def supervise_appserver_turn(
     await drain_task_messages(task["id"])
 
 
-async def auth(credentials: HTTPAuthorizationCredentials = Depends(bearer)):
-    if TOKEN and (not credentials or credentials.credentials != TOKEN):
-        raise HTTPException(401, "Bearer token required")
+def active_auth_session(token: str) -> Optional[dict[str, Any]]:
+    session = auth_sessions.get(token)
+    if not session:
+        return None
+    if float(session.get("expires_at", 0)) <= time.time():
+        auth_sessions.pop(token, None)
+        return None
+    return session
+
+
+def request_auth_session(request: Request) -> Optional[dict[str, Any]]:
+    if AUTH_MODE == "none":
+        return {"username": getpass.getuser(), "expires_at": 0}
+    return active_auth_session(request.cookies.get(AUTH_COOKIE, ""))
+
+
+def websocket_auth_session(websocket: WebSocket) -> Optional[dict[str, Any]]:
+    if AUTH_MODE == "none":
+        return {"username": getpass.getuser(), "expires_at": 0}
+    return active_auth_session(websocket.cookies.get(AUTH_COOKIE, ""))
+
+
+async def auth(request: Request):
+    session = request_auth_session(request)
+    if not session:
+        raise HTTPException(401, "SSH login required")
+    return session
 
 
 def task_or_404(task_id: str) -> dict:
@@ -2890,8 +2923,7 @@ def set_terminal_size(fd: int, cols: int, rows: int) -> None:
 
 @app.websocket("/ws/terminal/{task_id}")
 async def terminal_socket(websocket: WebSocket, task_id: str):
-    token = websocket.query_params.get("token", "") or websocket.headers.get("authorization", "").removeprefix("Bearer ")
-    if TOKEN and token != TOKEN:
+    if not websocket_auth_session(websocket):
         await websocket.close(code=4401)
         return
     task = db.one("SELECT id,workspace,ssh_host FROM tasks WHERE id=?", (task_id,))
@@ -3202,6 +3234,73 @@ def markdown_rows(rows: list[dict], fields: list[tuple[str, str]], empty: str) -
     return "\n".join(result)
 
 
+def secure_request_cookie(request: Request) -> bool:
+    forwarded = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
+    return request.url.scheme == "https" or forwarded == "https"
+
+
+@app.get("/api/auth/status")
+async def auth_status(request: Request):
+    session = request_auth_session(request)
+    return {
+        "mode": AUTH_MODE,
+        "authenticated": bool(session),
+        "username": (session or {}).get("username", ""),
+        "server_hostname": socket.gethostname(),
+        "ssh_host": AUTH_SSH_HOST,
+        "ssh_port": AUTH_SSH_PORT,
+    }
+
+
+@app.get("/api/live")
+async def live():
+    return {"ok": True, "version": app.version}
+
+
+@app.post("/api/auth/login")
+async def ssh_login(payload: SSHLoginIn, request: Request):
+    if AUTH_MODE == "none":
+        return {"authenticated": True, "username": getpass.getuser()}
+    client = request.client.host if request.client else "unknown"
+    if not login_throttle.allowed(client):
+        raise HTTPException(429, "Too many failed SSH login attempts; try again later")
+    username = payload.username.strip()
+    valid, _detail = await asyncio.to_thread(
+        verify_ssh_password,
+        username,
+        payload.password.get_secret_value(),
+        host=AUTH_SSH_HOST,
+        port=AUTH_SSH_PORT,
+        known_hosts=DATA_DIR / "ssh-login-known-hosts",
+    )
+    if not valid:
+        login_throttle.fail(client)
+        raise HTTPException(401, "SSH username or password is incorrect")
+    login_throttle.clear(client)
+    token = secrets.token_urlsafe(32)
+    auth_sessions[token] = {"username": username, "expires_at": time.time() + AUTH_SESSION_TTL}
+    response = JSONResponse({"authenticated": True, "username": username})
+    response.set_cookie(
+        AUTH_COOKIE,
+        token,
+        max_age=AUTH_SESSION_TTL,
+        httponly=True,
+        secure=secure_request_cookie(request),
+        samesite="strict",
+        path="/",
+    )
+    return response
+
+
+@app.post("/api/auth/logout")
+async def ssh_logout(request: Request, response: Response):
+    token = request.cookies.get(AUTH_COOKIE, "")
+    if token:
+        auth_sessions.pop(token, None)
+    response.delete_cookie(AUTH_COOKIE, path="/", samesite="strict")
+    return {"authenticated": False}
+
+
 @app.get("/api/commands")
 async def list_slash_commands(_: Any = Depends(auth)):
     return {"version": app.version, "commands": SLASH_COMMANDS}
@@ -3216,7 +3315,7 @@ async def health(_: Any = Depends(auth)):
         "codex_available": CODEX_AVAILABLE,
         "codex_bin_source": CODEX_DISCOVERY.get("source", "missing"),
         "codex_install": None if CODEX_AVAILABLE else codex_install_plan(),
-        "token_required": bool(TOKEN),
+        "auth_mode": AUTH_MODE,
         "running": active,
         "server_user": getpass.getuser(),
         "server_hostname": socket.gethostname(),
@@ -4535,8 +4634,7 @@ async def steer_task_message(task_id: str, payload: TaskMessageIn, _: Any = Depe
 
 @app.websocket("/ws/overview")
 async def overview_socket(websocket: WebSocket):
-    token = websocket.query_params.get("token", "") or websocket.headers.get("authorization", "").removeprefix("Bearer ")
-    if TOKEN and token != TOKEN:
+    if not websocket_auth_session(websocket):
         await websocket.close(code=4401)
         return
     await websocket.accept()
@@ -4555,8 +4653,7 @@ async def overview_socket(websocket: WebSocket):
 
 @app.websocket("/ws/tasks/{task_id}")
 async def task_socket(websocket: WebSocket, task_id: str):
-    token = websocket.query_params.get("token", "") or websocket.headers.get("authorization", "").removeprefix("Bearer ")
-    if TOKEN and token != TOKEN:
+    if not websocket_auth_session(websocket):
         await websocket.close(code=4401)
         return
     if not db.one("SELECT id FROM tasks WHERE id=?", (task_id,)):

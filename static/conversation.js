@@ -576,11 +576,9 @@ async function selectWorkspaceDirectory() {
 
 async function workspaceFetch(path, options = {}, canPrompt = true) {
   const headers = { ...(options.headers || {}) };
-  if (authToken) headers.Authorization = `Bearer ${authToken}`;
   const response = await fetch(`/api${path}`, { ...options, headers });
   if (response.status === 401 && canPrompt) {
-    const token = await requestAccessToken();
-    if (token) { authToken = token.trim(); localStorage.setItem("codex-dashboard-token", authToken); return workspaceFetch(path, options, false); }
+    if (await requestSSHLogin()) return workspaceFetch(path, options, false);
   }
   return response;
 }
@@ -708,8 +706,7 @@ function connectOverviewSocket() {
   if (overviewSocket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(overviewSocket.readyState)) return;
   if (realtimeChannels.overview !== "reconnecting") setRealtimeChannel("overview", "connecting");
   const scheme = location.protocol === "https:" ? "wss" : "ws";
-  const token = authToken ? `?token=${encodeURIComponent(authToken)}` : "";
-  overviewSocket = new WebSocket(`${scheme}://${location.host}/ws/overview${token}`);
+  overviewSocket = new WebSocket(`${scheme}://${location.host}/ws/overview`);
   overviewSocket.onopen = () => { noteRealtime("overview"); setRealtimeChannel("overview", "live"); };
   overviewSocket.onmessage = event => {
     noteRealtime("overview"); setRealtimeChannel("overview", "live");
@@ -741,8 +738,9 @@ function connectOverviewSocket() {
     }
   };
   overviewSocket.onerror = () => setRealtimeChannel("overview", "reconnecting");
-  overviewSocket.onclose = () => {
+  overviewSocket.onclose = event => {
     overviewSocket = null;
+    if (event.code === 4401) { requestSSHLogin().then(ok => { if (ok) connectOverviewSocket(); }); return; }
     setRealtimeChannel("overview", "reconnecting");
     clearTimeout(overviewReconnectTimer);
     overviewReconnectTimer = setTimeout(() => { if (document.visibilityState !== "hidden") connectOverviewSocket(); }, 1200);
@@ -753,8 +751,8 @@ function connectSocket(id, reconnect = false) {
   if (!reconnect) socketPaused = false;
   if (socket) { socket.onclose = null; socket.close(); }
   setRealtimeChannel("task", reconnect ? "reconnecting" : "connecting");
-  const scheme = location.protocol === "https:" ? "wss" : "ws"; const token = authToken ? `?token=${encodeURIComponent(authToken)}` : "";
-  const nextSocket = new WebSocket(`${scheme}://${location.host}/ws/tasks/${id}${token}`);
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  const nextSocket = new WebSocket(`${scheme}://${location.host}/ws/tasks/${id}`);
   socket = nextSocket; socketTaskId = id;
   nextSocket.onopen = () => { noteRealtime("task"); setRealtimeChannel("task", "live"); if (state.selectedId === id && reconnect) refreshSelectedConversation(id); };
   nextSocket.onmessage = async event => {
@@ -796,9 +794,10 @@ function connectSocket(id, reconnect = false) {
     }
   };
   nextSocket.onerror = () => { if (socket === nextSocket && !socketPaused) setRealtimeChannel("task", "reconnecting"); };
-  nextSocket.onclose = () => {
+  nextSocket.onclose = event => {
     if (socket === nextSocket) socket = null;
     if (state.selectedId !== id) { setRealtimeChannel("task", "idle"); return; }
+    if (event.code === 4401) { requestSSHLogin().then(ok => { if (ok && state.selectedId === id) connectSocket(id, true); }); return; }
     if (socketPaused) { setRealtimeChannel("task", "paused"); return; }
     setRealtimeChannel("task", "reconnecting");
     socketReconnectTimer = setTimeout(() => connectSocket(id, true), 900);
@@ -865,8 +864,7 @@ function connectTerminal(taskId, reconnect = false) {
   terminalStatus(reconnect ? uiLabel("terminalReconnecting") : uiLabel("terminalConnecting"), reconnect ? "reconnecting" : "");
   setRealtimeChannel("terminal", reconnect ? "reconnecting" : "connecting");
   const scheme = location.protocol === "https:" ? "wss" : "ws";
-  const token = authToken ? `?token=${encodeURIComponent(authToken)}` : "";
-  const nextSocket = new WebSocket(`${scheme}://${location.host}/ws/terminal/${encodeURIComponent(taskId)}${token}`);
+  const nextSocket = new WebSocket(`${scheme}://${location.host}/ws/terminal/${encodeURIComponent(taskId)}`);
   terminalSocket = nextSocket;
   nextSocket.onopen = () => { noteRealtime("terminal"); terminalStatus(uiLabel("terminalConnecting")); sendTerminalResize(); terminalEmulator.focus(); };
   nextSocket.onmessage = event => {
@@ -878,10 +876,11 @@ function connectTerminal(taskId, reconnect = false) {
     if (data.type === "pong") { terminalStatus(uiLabel("terminalConnected"), "connected"); setRealtimeChannel("terminal", "live"); }
   };
   nextSocket.onerror = () => { if (terminalSocket === nextSocket) { terminalStatus(uiLabel("terminalReconnecting"), "reconnecting"); setRealtimeChannel("terminal", "reconnecting"); } };
-  nextSocket.onclose = () => {
+  nextSocket.onclose = event => {
     if (terminalSocket !== nextSocket) return;
     terminalSocket = null;
     const stillOpen = $("#terminal-window").classList.contains("open") && terminalTaskId === taskId;
+    if (event.code === 4401) { requestSSHLogin().then(ok => { if (ok && stillOpen) connectTerminal(taskId, true); }); return; }
     if (!terminalShouldReconnect || !stillOpen) { setRealtimeChannel("terminal", terminalShouldReconnect ? "idle" : "closed"); return; }
     terminalStatus(uiLabel("terminalReconnecting"), "reconnecting"); setRealtimeChannel("terminal", "reconnecting");
     const delay = Math.min(5000, 700 * (2 ** terminalReconnectAttempt));

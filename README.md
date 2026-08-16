@@ -48,19 +48,21 @@ codex-partner
 
 Open <http://127.0.0.1:8787>.
 
-For access from other devices, set `CODEX_DASHBOARD_HOST=0.0.0.0` and a strong `CODEX_DASHBOARD_TOKEN` in `.env`.
+For access from other devices, set `CODEX_DASHBOARD_HOST=0.0.0.0`. Codex Partner signs browsers in with a username and password accepted by this server's SSH service; the password is verified by OpenSSH and is never stored. Put HTTPS in front of the service before entering an SSH password over an untrusted network.
 
 ## Docker
 
 ```bash
-docker build -t codex-partner:0.0.1 .
+docker build -t codex-partner:0.0.2 .
 docker run -d --name codex-partner \
   -p 8787:8787 \
-  -e CODEX_DASHBOARD_TOKEN=replace-with-a-strong-random-token \
+  --add-host=host.docker.internal:host-gateway \
+  -e CODEX_DASHBOARD_AUTH=ssh \
+  -e CODEX_DASHBOARD_AUTH_SSH_HOST=host.docker.internal \
   -v codex-partner-data:/var/lib/codex-partner \
   -v codex-home:/home/codex/.codex \
   -v codex-workspace:/workspace \
-  codex-partner:0.0.1
+  codex-partner:0.0.2
 docker exec -it codex-partner codex login
 ```
 

@@ -285,7 +285,7 @@ const UI_LABELS = {
   tipSteps: { zh: "正在把线索拼成答案", en: "Turning clues into an answer", fr: "Les indices deviennent une réponse", ja: "手がかりを答えにまとめています", ko: "단서를 답으로 엮는 중" },
   tipContext: { zh: "正在检查有没有漏掉一步", en: "Checking for a missed step", fr: "Recherche d’une étape oubliée", ja: "見落とした手順がないか確認中", ko: "놓친 단계가 없는지 확인 중" },
   tipEvidence: { zh: "正在给答案做最后抛光", en: "Giving the answer a final polish", fr: "Dernière touche à la réponse", ja: "答えを最後に磨いています", ko: "답변을 마지막으로 다듬는 중" },
-  tipSteer: { zh: "新消息会在下一回合接上", en: "New messages join the next turn", fr: "Les nouveaux messages passent au prochain tour", ja: "新しいメッセージは次のターンへ", ko: "새 메시지는 다음 turn에 이어집니다" },
+  tipSteer: { zh: "需要时可把新消息插入当前回合", en: "New messages can be steered into the current turn", fr: "Les nouveaux messages peuvent être insérés dans le tour actuel", ja: "新しいメッセージを現在のターンに挿入できます", ko: "새 메시지를 현재 turn에 삽입할 수 있습니다" },
   tipGoal: { zh: "Goal 正沿着同一条线继续", en: "The goal keeps moving on this thread", fr: "L’objectif avance dans ce fil", ja: "Goal はこのスレッドで続いています", ko: "Goal은 이 스레드에서 계속됩니다" },
   tipContinue: { zh: "可以先喝口水，这里还在推进", en: "Take a short break; work continues here", fr: "Petite pause possible, le travail continue ici", ja: "ひと息ついても、作業は続いています", ko: "잠시 쉬어도 여기서 계속 진행됩니다" },
   queue: { zh: "队列", en: "Queue", fr: "File", ja: "キュー", ko: "대기열" },
@@ -323,8 +323,10 @@ const UI_LABELS = {
   confirmTitle: { zh: "确认操作", en: "Confirm action", fr: "Confirmer l’action", ja: "操作の確認", ko: "작업 확인" },
   confirmAction: { zh: "确认", en: "Confirm", fr: "Confirmer", ja: "確認", ko: "확인" },
   authTitle: { zh: "连接 Codex Partner", en: "Connect to Codex Partner", fr: "Connexion à Codex Partner", ja: "Codex Partner に接続", ko: "Codex Partner 연결" },
-  authMessage: { zh: "输入服务器访问令牌后继续。令牌只保存在当前浏览器中。", en: "Enter the server access token to continue. It stays in this browser.", fr: "Saisissez le jeton d’accès au serveur. Il reste dans ce navigateur.", ja: "サーバーのアクセストークンを入力してください。現在のブラウザーだけに保存されます。", ko: "서버 액세스 토큰을 입력하세요. 현재 브라우저에만 저장됩니다." },
-  accessToken: { zh: "访问令牌", en: "Access token", fr: "Jeton d’accès", ja: "アクセストークン", ko: "액세스 토큰" },
+  authMessage: { zh: "使用这台服务器的 SSH 账户登录。密码只用于本次 SSH 验证，不会保存。", en: "Sign in with an SSH account on this server. The password is used only for this verification and is not stored.", fr: "Connectez-vous avec un compte SSH de ce serveur. Le mot de passe sert uniquement à cette vérification et n’est pas stocké.", ja: "このサーバーの SSH アカウントでログインします。パスワードは今回の認証にのみ使用され、保存されません。", ko: "이 서버의 SSH 계정으로 로그인하세요. 비밀번호는 이번 인증에만 사용되며 저장되지 않습니다." },
+  sshUsername: { zh: "SSH 用户名", en: "SSH username", fr: "Nom d’utilisateur SSH", ja: "SSH ユーザー名", ko: "SSH 사용자 이름" },
+  sshPassword: { zh: "SSH 密码", en: "SSH password", fr: "Mot de passe SSH", ja: "SSH パスワード", ko: "SSH 비밀번호" },
+  sshLoginFailed: { zh: "SSH 登录失败", en: "SSH sign-in failed", fr: "Échec de la connexion SSH", ja: "SSH ログインに失敗しました", ko: "SSH 로그인 실패" },
   connect: { zh: "连接", en: "Connect", fr: "Se connecter", ja: "接続", ko: "연결" },
   renameSessionTitle: { zh: "重命名会话", en: "Rename session", fr: "Renommer la session", ja: "セッション名を変更", ko: "세션 이름 변경" },
   sessionName: { zh: "会话名称", en: "Session name", fr: "Nom de la session", ja: "セッション名", ko: "세션 이름" },
@@ -389,6 +391,7 @@ function applyLanguage(language = state.language) {
   for (const [selector, key] of Object.entries(titles)) { const node = $(selector); if (node) { node.title = t(key); node.setAttribute("aria-label", t(key)); } }
   const select = $("#language-select"); if (select) select.value = state.language;
   updateThemeToggle();
+  updateSSHLoginDialog();
   window.dispatchEvent(new CustomEvent("languagechange"));
 }
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -402,8 +405,6 @@ function setInspectorOpen(open) {
   inspector.classList.toggle("closed", !open);
   inspector.setAttribute("aria-hidden", open ? "false" : "true");
 }
-let authToken = localStorage.getItem("codex-dashboard-token") || new URLSearchParams(location.search).get("token") || "";
-if (authToken) localStorage.setItem("codex-dashboard-token", authToken);
 let socket = null;
 let socketTaskId = null;
 let socketReconnectTimer = null;
@@ -476,20 +477,66 @@ function appPrompt(options = {}) {
   return showAppDialog({ ...options, input: true });
 }
 
-async function requestAccessToken() {
-  if (!authPromptPromise) {
-    authPromptPromise = appPrompt({ title: uiLabel("authTitle"), message: uiLabel("authMessage"), label: uiLabel("accessToken"), inputType: "password", confirmLabel: uiLabel("connect"), required: true }).finally(() => { authPromptPromise = null; });
-  }
+function updateSSHLoginDialog() {
+  if (!document.querySelector("#ssh-login-dialog")) return;
+  $("#ssh-login-title").textContent = uiLabel("authTitle");
+  $("#ssh-login-message").textContent = uiLabel("authMessage");
+  $("#ssh-login-username-label").textContent = uiLabel("sshUsername");
+  $("#ssh-login-password-label").textContent = uiLabel("sshPassword");
+  $("#ssh-login-submit").textContent = uiLabel("connect");
+}
+
+async function requestSSHLogin() {
+  if (authPromptPromise) return authPromptPromise;
+  authPromptPromise = new Promise(resolve => {
+    const dialog = $("#ssh-login-dialog");
+    const form = $("#ssh-login-form");
+    const username = $("#ssh-login-username");
+    const password = $("#ssh-login-password");
+    const error = $("#ssh-login-error");
+    const submit = $("#ssh-login-submit");
+    updateSSHLoginDialog();
+    $("#ssh-login-server").textContent = `SSH · ${location.hostname}:22`;
+    fetch("/api/auth/status").then(response => response.json()).then(status => {
+      if (status?.ssh_host) $("#ssh-login-server").textContent = `SSH · ${status.ssh_host}:${status.ssh_port || 22}`;
+    }).catch(() => {});
+    error.textContent = "";
+    password.value = "";
+    dialog.oncancel = event => event.preventDefault();
+    form.onsubmit = async event => {
+      event.preventDefault();
+      if (!form.reportValidity()) return;
+      submit.disabled = true;
+      error.textContent = "";
+      try {
+        const response = await fetch("/api/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username: username.value.trim(), password: password.value }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw Error(payload.detail || uiLabel("sshLoginFailed"));
+        password.value = "";
+        dialog.close();
+        resolve(true);
+      } catch (loginError) {
+        error.textContent = loginError.message || uiLabel("sshLoginFailed");
+        password.focus();
+      } finally {
+        submit.disabled = false;
+      }
+    };
+    if (!dialog.open) dialog.showModal();
+    requestAnimationFrame(() => (username.value ? password : username).focus());
+  }).finally(() => { authPromptPromise = null; });
   return authPromptPromise;
 }
 
 async function api(path, options = {}, canPrompt = true) {
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
-  if (authToken) headers.Authorization = `Bearer ${authToken}`;
   const response = await fetch(`/api${path}`, { ...options, headers });
   if (response.status === 401 && canPrompt) {
-    const token = await requestAccessToken();
-    if (token) { authToken = token.trim(); localStorage.setItem("codex-dashboard-token", authToken); return api(path, options, false); }
+    if (await requestSSHLogin()) return api(path, options, false);
   }
   if (!response.ok) { const error = await response.json().catch(() => ({ detail: response.statusText })); throw Error(error.detail || response.statusText); }
   return response.json();

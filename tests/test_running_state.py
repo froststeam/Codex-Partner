@@ -1150,6 +1150,9 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn("cursor: pointer", styles)
         self.assertIn(".composer-dock { grid-template-columns: minmax(0, 1fr);", styles)
         self.assertIn(".composer-model-control { order: -3; }", styles)
+        self.assertIn("height: calc(100dvh - 58px)", styles)
+        self.assertIn(".composer-meta button, .composer-meta select", styles)
+        self.assertIn("env(safe-area-inset-bottom)", styles)
 
     def test_active_task_status_is_reconciled_after_missed_completion_event(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -1159,6 +1162,30 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn("authoritative.status !== state.selectedTask.status", core_js)
         self.assertIn("setInterval(reconcileSelectedTaskStatus, 5000)", app_js)
         self.assertIn("reconcileSelectedTaskStatus();", app_js)
+
+    def test_browser_auth_uses_ssh_cookie_instead_of_access_tokens(self):
+        static = Path(__file__).resolve().parents[1] / "static"
+        core_js = (static / "core.js").read_text(encoding="utf-8")
+        conversation_js = (static / "conversation.js").read_text(encoding="utf-8")
+        html = (static / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="ssh-login-dialog"', html)
+        self.assertIn("requestSSHLogin", core_js)
+        self.assertIn('fetch("/api/auth/login"', core_js)
+        self.assertNotIn("codex-dashboard-token", core_js + conversation_js)
+        self.assertNotIn("?token=", conversation_js)
+
+    def test_ssh_login_username_and_throttle_are_bounded(self):
+        from codex_partner.ssh_auth import LoginThrottle, valid_ssh_username
+
+        self.assertTrue(valid_ssh_username("qingzhiguo"))
+        self.assertFalse(valid_ssh_username("user@host"))
+        throttle = LoginThrottle(attempts=2, window_seconds=60)
+        self.assertTrue(throttle.allowed("client"))
+        throttle.fail("client")
+        throttle.fail("client")
+        self.assertFalse(throttle.allowed("client"))
+        throttle.clear("client")
+        self.assertTrue(throttle.allowed("client"))
 
     def test_language_picker_title_collapse_and_mascot_are_wired(self):
         static = Path(__file__).resolve().parents[1] / "static"
