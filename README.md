@@ -53,6 +53,38 @@ docker run -d --name codex-partner \
 docker exec -it codex-partner codex login
 ```
 
+## systemd
+
+Create a dedicated service user and install Codex Partner:
+
+```bash
+sudo useradd --system --create-home --home-dir /home/codex --shell /bin/bash codex
+sudo install -d -o codex -g codex /opt/codex-partner /var/lib/codex-partner
+sudo -u codex -H git clone https://github.com/froststeam/Codex-Partner.git /opt/codex-partner
+sudo -u codex -H python3 -m venv /opt/codex-partner/.venv
+sudo -u codex -H /opt/codex-partner/.venv/bin/pip install /opt/codex-partner
+sudo -u codex -H cp /opt/codex-partner/.env.example /opt/codex-partner/.env
+sudoedit /opt/codex-partner/.env
+```
+
+Ensure the `codex` user can run and authenticate the Codex CLI:
+
+```bash
+sudo -u codex -H codex login
+sudo -u codex -H codex --version
+```
+
+Install and start the service:
+
+```bash
+sudo cp /opt/codex-partner/codex-partner.service.example /etc/systemd/system/codex-partner.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now codex-partner.service
+sudo systemctl status codex-partner.service
+```
+
+View logs with `sudo journalctl -u codex-partner.service -f`.
+
 ## Use
 
 Create a session, choose a workspace and model, then send a message. Messages sent during an active turn queue automatically. Set a Goal to let Codex Partner keep resuming unfinished work. Reopen the same session from any connected device to continue the same thread.

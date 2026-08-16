@@ -7,6 +7,7 @@ Type=simple
 WorkingDirectory=/opt/codex-partner
 EnvironmentFile=-/opt/codex-partner/.env
 Environment=CODEX_DASHBOARD_DEFAULT_WORKSPACE=/home/codex
+Environment=CODEX_DASHBOARD_DATA=/var/lib/codex-partner
 # CODEX_BIN is optional; automatic discovery prefers PATH, then VS Code, then official paths.
 ExecStart=/opt/codex-partner/.venv/bin/codex-partner
 Restart=always
