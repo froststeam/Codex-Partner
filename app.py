@@ -10,6 +10,7 @@ import fcntl
 import glob
 import hashlib
 import io
+import ipaddress
 import json
 import mimetypes
 import os
@@ -2448,15 +2449,67 @@ def active_auth_session(token: str) -> Optional[dict[str, Any]]:
     return session
 
 
+def local_server_addresses() -> set[str]:
+    """Return addresses owned by this host without trusting request headers."""
+    addresses = {"127.0.0.1", "::1"}
+    for name in {socket.gethostname(), socket.getfqdn()}:
+        try:
+            for item in socket.getaddrinfo(name, None):
+                addresses.add(str(item[4][0]).split("%", 1)[0])
+        except socket.gaierror:
+            continue
+    if platform.system() == "Linux":
+        for _index, name in socket.if_nameindex():
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                    packed = fcntl.ioctl(probe.fileno(), 0x8915, struct.pack("256s", name.encode()[:15]))
+                addresses.add(socket.inet_ntoa(packed[20:24]))
+            except OSError:
+                continue
+        try:
+            for line in Path("/proc/net/if_inet6").read_text(encoding="ascii").splitlines():
+                addresses.add(str(ipaddress.IPv6Address(int(line.split()[0], 16))))
+        except (OSError, ValueError, IndexError):
+            pass
+    return addresses
+
+
+LOCAL_SERVER_ADDRESSES = local_server_addresses()
+
+
+def direct_local_client(client_host: str, headers: Any) -> bool:
+    """Allow passwordless access only for direct connections from this host."""
+    if any(headers.get(name) for name in ("forwarded", "x-forwarded-for", "x-real-ip")):
+        return False
+    host = str(client_host or "").split("%", 1)[0]
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if address.is_loopback:
+        return True
+    return host in LOCAL_SERVER_ADDRESSES
+
+
+def local_auth_session(client_host: str, headers: Any) -> Optional[dict[str, Any]]:
+    if direct_local_client(client_host, headers):
+        return {"username": getpass.getuser(), "expires_at": 0, "local": True}
+    return None
+
+
 def request_auth_session(request: Request) -> Optional[dict[str, Any]]:
     if AUTH_MODE == "none":
         return {"username": getpass.getuser(), "expires_at": 0}
+    if session := local_auth_session(request.client.host if request.client else "", request.headers):
+        return session
     return active_auth_session(request.cookies.get(AUTH_COOKIE, ""))
 
 
 def websocket_auth_session(websocket: WebSocket) -> Optional[dict[str, Any]]:
     if AUTH_MODE == "none":
         return {"username": getpass.getuser(), "expires_at": 0}
+    if session := local_auth_session(websocket.client.host if websocket.client else "", websocket.headers):
+        return session
     return active_auth_session(websocket.cookies.get(AUTH_COOKIE, ""))
 
 
@@ -3476,6 +3529,7 @@ async def auth_status(request: Request):
     return {
         "mode": AUTH_MODE,
         "authenticated": bool(session),
+        "local_access": bool((session or {}).get("local")),
         "username": (session or {}).get("username", ""),
         "server_hostname": socket.gethostname(),
         "ssh_host": AUTH_SSH_HOST,
@@ -3521,7 +3575,7 @@ async def live():
 
 @app.post("/api/auth/login")
 async def ssh_login(payload: SSHLoginIn, request: Request):
-    if AUTH_MODE == "none":
+    if AUTH_MODE == "none" or local_auth_session(request.client.host if request.client else "", request.headers):
         return {"authenticated": True, "username": getpass.getuser()}
     client = request.client.host if request.client else "unknown"
     if not login_throttle.allowed(client):

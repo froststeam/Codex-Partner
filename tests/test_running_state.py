@@ -10,6 +10,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -1402,6 +1403,32 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn('fetch("/api/auth/login"', core_js)
         self.assertNotIn("codex-dashboard-token", core_js + conversation_js)
         self.assertNotIn("?token=", conversation_js)
+
+    def test_direct_local_access_is_passwordless_but_proxied_or_remote_access_is_not(self):
+        local_request = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"), headers={}, cookies={})
+        local_session = self.app.request_auth_session(local_request)
+        self.assertTrue(local_session["local"])
+        self.assertEqual(self.app.getpass.getuser(), local_session["username"])
+
+        local_lan = next(
+            (address for address in self.app.LOCAL_SERVER_ADDRESSES if not self.app.ipaddress.ip_address(address).is_loopback),
+            None,
+        )
+        if local_lan:
+            lan_request = SimpleNamespace(client=SimpleNamespace(host=local_lan), headers={}, cookies={})
+            self.assertTrue(self.app.request_auth_session(lan_request)["local"])
+
+        proxy_request = SimpleNamespace(
+            client=SimpleNamespace(host="127.0.0.1"),
+            headers={"x-forwarded-for": "192.0.2.10"},
+            cookies={},
+        )
+        remote_request = SimpleNamespace(client=SimpleNamespace(host="192.0.2.10"), headers={}, cookies={})
+        self.assertIsNone(self.app.request_auth_session(proxy_request))
+        self.assertIsNone(self.app.request_auth_session(remote_request))
+
+        local_socket = SimpleNamespace(client=SimpleNamespace(host="::1"), headers={}, cookies={})
+        self.assertTrue(self.app.websocket_auth_session(local_socket)["local"])
 
     def test_ssh_login_username_and_throttle_are_bounded(self):
         from codex_partner.ssh_auth import LoginThrottle, valid_ssh_username
