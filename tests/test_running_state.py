@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import importlib
+import io
 import json
 import os
 import re
@@ -38,6 +40,39 @@ class RunningStateTests(unittest.TestCase):
     def test_native_history_accepts_iso_timestamps(self):
         stamp = self.app.native_stamp("2026-08-16T01:27:10.093564Z", "fallback")
         self.assertEqual("2026-08-16T01:27:10.093564+00:00", stamp)
+
+    def test_avatar_is_persisted_per_login_and_broadcast_to_matching_devices(self):
+        image = self.app.Image.new("RGB", (32, 32), "#ffd83e")
+        source = io.BytesIO()
+        image.save(source, "PNG")
+        data_url = "data:image/png;base64," + base64.b64encode(source.getvalue()).decode()
+
+        class Socket:
+            def __init__(self):
+                self.payloads = []
+
+            async def send_json(self, payload):
+                self.payloads.append(payload)
+
+        own_device = Socket()
+        other_user = Socket()
+        self.app.overview_clients.update({own_device, other_user})
+        self.app.overview_client_users[own_device] = "avatar-user"
+        self.app.overview_client_users[other_user] = "someone-else"
+        try:
+            result = asyncio.run(self.app.update_profile_avatar(
+                self.app.AvatarIn(data_url=data_url), {"username": "avatar-user"}
+            ))
+            path = self.app.profile_avatar_path("avatar-user")
+            self.assertTrue(path.is_file())
+            self.assertEqual(0o600, path.stat().st_mode & 0o777)
+            self.assertTrue(result["avatar_url"].startswith("/api/profile/avatar?v="))
+            self.assertEqual("profile_updated", own_device.payloads[-1]["type"])
+            self.assertFalse(other_user.payloads)
+        finally:
+            self.app.overview_clients.difference_update({own_device, other_user})
+            self.app.overview_client_users.pop(own_device, None)
+            self.app.overview_client_users.pop(other_user, None)
 
     def test_timeline_uses_cursor_pages_without_overlap(self):
         task_id = f"timeline-{time.time_ns()}"
@@ -1114,7 +1149,7 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn("attachmentUploadName", app_js)
         self.assertIn("new File([file]", app_js)
         self.assertIn('uiLabel("binaryAttachment"', app_js)
-        self.assertIn('/app.js?v=20260816-sidebar-toggle', html)
+        self.assertIn('/app.js?v=20260816-avatar-sync', html)
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)

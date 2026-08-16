@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import codecs
 import errno
 import getpass
@@ -56,6 +57,7 @@ from codex_partner.discovery import (
     vscode_candidates,
 )
 from codex_partner.schemas import (
+    AvatarIn,
     ContextPatch,
     GoalPatch,
     MemoryIn,
@@ -386,6 +388,7 @@ running: dict[str, asyncio.subprocess.Process] = {}
 running_lock = asyncio.Lock()
 task_clients: dict[str, set[WebSocket]] = {}
 overview_clients: set[WebSocket] = set()
+overview_client_users: dict[WebSocket, str] = {}
 task_queues: dict[str, asyncio.Queue[str]] = {}
 task_workers: dict[str, asyncio.Task] = {}
 task_message_locks: dict[str, asyncio.Lock] = {}
@@ -2390,6 +2393,39 @@ def websocket_auth_session(websocket: WebSocket) -> Optional[dict[str, Any]]:
     return active_auth_session(websocket.cookies.get(AUTH_COOKIE, ""))
 
 
+def profile_avatar_path(username: str) -> Path:
+    profile_id = hashlib.sha256(username.encode("utf-8")).hexdigest()
+    return DATA_DIR / "profiles" / f"{profile_id}.webp"
+
+
+def profile_snapshot(username: str) -> dict[str, Any]:
+    path = profile_avatar_path(username)
+    version = str(path.stat().st_mtime_ns) if path.is_file() else ""
+    return {
+        "username": username,
+        "avatar_url": f"/api/profile/avatar?v={version}" if version else "",
+        "avatar_version": version,
+    }
+
+
+def avatar_webp(data_url: str) -> bytes:
+    match = re.fullmatch(r"data:image/[A-Za-z0-9.+-]+;base64,([A-Za-z0-9+/=\r\n]+)", data_url.strip())
+    if not match:
+        raise HTTPException(400, "Avatar must be a base64 image")
+    try:
+        raw = base64.b64decode(match.group(1), validate=True)
+        with Image.open(io.BytesIO(raw)) as source:
+            image = ImageOps.exif_transpose(source)
+            image.thumbnail((512, 512), Image.Resampling.LANCZOS)
+            if image.mode not in {"RGB", "RGBA"}:
+                image = image.convert("RGBA" if "transparency" in image.info else "RGB")
+            output = io.BytesIO()
+            image.save(output, "WEBP", quality=88, method=4)
+            return output.getvalue()
+    except (binascii.Error, UnidentifiedImageError, OSError, ValueError) as exc:
+        raise HTTPException(415, "Avatar is not a supported image") from exc
+
+
 async def auth(request: Request):
     session = request_auth_session(request)
     if not session:
@@ -2845,6 +2881,7 @@ async def broadcast_overview(task_id: str, source: Optional[dict] = None) -> Non
             stale.append(websocket)
     for websocket in stale:
         overview_clients.discard(websocket)
+        overview_client_users.pop(websocket, None)
 
 
 async def broadcast_overview_removed(task_id: str) -> None:
@@ -2857,6 +2894,22 @@ async def broadcast_overview_removed(task_id: str) -> None:
             stale.append(websocket)
     for websocket in stale:
         overview_clients.discard(websocket)
+        overview_client_users.pop(websocket, None)
+
+
+async def broadcast_profile(username: str, profile: Optional[dict] = None) -> None:
+    payload = {"type": "profile_updated", "profile": profile or profile_snapshot(username)}
+    stale = []
+    for websocket, connected_user in list(overview_client_users.items()):
+        if connected_user != username:
+            continue
+        try:
+            await websocket.send_json(payload)
+        except Exception:
+            stale.append(websocket)
+    for websocket in stale:
+        overview_clients.discard(websocket)
+        overview_client_users.pop(websocket, None)
 
 
 async def broadcast_task(task_id: str, payload: dict) -> None:
@@ -3262,6 +3315,33 @@ async def auth_status(request: Request):
         "ssh_host": AUTH_SSH_HOST,
         "ssh_port": AUTH_SSH_PORT,
     }
+
+
+@app.get("/api/profile")
+async def get_profile(session: Any = Depends(auth)):
+    return profile_snapshot(session["username"])
+
+
+@app.get("/api/profile/avatar")
+async def get_profile_avatar(session: Any = Depends(auth)):
+    path = profile_avatar_path(session["username"])
+    if not path.is_file():
+        raise HTTPException(404, "Avatar not found")
+    return FileResponse(path, media_type="image/webp", headers={"Cache-Control": "private, max-age=31536000, immutable"})
+
+
+@app.put("/api/profile/avatar")
+async def update_profile_avatar(payload: AvatarIn, session: Any = Depends(auth)):
+    path = profile_avatar_path(session["username"])
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.parent.chmod(0o700)
+    temporary = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+    temporary.write_bytes(avatar_webp(payload.data_url))
+    temporary.chmod(0o600)
+    temporary.replace(path)
+    profile = profile_snapshot(session["username"])
+    await broadcast_profile(session["username"], profile)
+    return profile
 
 
 @app.get("/api/live")
@@ -4647,13 +4727,15 @@ async def steer_task_message(task_id: str, payload: TaskMessageIn, _: Any = Depe
 
 @app.websocket("/ws/overview")
 async def overview_socket(websocket: WebSocket):
-    if not websocket_auth_session(websocket):
+    session = websocket_auth_session(websocket)
+    if not session:
         await websocket.close(code=4401)
         return
     await websocket.accept()
     overview_clients.add(websocket)
+    overview_client_users[websocket] = session["username"]
     try:
-        await websocket.send_json({"type": "overview_snapshot", "tasks": all_task_summaries()})
+        await websocket.send_json({"type": "overview_snapshot", "tasks": all_task_summaries(), "profile": profile_snapshot(session["username"])})
         while True:
             incoming = await websocket.receive_json()
             if incoming.get("type") == "ping":
@@ -4662,6 +4744,7 @@ async def overview_socket(websocket: WebSocket):
         pass
     finally:
         overview_clients.discard(websocket)
+        overview_client_users.pop(websocket, None)
 
 
 @app.websocket("/ws/tasks/{task_id}")

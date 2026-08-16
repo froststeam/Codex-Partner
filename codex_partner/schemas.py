@@ -58,6 +58,10 @@ class ContextPatch(BaseModel):
     context: str
 
 
+class AvatarIn(BaseModel):
+    data_url: str = Field(min_length=1)
+
+
 class GoalPatch(BaseModel):
     objective: Optional[str] = None
     status: Optional[GoalStatus] = None

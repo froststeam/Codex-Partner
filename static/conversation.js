@@ -712,8 +712,13 @@ function connectOverviewSocket() {
     noteRealtime("overview"); setRealtimeChannel("overview", "live");
     const data = JSON.parse(event.data);
     if (data.type === "overview_snapshot") {
+      applyUserProfile(data.profile, true);
       mergeOverviewSnapshot(data.tasks || []);
       renderSessionList(); renderSidebarStats();
+      return;
+    }
+    if (data.type === "profile_updated") {
+      applyUserProfile(data.profile, true);
       return;
     }
     if (data.type === "task_status" && data.task) {

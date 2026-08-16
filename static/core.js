@@ -6,6 +6,7 @@ const state = {
   commandIndex: 0, rawActivity: true, composerHistory: [], historyIndex: -1, editingQueuedId: null, defaultWorkspace: "", codexAvailable: true, codexInstall: null, codexInfo: null,
   runtimeMetrics: { taskId: "", ttftMs: null, tpotMs: null, estimated: true, outputTokens: 0 }, serverInfo: { user: "", hostname: "" }, chatSnapToBottom: false, userAvatar: localStorage.getItem("codex-dashboard-user-avatar") || "",
 };
+const legacyUserAvatar = localStorage.getItem("codex-dashboard-user-avatar") || "";
 state.selectedId = localStorage.getItem("codex-dashboard-session") || null;
 state.language = localStorage.getItem("codex-dashboard-language") || "zh";
 state.titleExpanded = false;
@@ -363,6 +364,25 @@ function mascotMarkup(className = "") { return `<span class="mascot mascot-inlin
 function humanMarkup(className = "") {
   if (state.userAvatar) return `<span class="human-avatar image-avatar ${className}" aria-hidden="true"><img class="human-avatar-image" src="${esc(state.userAvatar)}" alt="" /></span>`;
   return `<span class="human-avatar ${className}" aria-hidden="true"><i></i><b></b></span>`;
+}
+function applyUserProfile(profile, rerender = false) {
+  const next = profile?.avatar_url || "";
+  const changed = next !== state.userAvatar;
+  state.userAvatar = next;
+  if (next) localStorage.removeItem("codex-dashboard-user-avatar");
+  if (changed && rerender && typeof renderChat === "function") renderChat();
+}
+async function loadUserProfile() {
+  let profile = await api("/profile");
+  if (!profile.avatar_url && legacyUserAvatar.startsWith("data:image/")) {
+    try {
+      profile = await api("/profile/avatar", { method: "PUT", body: JSON.stringify({ data_url: legacyUserAvatar }) });
+    } catch (_) {
+      return profile;
+    }
+  }
+  applyUserProfile(profile);
+  return profile;
 }
 function updateThemeToggle() {
   const toggle = document.querySelector("#theme-toggle");
@@ -962,7 +982,7 @@ function scheduleRenderChat() {
 
 async function refresh(keepSelection = true) {
   try {
-    const [tasks, sessions, providers, skills, memories, health, commandData] = await Promise.all([api("/tasks"), api("/sessions"), api("/providers"), api("/skills"), api("/memories"), api("/health"), api("/commands")]);
+    const [tasks, sessions, providers, skills, memories, health, commandData] = await Promise.all([api("/tasks"), api("/sessions"), api("/providers"), api("/skills"), api("/memories"), api("/health"), api("/commands"), loadUserProfile()]);
     state.tasks = tasks; state.sessions = sessions; state.providers = providers; state.skills = skills; state.memories = memories.files || []; state.generatedMemories = memories.generated || []; state.commands = commandData.commands || []; state.defaultWorkspace = health.default_workspace || state.defaultWorkspace; renderCodexAvailability(health); renderConnectionStatus();
     renderSessionList(); renderSidebarStats(); refreshOpenPanel();
     if (state.selectedId && !state.tasks.some(task => task.id === state.selectedId)) state.selectedId = null;

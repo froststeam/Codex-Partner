@@ -408,11 +408,14 @@ $("#user-avatar-file").onchange = event => {
   if (!file) return;
   if (!String(file.type || "").startsWith("image/")) { toast("请选择图片文件"); event.target.value = ""; return; }
   const reader = new FileReader();
-  reader.onload = () => {
-    state.userAvatar = String(reader.result || "");
-    try { localStorage.setItem("codex-dashboard-user-avatar", state.userAvatar); } catch (_) { toast("图片过大，无法保存头像"); return; }
-    renderChat();
-    toast("头像已更新");
+  reader.onload = async () => {
+    try {
+      const profile = await api("/profile/avatar", { method: "PUT", body: JSON.stringify({ data_url: String(reader.result || "") }) });
+      applyUserProfile(profile, true);
+      toast("头像已更新");
+    } catch (error) {
+      toast(error.message || "头像保存失败");
+    }
   };
   reader.onerror = () => toast("头像读取失败");
   reader.readAsDataURL(file);
