@@ -25,8 +25,19 @@ Codex Partner is a self-hosted control panel for long-running Codex work. It kee
 
 Requires Python 3.10+ and an authenticated [Codex CLI](https://github.com/openai/codex).
 
+### PyPI
+
 ```bash
-git clone git@github.com:froststeam/Codex-Partner.git
+python3 -m venv .venv
+. .venv/bin/activate
+pip install codex-partner
+codex-partner
+```
+
+### From source
+
+```bash
+git clone https://github.com/froststeam/Codex-Partner.git
 cd Codex-Partner
 python3 -m venv .venv
 . .venv/bin/activate
@@ -55,7 +66,7 @@ docker exec -it codex-partner codex login
 
 ## systemd
 
-After completing the installation above, stop the foreground process and install the user service:
+After completing the source installation above, stop the foreground process and install the user service:
 
 ```bash
 mkdir -p ~/.config/systemd/user
