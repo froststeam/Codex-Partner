@@ -863,13 +863,17 @@ def persist_external_task_status(task_id: str, dashboard_active: Optional[bool] 
     if dashboard_active is None:
         dashboard_active = dashboard_owns_task(task_id)
     active_session_id = task.get("active_session_id") if dashboard_active else external.get("session_id")
+    persisted_run_mode = str(task.get("run_mode") or "")
+    # An explicit browser Goal start can adopt the already-running terminal
+    # turn. Rollout polling must not erase that intent back to "terminal".
+    run_mode = persisted_run_mode if dashboard_active or persisted_run_mode == "goal_resume" else "terminal"
     db.execute(
         "UPDATE tasks SET status='running',active_session_id=?,execution_source=?,execution_turn_id=?,run_mode=?,last_error='',updated_at=? WHERE id=?",
         (
             active_session_id,
             "mixed" if dashboard_active else "terminal",
             external.get("turn_id", ""),
-            task.get("run_mode", "") if dashboard_active else "terminal",
+            run_mode,
             now(),
             task_id,
         ),
@@ -1024,7 +1028,7 @@ async def settle_inactive_external_turn(task_id: str, reason: str, current: Opti
         (stamp, reason, task_id),
     )
     db.execute(
-        "UPDATE tasks SET status='stopped',active_session_id=NULL,execution_source='',execution_turn_id='',last_error=?,updated_at=? WHERE id=?",
+        "UPDATE tasks SET status='stopped',active_session_id=NULL,execution_source='',execution_turn_id='',run_mode='',last_error=?,updated_at=? WHERE id=?",
         (reason, stamp, task_id),
     )
     session_id = (current or {}).get("session_id")
@@ -3137,11 +3141,12 @@ def latest_codex_session(task: dict) -> str:
 
 
 async def drain_task_messages(task_id: str) -> None:
-    """Start one queued browser message when the task has become idle.
+    """Continue queued browser work when the task has become idle.
 
     The task worker owns the ordering.  This function intentionally leaves the
     row queued while a turn is active, so a message sent during a turn can
-    never compete with that turn or be lost at the completion boundary.
+    never compete with that turn or be lost at the completion boundary. An
+    adopted terminal Goal turn resumes only after queued user messages.
     """
     lock = task_message_locks.setdefault(task_id, asyncio.Lock())
     async with lock:
@@ -3150,6 +3155,25 @@ async def drain_task_messages(task_id: str) -> None:
             return
         row = db.one("SELECT * FROM task_messages WHERE task_id=? AND status='queued' ORDER BY created_at, id LIMIT 1", (task_id,))
         if not row:
+            goal_resume = bool(
+                current.get("goal")
+                and current.get("retry_forever")
+                and current.get("run_mode") == "goal_resume"
+                and current.get("goal_status") not in {"paused", "complete", "none"}
+            )
+            if not goal_resume:
+                return
+            # A browser can adopt a terminal-owned Goal turn. Once that turn
+            # ends, continue the same Goal through the shared app-server.
+            db.execute(
+                "UPDATE tasks SET status='queued',execution_source='dashboard',execution_turn_id='',updated_at=? WHERE id=?",
+                (now(), task_id),
+            )
+            try:
+                await launch(task_id, "resume")
+            except Exception as exc:
+                if not is_task_busy_error(exc):
+                    db.execute("UPDATE tasks SET status='failed',last_error=?,updated_at=? WHERE id=?", (str(exc), now(), task_id))
             return
         # launch() only reserves an async supervisor; it does not mean Codex
         # has accepted the turn yet. Keep the row in the compact queue until
@@ -4586,8 +4610,13 @@ async def start_task(task_id: str, _: Any = Depends(auth)):
 async def resume_task(task_id: str, _: Any = Depends(auth)):
     task = task_or_404(task_id)
     if external_turns.get(task_id):
+        if task.get("goal"):
+            db.execute("UPDATE tasks SET run_mode='goal_resume',last_error='',updated_at=? WHERE id=?", (now(), task_id))
         persist_external_task_status(task_id, dashboard_active=False)
-        return task_or_404(task_id) | {"shared": True, "message": "Task is already running in a terminal Codex client"}
+        result = task_or_404(task_id)
+        await broadcast_task(task_id, {"type": "task_status", "task": result, "source": {"kind": "goal_resume", "surface": "terminal"}})
+        await broadcast_overview(task_id, {"kind": "goal_resume", "surface": "terminal"})
+        return result | {"shared": True, "message": "Goal resume adopted the active terminal Codex turn"}
     if task_id in running or task_id in appserver_turn_tasks or task["status"] == "running":
         # Rejoin the server-owned turn instead of starting a competing CLI
         # process. All browser tabs can continue through /messages.
@@ -4842,7 +4871,7 @@ async def stop_task_run(task_id: str) -> dict:
                 (stamp, task_id),
             )
             db.execute(
-                "UPDATE tasks SET status='stopped',active_session_id=NULL,execution_source='',execution_turn_id='',last_error='Stopped by user',updated_at=? WHERE id=?",
+                "UPDATE tasks SET status='stopped',active_session_id=NULL,execution_source='',execution_turn_id='',run_mode='',last_error='Stopped by user',updated_at=? WHERE id=?",
                 (stamp, task_id),
             )
             result = task_or_404(task_id)
@@ -4851,7 +4880,7 @@ async def stop_task_run(task_id: str) -> dict:
             return result
         raise HTTPException(409, "Task is not running")
     db.execute(
-        "UPDATE tasks SET status='stopped',execution_source='',execution_turn_id='',last_error='Stopped by user',updated_at=? WHERE id=?",
+        "UPDATE tasks SET status='stopped',execution_source='',execution_turn_id='',run_mode='',last_error='Stopped by user',updated_at=? WHERE id=?",
         (now(), task_id),
     )
     # ``running`` stores the shared app-server process as an owner marker for

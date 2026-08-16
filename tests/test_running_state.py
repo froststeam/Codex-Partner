@@ -201,11 +201,50 @@ class RunningStateTests(unittest.TestCase):
         self.assertEqual(str(path), self.app.external_turns[task_id]["path"])
         self.assertEqual(self.app.external_turns[task_id]["session_id"], self.app.task_or_404(task_id)["active_session_id"])
 
+    def test_goal_resume_adopts_active_terminal_turn(self):
+        task_id = f"external-goal-{time.time_ns()}"
+        self.make_task(task_id, "available")
+        self.app.db.execute(
+            "UPDATE tasks SET goal='finish it',goal_status='active',retry_forever=1 WHERE id=?",
+            (task_id,),
+        )
+        self.app.register_external_turn(task_id, {
+            "thread_id": task_id,
+            "turn_id": "terminal-turn",
+            "started_at": self.app.now(),
+            "session_id": f"external:{task_id}:terminal-turn",
+            "path": "/tmp/live-terminal-rollout",
+        })
+        try:
+            result = asyncio.run(self.app.resume_task(task_id, None))
+            self.assertTrue(result["shared"])
+            self.assertEqual("running", result["status"])
+            self.assertEqual("goal_resume", result["run_mode"])
+            self.assertEqual("terminal", result["execution_source"])
+            self.app.persist_external_task_status(task_id, dashboard_active=False)
+            self.assertEqual("goal_resume", self.app.task_or_404(task_id)["run_mode"])
+        finally:
+            self.app.clear_external_turns(task_id)
+
+    def test_adopted_terminal_goal_continues_when_turn_finishes(self):
+        task_id = f"external-goal-drain-{time.time_ns()}"
+        self.make_task(task_id, "available")
+        self.app.db.execute(
+            "UPDATE tasks SET goal='finish it',goal_status='active',retry_forever=1,run_mode='goal_resume' WHERE id=?",
+            (task_id,),
+        )
+        with mock.patch.object(self.app, "launch", new=mock.AsyncMock(return_value={"session_id": "next"})) as launch:
+            asyncio.run(self.app.drain_task_messages(task_id))
+        launch.assert_awaited_once_with(task_id, "resume")
+        self.assertEqual("queued", self.app.task_or_404(task_id)["status"])
+
     def test_stop_clears_unowned_running_state(self):
         task_id = "orphan-thread"
         self.make_task(task_id)
+        self.app.db.execute("UPDATE tasks SET run_mode='goal_resume' WHERE id=?", (task_id,))
         result = asyncio.run(self.app.stop_task_run(task_id))
         self.assertEqual("stopped", result["status"])
+        self.assertEqual("", result["run_mode"])
 
     def test_one_task_stays_running_until_all_terminal_turns_finish(self):
         task_id = "shared-thread"
