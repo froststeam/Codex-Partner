@@ -100,8 +100,6 @@ function renderConversation() {
   const workspace = task.workspace || "";
   const location = task.ssh_host ? `${task.ssh_host} · ` : "";
   $("#conversation-subtitle").textContent = `${location}${workspace} · ${uiLabel("threadId")} ${threadId || "—"}`;
-  $("#composer-goal-meta").hidden = !task.goal;
-  $("#composer-goal-meta").textContent = task.goal ? `${uiLabel("goal")} · ${goalStatusLabel(task.goal_status || "active")}` : "";
   const composerSettings = composerModelCache.get(`${task.id}:${task.provider_id || "default"}`) || {};
   renderComposerModelSelect(task, Array.isArray(composerSettings) ? composerSettings : composerSettings.models || []);
   renderComposerEffortSelect(task, Array.isArray(composerSettings) ? "" : composerSettings.reasoning_effort || task.reasoning_effort || "");

@@ -163,7 +163,6 @@ body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56p
 .composer-meta .meta-pill { padding: 3px 7px; border: 1px solid #344148; border-radius: 4px; color: #b7c3c7; }
 .composer-meta .thread-id { max-width: min(100%, 360px); overflow: hidden; color: #6f7e84; font-family: ui-monospace, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .meta-pill { padding: 3px 7px; border: 1px solid #344148; border-radius: 4px; color: #b7c3c7; }
-.goal-pill { color: #c4dc94; border-color: #53683e; }
 .thread-id { max-width: 310px; overflow: hidden; color: #6f7e84; font-family: ui-monospace, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .chat-stream { min-height: 0; flex: 1; overflow: auto; padding: 30px clamp(18px, 6vw, 100px) 24px; background: #101619; scroll-behavior: auto; }
 .message { display: flex; align-items: flex-start; gap: 11px; max-width: 920px; margin: 0 auto 24px; }
