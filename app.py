@@ -301,18 +301,22 @@ def align_session_workspace(task_id: str, thread_id: str) -> Optional[Path]:
         return None
     root = SESSION_WORKSPACE_ROOT.resolve()
     current = Path(task["workspace"]).expanduser().resolve()
-    if current.parent != root or current.name != task_id:
+    if current.parent != root:
         return None
     target = (root / thread_id).resolve()
     if target == current:
+        target.mkdir(mode=0o700, parents=True, exist_ok=True)
         return current
+    if current.name != task_id:
+        return None
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     if target.exists():
         # A previous interrupted migration may have left the destination.
-        # Keep the existing directory and remove only the empty placeholder.
+        # Keep it and remove only an empty placeholder. A missing placeholder
+        # means the rename completed before the database update.
         if current.is_dir() and not any(current.iterdir()):
             current.rmdir()
-        else:
+        elif current.exists():
             return None
     elif current.exists():
         current.rename(target)

@@ -659,6 +659,21 @@ class RunningStateTests(unittest.TestCase):
                 self.assertTrue(target.is_dir())
                 self.assertFalse((root / task["id"]).exists())
                 self.assertEqual(str(target), self.app.task_or_404(task["id"])["workspace"])
+                self.assertEqual(target, self.app.align_session_workspace(task["id"], "thread-123"))
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task["id"],))
+
+    def test_interrupted_workspace_alignment_finishes_database_update(self):
+        with tempfile.TemporaryDirectory(dir=self.temp.name) as directory:
+            root = Path(directory) / "codex_partner"
+            with mock.patch.object(self.app, "SESSION_WORKSPACE_ROOT", root):
+                task = asyncio.run(self.app.create_quick_task(self.app.QuickTaskCreate(), None))
+                current = Path(task["workspace"])
+                current.rmdir()
+                target = root / "thread-after-rename"
+                target.mkdir()
+                aligned = self.app.align_session_workspace(task["id"], target.name)
+                self.assertEqual(target, aligned)
+                self.assertEqual(str(target), self.app.task_or_404(task["id"])["workspace"])
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task["id"],))
 
     def test_temp_directory_cannot_be_configured_as_default(self):
