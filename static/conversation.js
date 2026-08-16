@@ -129,23 +129,47 @@ function renderComposerModelSelect(task, models = []) {
   const current = task.model || "";
   const unique = normalizeModelItems(models);
   if (current && !unique.some(item => item.id === current)) unique.unshift({ id: current, label: `${current}（当前）` });
-  select.innerHTML = `<option value="">${uiLabel("providerDefaultModel")}</option>${unique.map(item => `<option value="${esc(item.id)}">${esc(item.label)}</option>`).join("")}`;
-  select.value = current;
-  if (select.value !== current && current) {
-    select.insertAdjacentHTML("beforeend", `<option value="${esc(current)}">${esc(current)}（当前）</option>`);
-    select.value = current;
+  const taskKey = `${task.id}:${task.provider_id || "default"}`;
+  const options = [{ id: "", label: uiLabel("providerDefaultModel") }, ...unique];
+  const signature = JSON.stringify(options.map(item => [item.id, item.label]));
+  const sameTask = select.dataset.taskKey === taskKey;
+  const userIsChoosing = sameTask && document.activeElement === select;
+  if (select.dataset.optionsSignature !== signature) {
+    if (userIsChoosing) {
+      // Status patches arrive while a turn is running. Rebuilding a focused
+      // native select closes its menu, so apply refreshed models after blur.
+      select.dataset.pendingOptions = "1";
+    } else {
+      select.innerHTML = options.map(item => `<option value="${esc(item.id)}">${esc(item.label)}</option>`).join("");
+      select.dataset.optionsSignature = signature;
+      delete select.dataset.pendingOptions;
+    }
   }
-  select.onchange = async () => {
-    const model = select.value;
-    if (model === current) return;
-    select.disabled = true;
-    try {
-      const updated = await api(`/tasks/${encodeURIComponent(task.id)}`, { method: "PATCH", body: JSON.stringify({ model }) });
-      state.selectedTask = { ...state.selectedTask, ...updated }; mergeTask(updated); renderConversation();
-      toast(model ? `已切换模型：${model}` : "已恢复 Provider 默认模型");
-    } catch (error) { select.value = current; toast(`模型切换失败：${error.message}`); }
-    finally { select.disabled = false; }
-  };
+  select.dataset.taskKey = taskKey;
+  if (!userIsChoosing) select.value = current;
+  if (!select.dataset.modelChangeBound) {
+    select.dataset.modelChangeBound = "1";
+    select.addEventListener("change", async () => {
+      const activeTask = state.selectedTask;
+      if (!activeTask) return;
+      const previous = activeTask.model || "";
+      const model = select.value;
+      if (model === previous) return;
+      select.disabled = true;
+      try {
+        const updated = await api(`/tasks/${encodeURIComponent(activeTask.id)}`, { method: "PATCH", body: JSON.stringify({ model }) });
+        state.selectedTask = { ...state.selectedTask, ...updated }; mergeTask(updated); renderConversation();
+        toast(model ? `已切换模型：${model}` : "已恢复 Provider 默认模型");
+      } catch (error) { select.value = previous; toast(`模型切换失败：${error.message}`); }
+      finally { select.disabled = false; }
+    });
+    select.addEventListener("blur", () => {
+      if (!select.dataset.pendingOptions || !state.selectedTask) return;
+      const cacheKey = `${state.selectedTask.id}:${state.selectedTask.provider_id || "default"}`;
+      const cached = composerModelCache.get(cacheKey) || {};
+      queueMicrotask(() => renderComposerModelSelect(state.selectedTask, Array.isArray(cached) ? cached : cached.models || []));
+    });
+  }
   select.title = unique.length ? `已加载 ${unique.length} 个模型，可直接选择` : "Provider 未返回模型列表，将使用默认模型";
 }
 function renderComposerEffortSelect(task, value = "") {

@@ -1138,6 +1138,19 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn('await launch(task["id"], "resume", "", "", set())', (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8"))
         self.assertIn("flex-wrap: nowrap", (static / "styles.css").read_text(encoding="utf-8"))
 
+    def test_composer_model_picker_survives_realtime_status_renders(self):
+        static = Path(__file__).resolve().parents[1] / "static"
+        conversation_js = (static / "conversation.js").read_text(encoding="utf-8")
+        styles = (static / "styles.css").read_text(encoding="utf-8")
+        self.assertIn("document.activeElement === select", conversation_js)
+        self.assertIn('select.dataset.pendingOptions = "1"', conversation_js)
+        self.assertIn("select.dataset.optionsSignature !== signature", conversation_js)
+        self.assertIn('select.addEventListener("blur"', conversation_js)
+        self.assertIn(".composer-model-control .composer-select", styles)
+        self.assertIn("cursor: pointer", styles)
+        self.assertIn(".composer-dock { grid-template-columns: minmax(0, 1fr);", styles)
+        self.assertIn(".composer-model-control { order: -3; }", styles)
+
     def test_language_picker_title_collapse_and_mascot_are_wired(self):
         static = Path(__file__).resolve().parents[1] / "static"
         html = (static / "index.html").read_text(encoding="utf-8")
