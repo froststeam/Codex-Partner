@@ -2,9 +2,9 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=0.9" />
   <title>Codex Partner</title>
-  <link rel="stylesheet" href="/styles.css?v=20260816-composer-hitbox" />
+  <link rel="stylesheet" href="/styles.css?v=20260816-sidebar-toggle" />
   <link rel="stylesheet" href="/mascot-dance.css?v=20260816-game-sprites" />
   <link rel="stylesheet" href="/vendor/toastui-editor/toastui-editor.css" />
   <link rel="stylesheet" href="/vendor/toastui-editor/toastui-editor-dark.css" />
@@ -12,7 +12,7 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="brand"><button id="theme-toggle" class="theme-toggle" type="button" title="切换废土终端主题" aria-label="切换废土终端主题"><span class="mascot mascot-mini" role="img" aria-hidden="true"><i></i><b></b><em></em></span></button><span>Codex Partner</span></div>
+    <div class="brand"><button id="sidebar-toggle" class="icon-btn sidebar-toggle" type="button" title="关闭会话列表" aria-label="关闭会话列表" aria-expanded="true">☰</button><button id="theme-toggle" class="theme-toggle" type="button" title="切换废土终端主题" aria-label="切换废土终端主题"><span class="mascot mascot-mini" role="img" aria-hidden="true"><i></i><b></b><em></em></span></button><span>Codex Partner</span></div>
     <div class="shortcut-hints" aria-label="快捷键">
       <span class="shortcut-hint" title="单按反引号键 (`) 显示/隐藏终端"><kbd class="key-backquote" aria-label="反引号键"><span aria-hidden="true">~</span><span aria-hidden="true">`</span></kbd><span class="shortcut-label">终端</span></span>
       <span class="shortcut-hint" title="下一个会话"><kbd class="combo-key" aria-label="Shift N"><span aria-hidden="true">⇧</span> N</kbd><span class="shortcut-label">下一个会话</span></span>
@@ -25,7 +25,7 @@
   <div id="codex-install-notice" class="codex-install-notice" role="alert" hidden><span class="codex-install-mark" aria-hidden="true">!</span><span class="codex-install-copy"><strong>未找到 Codex CLI</strong><small id="codex-install-command">正在检查安装环境</small></span><button id="install-codex" class="primary" type="button">一键安装</button></div>
   <main class="workspace-app">
     <aside class="session-sidebar" aria-label="Codex 会话列表">
-      <div class="sidebar-top"><div><h1>会话</h1></div><button id="sync-native" class="icon-action" title="同步本机 Codex">⟳</button></div>
+      <div class="sidebar-top"><div><h1>会话</h1></div><div class="sidebar-top-actions"><button id="sync-native" class="icon-action" title="同步本机 Codex">⟳</button><button id="sidebar-close" class="icon-action" type="button" title="关闭会话列表" aria-label="关闭会话列表">×</button></div></div>
       <div class="session-search"><span>⌕</span><input id="session-search" placeholder="搜索会话" /></div>
       <div class="session-filters"><button class="filter active" data-filter="all">全部</button><button class="filter" data-filter="running">进行中</button><button class="filter" data-filter="available">待处理</button><button class="filter trash-filter" data-panel="trash" title="打开回收站">回收站</button></div>
       <div id="running-summary" class="running-summary" hidden></div>
@@ -35,7 +35,7 @@
     <section class="conversation-shell">
       <div id="empty-conversation" class="empty-conversation"><div class="mascot mascot-large" aria-hidden="true"><i></i><b></b><em></em></div><h2>开始一个 Codex 会话</h2><p>从左侧选择已有线程，或新建一个会话开始工作。</p><button id="empty-new-task" class="primary">新建会话</button></div>
       <div id="conversation-view" class="conversation-view" hidden>
-        <header class="conversation-head"><div class="conversation-title"><button id="mobile-sessions" class="icon-action mobile-only" title="打开会话列表">☰</button><div><div class="conversation-title-line"><h2 id="conversation-name">Codex 会话</h2><button id="conversation-title-toggle" class="title-toggle" type="button" hidden>展开</button></div><p id="conversation-subtitle"></p></div></div><div class="conversation-actions"><button id="conversation-rename" class="icon-action" title="重命名">✎</button><button id="conversation-fork" class="icon-action" title="复制会话">⑂</button><button id="conversation-more" class="icon-action" title="更多操作">⋯</button></div></header>
+        <header class="conversation-head"><div class="conversation-title"><div><div class="conversation-title-line"><h2 id="conversation-name">Codex 会话</h2><button id="conversation-title-toggle" class="title-toggle" type="button" hidden>展开</button></div><p id="conversation-subtitle"></p></div></div><div class="conversation-actions"><button id="conversation-rename" class="icon-action" title="重命名">✎</button><button id="conversation-fork" class="icon-action" title="复制会话">⑂</button><button id="conversation-more" class="icon-action" title="更多操作">⋯</button></div></header>
         <div id="chat-log" class="chat-stream"></div>
         <div class="conversation-status-row">
           <div id="turn-progress" class="turn-progress" aria-hidden="true"><div class="turn-progress-inner"><span class="codex-working-mark" aria-hidden="true"><i></i></span><span class="turn-progress-copy" role="status" aria-live="polite"><small id="turn-progress-tip"></small></span><span class="turn-progress-rail" aria-hidden="true"></span></div></div>
@@ -62,11 +62,11 @@
   <script src="/vendor/i18next/i18next.min.js"></script>
   <script src="/vendor/ace/ace.js"></script>
   <script src="/vendor/ace/ext-modelist.js"></script>
-  <script src="/core.js?v=20260816-goal-run-mode"></script>
+  <script src="/core.js?v=20260816-sidebar-toggle"></script>
   <script src="/mascot-dance.js?v=20260816-game-sprites"></script>
   <script src="/editor.js?v=20260816-game-sprites"></script>
-  <script src="/conversation.js?v=20260816-goal-run-mode"></script>
+  <script src="/conversation.js?v=20260816-sidebar-toggle"></script>
   <script src="/settings.js?v=20260816-game-sprites"></script>
-  <script src="/app.js?v=20260816-goal-run-mode"></script>
+  <script src="/app.js?v=20260816-sidebar-toggle"></script>
 </body>
 </html>

@@ -63,7 +63,8 @@ document.addEventListener("click", async event => {
     if (button.dataset.panel) return openPanel(button.dataset.panel);
     if (button.id === "close-panel") return closePanel();
     if (button.id === "close-drawer" || button.id === "cancel") return closeDrawer();
-    if (button.id === "mobile-sessions") return $(".session-sidebar").classList.toggle("open");
+    if (button.id === "sidebar-toggle") return toggleSessionSidebar();
+    if (button.id === "sidebar-close") return setSessionSidebarOpen(false);
     if (button.id === "close-inspector") { state.inspectorClosed = true; setInspectorOpen(false); return; }
     if (button.dataset.workspaceChange !== undefined) return openWorkspacePicker();
     if (button.dataset.workspaceUpload !== undefined) {
@@ -499,6 +500,13 @@ window.addEventListener("online", () => {
   heartbeatRealtime();
 });
 setTheme(localStorage.getItem("codex-dashboard-theme") || "dark");
+let sidebarCompactViewport = window.innerWidth <= 860;
+restoreSessionSidebar();
+window.addEventListener("resize", () => {
+  const compact = window.innerWidth <= 860;
+  if (compact !== sidebarCompactViewport) { sidebarCompactViewport = compact; restoreSessionSidebar(); }
+  else updateSessionSidebarControls();
+});
 setInterval(updateTurnElapsed, 1000);
 setInterval(reconcileSelectedTaskStatus, 5000);
 setInterval(heartbeatRealtime, 10_000);

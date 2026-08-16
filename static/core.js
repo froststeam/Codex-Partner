@@ -35,6 +35,8 @@ const UI_LABELS = {
   queued: { zh: "排队中", en: "Queued", fr: "En file", ja: "待機中", ko: "대기 중" },
   failedSend: { zh: "发送失败", en: "Send failed", fr: "Échec de l'envoi", ja: "送信失敗", ko: "전송 실패" },
   firstMessage: { zh: "发送第一条消息，开始这个 Codex 会话。", en: "Send the first message to start this Codex session.", fr: "Envoyez un premier message pour démarrer cette session Codex.", ja: "最初のメッセージを送ってCodexセッションを開始します。", ko: "첫 메시지를 보내 Codex 세션을 시작하세요." },
+  openSessions: { zh: "打开会话列表", en: "Open sessions", fr: "Ouvrir les sessions", ja: "セッション一覧を開く", ko: "세션 목록 열기" },
+  closeSessions: { zh: "关闭会话列表", en: "Close sessions", fr: "Fermer les sessions", ja: "セッション一覧を閉じる", ko: "세션 목록 닫기" },
   wastelandTheme: { zh: "切换废土终端主题", en: "Switch to wasteland terminal theme", fr: "Activer le thème terminal rétro", ja: "ウェイストランド端末テーマに切替", ko: "황무지 터미널 테마로 전환" },
   darkTheme: { zh: "切换默认深色主题", en: "Switch to default dark theme", fr: "Revenir au thème sombre", ja: "標準ダークテーマに戻す", ko: "기본 다크 테마로 전환" },
   wastelandEnabled: { zh: "已进入废土终端模式", en: "Wasteland terminal enabled", fr: "Terminal rétro activé", ja: "ウェイストランド端末を有効化しました", ko: "황무지 터미널 모드 활성화" },
@@ -391,6 +393,7 @@ function applyLanguage(language = state.language) {
   for (const [selector, key] of Object.entries(titles)) { const node = $(selector); if (node) { node.title = t(key); node.setAttribute("aria-label", t(key)); } }
   const select = $("#language-select"); if (select) select.value = state.language;
   updateThemeToggle();
+  updateSessionSidebarControls();
   updateSSHLoginDialog();
   window.dispatchEvent(new CustomEvent("languagechange"));
 }
@@ -404,6 +407,40 @@ function setInspectorOpen(open) {
   inspector.classList.toggle("open", open);
   inspector.classList.toggle("closed", !open);
   inspector.setAttribute("aria-hidden", open ? "false" : "true");
+}
+function sessionSidebarIsOpen() {
+  const sidebar = $(".session-sidebar");
+  if (!sidebar) return false;
+  return window.innerWidth <= 860 ? sidebar.classList.contains("open") : !$(".workspace-app").classList.contains("sidebar-collapsed");
+}
+function updateSessionSidebarControls() {
+  const open = sessionSidebarIsOpen();
+  const toggle = $("#sidebar-toggle");
+  if (toggle) {
+    const label = uiLabel(open ? "closeSessions" : "openSessions");
+    toggle.title = label; toggle.setAttribute("aria-label", label); toggle.setAttribute("aria-expanded", String(open));
+  }
+  const close = $("#sidebar-close");
+  if (close) { close.title = uiLabel("closeSessions"); close.setAttribute("aria-label", uiLabel("closeSessions")); }
+  $(".session-sidebar")?.setAttribute("aria-hidden", open ? "false" : "true");
+}
+function setSessionSidebarOpen(open, persist = true) {
+  const sidebar = $(".session-sidebar");
+  const workspace = $(".workspace-app");
+  if (!sidebar || !workspace) return;
+  if (window.innerWidth <= 860) {
+    sidebar.classList.toggle("open", open);
+    workspace.classList.remove("sidebar-collapsed");
+  } else {
+    sidebar.classList.remove("open");
+    workspace.classList.toggle("sidebar-collapsed", !open);
+    if (persist) localStorage.setItem("codex-partner-sidebar-collapsed", open ? "0" : "1");
+  }
+  updateSessionSidebarControls();
+}
+function toggleSessionSidebar() { setSessionSidebarOpen(!sessionSidebarIsOpen()); }
+function restoreSessionSidebar() {
+  setSessionSidebarOpen(window.innerWidth <= 860 ? false : localStorage.getItem("codex-partner-sidebar-collapsed") !== "1", false);
 }
 let socket = null;
 let socketTaskId = null;

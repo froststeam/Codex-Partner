@@ -1114,7 +1114,7 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn("attachmentUploadName", app_js)
         self.assertIn("new File([file]", app_js)
         self.assertIn('uiLabel("binaryAttachment"', app_js)
-        self.assertIn('/app.js?v=20260816-goal-run-mode', html)
+        self.assertIn('/app.js?v=20260816-sidebar-toggle', html)
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
@@ -1243,6 +1243,20 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn("setInspectorOpen(window.innerWidth >= 861", conversation_js)
         self.assertIn("grid-template-columns: 272px minmax(0, 1fr) auto", styles)
         self.assertIn(".inspector.closed", styles)
+
+    def test_session_sidebar_can_toggle_and_persist_on_desktop(self):
+        static = Path(__file__).resolve().parents[1] / "static"
+        html = (static / "index.html").read_text(encoding="utf-8")
+        core_js = (static / "core.js").read_text(encoding="utf-8")
+        app_js = (static / "app.js").read_text(encoding="utf-8")
+        styles = (static / "styles.css").read_text(encoding="utf-8")
+        self.assertIn('initial-scale=0.9', html)
+        self.assertIn('id="sidebar-toggle"', html)
+        self.assertIn('id="sidebar-close"', html)
+        self.assertIn("function setSessionSidebarOpen", core_js)
+        self.assertIn('codex-partner-sidebar-collapsed', core_js)
+        self.assertIn('button.id === "sidebar-close"', app_js)
+        self.assertIn(".workspace-app.sidebar-collapsed", styles)
 
     def test_send_queues_behind_active_turn(self):
         static = Path(__file__).resolve().parents[1] / "static"

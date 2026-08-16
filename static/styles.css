@@ -17,6 +17,8 @@ button, input, textarea, select { font: inherit; }
 button { cursor: pointer; }
 .topbar { position: relative; height: 58px; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; padding: 0 20px; border-bottom: 1px solid var(--line); background: #151c20; }
 .brand { display: flex; align-items: center; gap: 10px; font-size: 14px; font-weight: 700; letter-spacing: .01em; }
+.sidebar-toggle { width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid #334148; border-radius: 5px; padding: 0; font-size: 16px; }
+.sidebar-toggle[aria-expanded="false"] { border-color: #526742; background: #202d24; color: var(--lime); }
 .theme-toggle { display: grid; place-items: center; width: 35px; height: 35px; padding: 3px; border: 1px solid transparent; border-radius: 9px; background: transparent; color: inherit; }
 .theme-toggle:hover { border-color: #52615d; background: #202a2f; }
 .theme-toggle:focus-visible { outline: 2px solid var(--lime); outline-offset: 2px; }
@@ -82,10 +84,13 @@ button { cursor: pointer; }
 @keyframes connection-enter { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes connection-spin { to { transform: rotate(360deg); } }
 @keyframes connection-ring { 0% { opacity: .9; transform: scale(.75); } 80%, 100% { opacity: 0; transform: scale(1.2); } }
-.workspace-app { height: calc(100vh - 58px); height: calc(100dvh - 58px); min-height: 0; display: grid; grid-template-columns: 272px minmax(0, 1fr) auto; grid-template-rows: minmax(0, 1fr); overflow: hidden; }
+.workspace-app { height: calc(100vh - 58px); height: calc(100dvh - 58px); min-height: 0; display: grid; grid-template-columns: 272px minmax(0, 1fr) auto; grid-template-rows: minmax(0, 1fr); overflow: hidden; transition: grid-template-columns .18s ease; }
+.workspace-app.sidebar-collapsed { grid-template-columns: 0 minmax(0, 1fr) auto; }
+.workspace-app.sidebar-collapsed .session-sidebar { overflow: hidden; border-right: 0; opacity: 0; pointer-events: none; }
 body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56px; }
-.session-sidebar { min-width: 0; min-height: 0; height: 100%; display: flex; flex-direction: column; border-right: 1px solid var(--line); background: #11181c; }
+.session-sidebar { min-width: 0; min-height: 0; height: 100%; display: flex; flex-direction: column; border-right: 1px solid var(--line); background: #11181c; transition: opacity .14s ease; }
 .sidebar-top { display: flex; align-items: flex-start; justify-content: space-between; padding: 22px 18px 14px; }
+.sidebar-top-actions { display: flex; align-items: center; gap: 2px; }
 .sidebar-top h1 { margin: 2px 0 0; font-size: 20px; letter-spacing: -.02em; }
 .sidebar-kicker, .eyebrow, .inspector-label { display: block; color: #8fa06a; font-size: 10px; letter-spacing: .14em; font-weight: 800; }
 .session-search { display: flex; align-items: center; gap: 8px; margin: 0 13px 11px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: #0d1316; color: var(--muted); }
@@ -598,6 +603,7 @@ body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56p
 @media (max-width: 860px) {
   .top-actions { margin-right: 0; }
   .connection-popover { top: 62px; right: auto; left: 10px; width: min(246px, calc(100vw - 20px)); }
+  .workspace-app.sidebar-collapsed .session-sidebar { overflow: visible; border-right: 1px solid var(--line); opacity: 1; pointer-events: auto; }
 }
 @media (max-width: 600px) { .connection-server { grid-template-columns: 28px minmax(0, 1fr); }.connection-server > .provider-health { grid-column: 2; justify-self: start; }.connection-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }.connection-facts > div { border-bottom: 1px solid #28343a; }.connection-facts > div:nth-child(2) { border-right: 0; }.connection-facts > div:nth-last-child(-n+2) { border-bottom: 0; }.connection-section-head { align-items: stretch; flex-direction: column; }.connection-section-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }.connection-provider-route { grid-template-columns: minmax(0, 1fr); gap: 3px; }.connection-provider-meta { gap: 4px 9px; }.connection-provider-actions { justify-content: stretch; }.connection-provider-actions button { flex: 1 1 auto; }.connection-provider-actions .danger-text { margin-left: 0; }.codex-management-grid { grid-template-columns: minmax(0, 1fr); } }
 @media (max-width: 600px) {

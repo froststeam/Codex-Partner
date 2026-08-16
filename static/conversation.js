@@ -83,7 +83,7 @@ async function selectSession(id, openSocket = true) {
   if (wasEmpty && window.innerWidth >= 861) state.inspectorClosed = false;
   setInspectorOpen(window.innerWidth >= 861 && !state.inspectorClosed);
   renderSessionList(); renderConversation(); await loadWorkspace("");
-  if (openSocket) connectSocket(id); if (window.innerWidth < 900) $(".session-sidebar").classList.remove("open");
+  if (openSocket) connectSocket(id); if (window.innerWidth <= 860) setSessionSidebarOpen(false);
 }
 function renderConversation() {
   const task = state.selectedTask; if (!task) return;
