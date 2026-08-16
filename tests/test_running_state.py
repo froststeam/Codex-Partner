@@ -1114,7 +1114,7 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn("attachmentUploadName", app_js)
         self.assertIn("new File([file]", app_js)
         self.assertIn('uiLabel("binaryAttachment"', app_js)
-        self.assertIn('/app.js?v=20260816-game-sprites', html)
+        self.assertIn('/app.js?v=20260816-status-reconcile', html)
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
@@ -1150,6 +1150,15 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn("cursor: pointer", styles)
         self.assertIn(".composer-dock { grid-template-columns: minmax(0, 1fr);", styles)
         self.assertIn(".composer-model-control { order: -3; }", styles)
+
+    def test_active_task_status_is_reconciled_after_missed_completion_event(self):
+        static = Path(__file__).resolve().parents[1] / "static"
+        core_js = (static / "core.js").read_text(encoding="utf-8")
+        app_js = (static / "app.js").read_text(encoding="utf-8")
+        self.assertIn("async function reconcileSelectedTaskStatus()", core_js)
+        self.assertIn("authoritative.status !== state.selectedTask.status", core_js)
+        self.assertIn("setInterval(reconcileSelectedTaskStatus, 5000)", app_js)
+        self.assertIn("reconcileSelectedTaskStatus();", app_js)
 
     def test_language_picker_title_collapse_and_mascot_are_wired(self):
         static = Path(__file__).resolve().parents[1] / "static"

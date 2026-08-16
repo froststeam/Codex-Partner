@@ -422,6 +422,7 @@ let terminalReconnectAttempt = 0;
 let terminalShouldReconnect = false;
 let queueSyncTimer = null;
 let queueSyncInFlight = false;
+let taskStatusSyncInFlight = false;
 let markdownComponents = [];
 const livePhases = new Map();
 const liveStartedAt = new Map();
@@ -796,6 +797,26 @@ function renderTurnProgress() {
   if (!livePhases.has(task.id)) livePhases.set(task.id, task.external_phase || latestActivityPhase(task) || (task.status === "queued" ? "phaseQueued" : "phaseAnalyzing"));
   node.setAttribute("aria-label", task.status === "retrying" ? uiLabel("recoveringTitle") : uiLabel("workingTitle"));
   updateTurnElapsed();
+}
+async function reconcileSelectedTaskStatus() {
+  const current = state.selectedTask;
+  if (!current || !["running", "retrying", "queued"].includes(current.status) || taskStatusSyncInFlight) return;
+  const taskId = current.id;
+  taskStatusSyncInFlight = true;
+  try {
+    const authoritative = await api(`/tasks/${encodeURIComponent(taskId)}`);
+    if (state.selectedId !== taskId || !state.selectedTask) return;
+    const changed = authoritative.status !== state.selectedTask.status
+      || authoritative.active_session_id !== state.selectedTask.active_session_id
+      || authoritative.updated_at !== state.selectedTask.updated_at;
+    state.selectedTask = { ...state.selectedTask, ...authoritative };
+    mergeTask(authoritative);
+    if (changed) { renderConversation(); renderSessionList(); renderSidebarStats(); }
+  } catch (_) {
+    // Realtime reconnect handling remains authoritative while the server is unavailable.
+  } finally {
+    taskStatusSyncInFlight = false;
+  }
 }
 function isUserEvent(event) { const payload = eventValue(event.payload); return payload?.type === "userMessage" || payload?.type === "browserMessage" || payload?.type === "slashCommand" || event.stream === "user"; }
 function isAssistantEvent(event) { const payload = eventValue(event.payload); return payload?.type === "agentMessage" || payload?.type === "agent_delta" || payload?.type === "commandResult" || event.stream === "assistant"; }

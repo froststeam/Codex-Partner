@@ -487,7 +487,7 @@ document.addEventListener("keydown", event => {
   mascotDanceIndex = 0;
   triggerMascotDance();
 });
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") { connectOverviewSocket(); if (state.selectedId && !socketPaused && (!socket || socket.readyState === WebSocket.CLOSED)) connectSocket(state.selectedId, true); if (terminalTaskId && terminalShouldReconnect && !terminalSocket) connectTerminal(terminalTaskId, true); } });
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") { connectOverviewSocket(); if (state.selectedId && !socketPaused && (!socket || socket.readyState === WebSocket.CLOSED)) connectSocket(state.selectedId, true); if (terminalTaskId && terminalShouldReconnect && !terminalSocket) connectTerminal(terminalTaskId, true); reconcileSelectedTaskStatus(); } });
 window.addEventListener("offline", renderConnectionStatus);
 window.addEventListener("online", () => {
   setRealtimeChannel("overview", "reconnecting");
@@ -500,6 +500,7 @@ window.addEventListener("online", () => {
 });
 setTheme(localStorage.getItem("codex-dashboard-theme") || "dark");
 setInterval(updateTurnElapsed, 1000);
+setInterval(reconcileSelectedTaskStatus, 5000);
 setInterval(heartbeatRealtime, 10_000);
 renderConnectionStatus();
 showEmptyConversation(); refresh(false);
