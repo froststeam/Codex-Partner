@@ -74,6 +74,28 @@ class RunningStateTests(unittest.TestCase):
             self.app.overview_client_users.pop(own_device, None)
             self.app.overview_client_users.pop(other_user, None)
 
+    def test_app_server_reads_large_json_messages_in_chunks(self):
+        async def collect():
+            payload = json.dumps({"id": 7, "result": {"text": "x" * (2 * 1024 * 1024)}}).encode() + b"\n"
+
+            class Stdout:
+                def __init__(self):
+                    self.chunks = [payload[:700_000], payload[700_000:1_400_000], payload[1_400_000:]]
+
+                async def read(self, _size):
+                    return self.chunks.pop(0) if self.chunks else b""
+
+            class Process:
+                stdout = Stdout()
+
+            client = self.app.AppServerClient({}, "large-json")
+            client.process = Process()
+            return [line async for line in client._message_lines()]
+
+        lines = asyncio.run(collect())
+        self.assertEqual(1, len(lines))
+        self.assertEqual(2 * 1024 * 1024, len(json.loads(lines[0])["result"]["text"]))
+
     def test_timeline_uses_cursor_pages_without_overlap(self):
         task_id = f"timeline-{time.time_ns()}"
         self.make_task(task_id, "available")
@@ -1150,6 +1172,8 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn("new File([file]", app_js)
         self.assertIn('uiLabel("binaryAttachment"', app_js)
         self.assertIn('/app.js?v=20260816-avatar-sync', html)
+        self.assertIn('/core.js?v=20260816-large-json', html)
+        self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)

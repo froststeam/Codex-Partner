@@ -595,8 +595,18 @@ async function api(path, options = {}, canPrompt = true) {
   if (response.status === 401 && canPrompt) {
     if (await requestSSHLogin()) return api(path, options, false);
   }
-  if (!response.ok) { const error = await response.json().catch(() => ({ detail: response.statusText })); throw Error(error.detail || response.statusText); }
+  if (!response.ok) throw Error(await responseErrorMessage(response));
   return response.json();
+}
+async function responseErrorMessage(response) {
+  const text = await response.text().catch(() => "");
+  try {
+    const payload = JSON.parse(text);
+    if (payload?.detail) return String(payload.detail);
+  } catch (_) { /* Non-JSON server and proxy errors are expected here. */ }
+  const plain = text.trim();
+  if (plain && !plain.startsWith("<") && plain.length <= 500) return plain;
+  return `${response.status} ${response.statusText || "Request failed"}`.trim();
 }
 function toast(message) { const node = $("#toast"); node.textContent = message; node.classList.add("show"); setTimeout(() => node.classList.remove("show"), 2600); }
 async function copyText(value) {

@@ -584,8 +584,7 @@ async function workspaceFetch(path, options = {}, canPrompt = true) {
 }
 
 async function workspaceResponseError(response) {
-  const payload = await response.json().catch(() => ({ detail: response.statusText }));
-  return Error(payload.detail || response.statusText);
+  return Error(await responseErrorMessage(response));
 }
 
 async function uploadWorkspaceFile(taskId, destination, file, overwrite = false) {

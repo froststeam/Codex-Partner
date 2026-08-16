@@ -76,7 +76,7 @@ class AppServerClient:
     async def _reader(self) -> None:
         assert self.process and self.process.stdout
         try:
-            async for raw in self.process.stdout:
+            async for raw in self._message_lines():
                 try:
                     message = json.loads(raw.decode(errors="replace"))
                 except json.JSONDecodeError:
@@ -113,6 +113,21 @@ class AppServerClient:
                 waiter = self.turn_waiters.pop(thread_id, None)
                 if waiter and not waiter.done():
                     waiter.set_exception(error)
+
+    async def _message_lines(self):
+        """Read newline-delimited RPC without StreamReader's line-size ceiling."""
+        assert self.process and self.process.stdout
+        buffered = bytearray()
+        while chunk := await self.process.stdout.read(1024 * 1024):
+            buffered.extend(chunk)
+            while (newline := buffered.find(b"\n")) >= 0:
+                raw = bytes(buffered[:newline]).rstrip(b"\r")
+                del buffered[: newline + 1]
+                if raw:
+                    yield raw
+        raw = bytes(buffered).strip()
+        if raw:
+            yield raw
 
     async def notify(self, method: str, params: Any = None) -> None:
         message = {"method": method}
