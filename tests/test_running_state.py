@@ -102,6 +102,43 @@ class RunningStateTests(unittest.TestCase):
         self.assertEqual(1, len(lines))
         self.assertEqual(2 * 1024 * 1024, len(json.loads(lines[0])["result"]["text"]))
 
+    def test_appserver_turn_inputs_preserve_native_modalities_and_workspace_boundary(self):
+        workspace = Path(self.temp.name) / "input-workspace"
+        workspace.mkdir(exist_ok=True)
+        (workspace / "screen.png").write_bytes(b"image")
+        (workspace / "notes.pdf").write_bytes(b"pdf")
+        (workspace / "voice.ogg").write_bytes(b"audio")
+        task = {"workspace": str(workspace), "prompt": "fallback", "context": "", "ssh_host": ""}
+        message = (
+            "inspect these\n"
+            "[[codex-input:localImage:screen.png]]\n"
+            "[[codex-input:mention:notes.pdf]]\n"
+            "[[codex-input:localAudio:voice.ogg]]\n"
+            "[[codex-input:mention:..%2Fsecret.txt]]"
+        )
+        inputs = self.app.appserver_turn_inputs(task, message)
+        self.assertEqual("text", inputs[0]["type"])
+        self.assertNotIn("codex-input", inputs[0]["text"])
+        self.assertEqual(
+            ["localImage", "mention", "localAudio"],
+            [item["type"] for item in inputs[1:]],
+        )
+        self.assertEqual("original", inputs[1]["detail"])
+        self.assertEqual("notes.pdf", inputs[2]["name"])
+        self.assertTrue(all(str(workspace) in item["path"] for item in inputs[1:]))
+
+    def test_attachment_frontend_uses_structured_appserver_inputs(self):
+        static = Path(__file__).resolve().parents[1] / "static"
+        app_js = (static / "app.js").read_text(encoding="utf-8")
+        conversation = (static / "conversation.js").read_text(encoding="utf-8")
+        worker = (static / "chat-worker.js").read_text(encoding="utf-8")
+        self.assertIn("[[codex-input:${file.inputType", app_js)
+        self.assertIn('modalities.includes("image")', app_js)
+        self.assertIn('modalities.includes("audio")', app_js)
+        self.assertIn("inputModalities", conversation)
+        self.assertIn("localImage|localAudio|mention", worker)
+        self.assertIn('mediaKind === "audio"', conversation)
+
     def test_controlled_appserver_approval_waits_for_browser_choice(self):
         task_id, thread_id, server_key = "controlled-approval", "approval-thread", "approval-server"
         self.make_task(task_id)
@@ -1287,7 +1324,7 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn("attachmentUploadName", app_js)
         self.assertIn("new File([file]", app_js)
         self.assertIn('uiLabel("binaryAttachment"', app_js)
-        self.assertIn('/app.js?v=20260816-controlled-approvals', html)
+        self.assertIn('/app.js?v=20260816-structured-inputs', html)
         self.assertIn('/core.js?v=20260816-composer-toggle', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
@@ -1476,11 +1513,11 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260816-controlled-approvals', html)
+        self.assertIn('/conversation.js?v=20260816-structured-inputs', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
-        self.assertIn('/styles.css?v=20260816-aligned-queue', html)
+        self.assertIn('/styles.css?v=20260816-structured-inputs', html)
         self.assertIn(".queued-messages { width: auto; height: auto; min-height: 0; max-height: none; align-self: stretch;", styles)
-        self.assertIn('/chat-worker.js?v=20260816-stable-chat-scroll', conversation_js)
+        self.assertIn('/chat-worker.js?v=20260816-structured-inputs', conversation_js)
         self.assertIn("scroll-behavior: auto", styles)
         self.assertIn("grid-template-columns: auto minmax(0, 1fr) auto", styles)
         self.assertIn(".shortcut-hints { position: absolute; left: 50%", styles)

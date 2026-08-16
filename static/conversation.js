@@ -2,7 +2,7 @@
 const chatFileObjectUrls = new Map();
 const chatThumbnailObjectUrls = new Map();
 const chatThumbnailLoads = new Map();
-const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260816-stable-chat-scroll") : null;
+const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260816-structured-inputs") : null;
 let chatBuildRequestId = 0;
 let chatHistoryLoadPromise = null;
 function renderSidebarStats() {
@@ -119,8 +119,26 @@ function renderConversation() {
 const composerModelCache = new Map();
 const composerModelLoads = new Map();
 function normalizeModelItems(raw) {
-  const items = (Array.isArray(raw) ? raw : []).map(item => typeof item === "string" ? { id: item, label: item } : { id: item?.id || item?.model || item?.slug || "", label: item?.displayName || item?.display_name || item?.label || item?.name || item?.id || item?.model || item?.slug || "" }).filter(item => item.id);
+  const items = (Array.isArray(raw) ? raw : []).map(item => {
+    if (typeof item === "string") return { id: item, label: item, inputModalities: [] };
+    return {
+      ...item,
+      id: item?.id || item?.model || item?.slug || "",
+      label: item?.displayName || item?.display_name || item?.label || item?.name || item?.id || item?.model || item?.slug || "",
+      inputModalities: item?.inputModalities || item?.input_modalities || [],
+      isDefault: Boolean(item?.isDefault ?? item?.is_default),
+    };
+  }).filter(item => item.id);
   return [...new Map(items.map(item => [item.id, item])).values()];
+}
+function selectedModelInputModalities() {
+  const task = state.selectedTask;
+  if (!task) return ["text", "image"];
+  const cached = composerModelCache.get(`${task.id}:${task.provider_id || "default"}`) || {};
+  const models = normalizeModelItems(Array.isArray(cached) ? cached : cached.models || []);
+  const selected = models.find(item => item.id === task.model) || models.find(item => item.isDefault);
+  const modalities = selected?.inputModalities?.map(value => String(value).toLowerCase()).filter(Boolean) || [];
+  return modalities.length ? modalities : ["text", "image"];
 }
 function renderComposerModelSelect(task, models = []) {
   const select = $("#composer-model-select");
@@ -462,7 +480,8 @@ async function hydrateChatFiles() {
       const imageByName = Boolean(imageMime);
       const taskId = state.selectedId;
       const cacheKey = `${taskId}:${path}`;
-      const isImage = imageByName;
+      const mediaKind = node.dataset.chatMedia || "";
+      const isImage = node.dataset.chatKind === "localImage" || imageByName;
       const preview = node.querySelector(".chat-file-preview");
       if (isImage && preview) {
         let url = chatThumbnailObjectUrls.get(cacheKey) || "";
@@ -498,6 +517,19 @@ async function hydrateChatFiles() {
             if (tab) tab.location.href = original; else window.open(original, "_blank", "noopener");
           } catch (error) { if (tab) tab.close(); toast(error.message); }
         };
+      } else if (["audio", "video"].includes(mediaKind) && preview) {
+        let url = chatFileObjectUrls.get(cacheKey) || "";
+        if (!url) {
+          const response = await workspaceFetch(`/tasks/${encodeURIComponent(taskId)}/workspace/download?path=${encodeURIComponent(path)}`);
+          if (!response.ok) throw new Error("media load failed");
+          url = URL.createObjectURL(await response.blob());
+          chatFileObjectUrls.set(cacheKey, url);
+        }
+        preview.hidden = false;
+        preview.classList.add("chat-media-preview");
+        preview.innerHTML = mediaKind === "audio"
+          ? `<audio controls preload="metadata" src="${url}"></audio>`
+          : `<video controls preload="metadata" src="${url}"></video>`;
       } else {
         node.classList.add("file-only"); node.tabIndex = 0; node.setAttribute("role", "link");
         node.onclick = async () => {

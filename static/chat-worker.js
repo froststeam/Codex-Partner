@@ -92,8 +92,9 @@ function mergeEvents(events, messages) {
 function markdown(text) {
   const files = [];
   const clean = String(text || "")
-    .replace(/\[\[codex-file:([^\]]+)\]\]/g, (_, path) => { files.push(decodeURIComponent(path)); return ""; })
-    .replace(/(?:Uploaded to workspace|已上传到工作区)\s*[:：]\s*([^\n\r，。]+?\.[a-z0-9]{1,12})(?=\s|[，。]|$)/gi, (_, path) => { files.push(path.trim()); return ""; })
+    .replace(/\[\[codex-input:(localImage|localAudio|mention):([^\]]+)\]\]/g, (_, kind, path) => { files.push({ kind, path: decodeURIComponent(path) }); return ""; })
+    .replace(/\[\[codex-file:([^\]]+)\]\]/g, (_, path) => { files.push({ kind: "legacy", path: decodeURIComponent(path) }); return ""; })
+    .replace(/(?:Uploaded to workspace|已上传到工作区)\s*[:：]\s*([^\n\r，。]+?\.[a-z0-9]{1,12})(?=\s|[，。]|$)/gi, (_, path) => { files.push({ kind: "legacy", path: path.trim() }); return ""; })
     .replace(/\[(?:Attachments?|附件)\s*[:：]\s*[^\]]+\]/gi, "")
     .trim();
   const body = escapeHtml(clean)
@@ -104,11 +105,16 @@ function markdown(text) {
     .replace(/^###\s+(.+)$/gm, "<h4>$1</h4>")
     .replace(/^[-*]\s+(.+)$/gm, '<span class="markdown-bullet">$1</span>')
     .replace(/\n/g, "<br>");
-  return body + [...new Set(files)].map(path => {
+  const uniqueFiles = [...new Map(files.map(file => [file.path, file])).values()];
+  return body + uniqueFiles.map(file => {
+    const path = file.path;
     const safePath = escapeHtml(path);
-    if (/\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(path)) return `<div class="chat-file-attachment chat-image-attachment" data-chat-file="${safePath}"><span class="chat-file-preview"></span></div>`;
+    const kind = file.kind === "legacy" ? (/\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(path) ? "localImage" : "mention") : file.kind;
+    if (kind === "localImage") return `<div class="chat-file-attachment chat-image-attachment" data-chat-kind="${kind}" data-chat-file="${safePath}"><span class="chat-file-preview"></span></div>`;
     const name = escapeHtml(path.split("/").pop() || path);
-    return `<div class="chat-file-attachment" data-chat-file="${safePath}"><span class="chat-file-icon">▤</span><span class="chat-file-copy"><strong>${name}</strong><small>${safePath}</small></span><span class="chat-file-preview" hidden></span></div>`;
+    const mediaKind = kind === "localAudio" || /\.(mp3|wav|m4a|aac|flac|ogg|opus)$/i.test(path) ? "audio" : /\.(mp4|webm|mov|m4v|ogv)$/i.test(path) ? "video" : /\.pdf$/i.test(path) ? "pdf" : "file";
+    const icon = { audio: "AUD", video: "VID", pdf: "PDF", file: "FILE" }[mediaKind];
+    return `<div class="chat-file-attachment chat-${mediaKind}-attachment" data-chat-kind="${kind}" data-chat-media="${mediaKind}" data-chat-file="${safePath}"><span class="chat-file-icon">${icon}</span><span class="chat-file-copy"><strong>${name}</strong><small>${safePath}</small></span><span class="chat-file-preview" hidden></span></div>`;
   }).join("");
 }
 

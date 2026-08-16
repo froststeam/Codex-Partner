@@ -223,7 +223,7 @@ async function submitMessage(mode = "codex") {
   if (pendingAttachments.length) {
     message += pendingAttachments.map((file, index) => {
       const prefix = message || index ? "\n\n" : "";
-      if (file.binary) return `${prefix}[${uiLabel("attachments")}：${file.name}]\n${uiLabel("binaryAttachment", { path: file.workspacePath || file.name })}\n[[codex-file:${encodeURIComponent(file.workspacePath || file.name)}]]`;
+      if (file.binary) return `${prefix}[${uiLabel("attachments")}：${file.name}]\n${uiLabel("binaryAttachment", { path: file.workspacePath || file.name })}\n[[codex-input:${file.inputType || "mention"}:${encodeURIComponent(file.workspacePath || file.name)}]]`;
       return `${prefix}[${uiLabel("attachments")}：${file.name}]\n\n\`\`\`\n${file.content}\n\`\`\``;
     }).join("");
   }
@@ -321,7 +321,8 @@ function renderComposerAttachments() {
   if (!context) return;
   context.classList.toggle("attachments", Boolean(pendingAttachments.length));
   if (!pendingAttachments.length) { context.textContent = ""; return; }
-  context.innerHTML = pendingAttachments.map((file, index) => `<span class="composer-attachment" title="${esc(file.name)}"><span aria-hidden="true">▤</span><strong>${esc(file.name)}</strong><small>${formatBytes(file.size)}</small><button type="button" data-composer-attachment-remove="${index}" title="${uiLabel("delete")}">×</button></span>`).join("");
+  const icons = { localImage: "IMG", localAudio: "AUD", mention: "FILE" };
+  context.innerHTML = pendingAttachments.map((file, index) => `<span class="composer-attachment" title="${esc(file.name)}"><span class="composer-attachment-kind" aria-hidden="true">${icons[file.inputType] || (file.binary ? "FILE" : "TXT")}</span><strong>${esc(file.name)}</strong><small>${formatBytes(file.size)}</small><button type="button" data-composer-attachment-remove="${index}" title="${uiLabel("delete")}">×</button></span>`).join("");
 }
 function attachmentUploadName(name) {
   const value = String(name || "attachment").replace(/[^\w.()\-\u4e00-\u9fff ]/g, "_").trim() || "attachment";
@@ -364,7 +365,11 @@ async function attachComposerFiles(fileList) {
       const result = await uploadWorkspaceFile(state.selectedId, state.workspacePath || "", uploadFile);
       if (result?.skipped) continue;
       const workspacePath = result?.entry?.path || `${state.workspacePath ? `${state.workspacePath}/` : ""}${name}`;
-      added.push({ name, size: file.size || 0, content: "", binary: true, workspacePath });
+      const modalities = selectedModelInputModalities();
+      const imageFile = ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(String(file.type || "").toLowerCase()) || /\.(png|jpe?g|gif|webp)$/i.test(name);
+      const audioFile = String(file.type || "").startsWith("audio/") || /\.(mp3|wav|m4a|aac|flac|ogg|opus|webm)$/i.test(name);
+      const inputType = imageFile && modalities.includes("image") ? "localImage" : audioFile && modalities.includes("audio") ? "localAudio" : "mention";
+      added.push({ name, size: file.size || 0, content: "", binary: true, workspacePath, inputType });
     } catch (error) {
       toast(error?.message ? `${uiLabel("fileUploadFailed", { name })}：${error.message}` : uiLabel("fileReadFailed", { name }));
     }

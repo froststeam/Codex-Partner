@@ -2228,7 +2228,6 @@ async def supervise_appserver_turn(
             goal_result = await client.request("thread/goal/set", {"threadId": thread_id, "objective": goal_task["goal"], "status": goal_task.get("goal_status") if goal_task.get("goal_status") not in {None, "none"} else "active"})
             goal = goal_result.get("goal") or {}
             db.execute("UPDATE tasks SET goal_status=?, goal_tokens_used=?, updated_at=? WHERE id=?", (goal.get("status", "active"), goal.get("tokensUsed", 0), now(), task["id"]))
-        prompt = prompt_for(task, message)
         codex_label = f"ssh {task['ssh_host']} codex" if task.get("ssh_host") else CODEX_BIN
         command = shlex.join([codex_label, "app-server", "thread/resume" if mode != "start" else "thread/start", thread_id, "turn/start"])
         db.execute("UPDATE sessions SET command=?, codex_session_id=? WHERE id=?", (command, thread_id, session_id))
@@ -2238,7 +2237,7 @@ async def supervise_appserver_turn(
         turn_waiters[thread_id] = waiter
         turn_params = {
             "threadId": thread_id,
-            "input": [{"type": "text", "text": prompt}],
+            "input": appserver_turn_inputs(task, message),
             "approvalPolicy": approval,
             "clientUserMessageId": message_id or None,
             **turn_settings(task, provider, sandbox_policy),
@@ -2861,6 +2860,63 @@ def prompt_for(task: dict, override: str = "") -> str:
     if skills:
         prompt = f"{prompt}\n\nAvailable skills:\n{skills}"
     return prompt
+
+
+CODEX_INPUT_MARKER = re.compile(r"\[\[codex-input:(localImage|localAudio|mention):([^\]]+)\]\]")
+LEGACY_FILE_MARKER = re.compile(r"\[\[codex-file:([^\]]+)\]\]")
+IMAGE_FILE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+
+def appserver_attachment_path(task: dict, encoded_path: str) -> tuple[str, str] | None:
+    """Resolve a browser attachment without allowing it to escape the task workspace."""
+    relative = urllib.parse.unquote(encoded_path).strip().replace("\\", "/")
+    candidate_path = PurePosixPath(relative)
+    if not relative or "\0" in relative or candidate_path.is_absolute() or ".." in candidate_path.parts:
+        return None
+    normalized = candidate_path.as_posix()
+    if task.get("ssh_host"):
+        return normalized, posixpath.join(str(task["workspace"]), normalized)
+    try:
+        _root, candidate = workspace_path(task, normalized)
+    except HTTPException:
+        return None
+    if not candidate.is_file() or workspace_hidden(candidate):
+        return None
+    return normalized, str(candidate)
+
+
+def appserver_turn_inputs(task: dict, message: str) -> list[dict[str, Any]]:
+    """Translate durable chat markers into the structured app-server input protocol."""
+    attachments: list[tuple[str, str]] = []
+
+    def collect(match: re.Match, legacy: bool = False) -> str:
+        encoded_path = match.group(1) if legacy else match.group(2)
+        resolved = appserver_attachment_path(task, encoded_path)
+        if resolved:
+            relative, absolute = resolved
+            kind = "localImage" if legacy and PurePosixPath(relative).suffix.lower() in IMAGE_FILE_SUFFIXES else ("mention" if legacy else match.group(1))
+            attachments.append((kind, absolute))
+        return ""
+
+    clean_message = CODEX_INPUT_MARKER.sub(collect, message)
+    clean_message = LEGACY_FILE_MARKER.sub(lambda match: collect(match, True), clean_message)
+    inputs: list[dict[str, Any]] = []
+    prompt = prompt_for(task, clean_message.strip())
+    if prompt:
+        inputs.append({"type": "text", "text": prompt})
+    seen: set[tuple[str, str]] = set()
+    for kind, path in attachments:
+        if (kind, path) in seen:
+            continue
+        seen.add((kind, path))
+        if kind == "mention":
+            inputs.append({"type": "mention", "name": PurePosixPath(path).name, "path": path})
+        else:
+            item: dict[str, Any] = {"type": kind, "path": path}
+            if kind == "localImage":
+                item["detail"] = "original"
+            inputs.append(item)
+    return inputs
 
 
 def requested_run_mode(task: dict, mode: str, message_id: str = "") -> str:
@@ -4349,7 +4405,7 @@ async def download_workspace_file(task_id: str, path: str, _: Any = Depends(auth
 
         filename = metadata["entry"]["name"]
         media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        mode = "inline" if media_type.startswith("image/") else "attachment"
+        mode = "inline" if media_type.startswith(("image/", "audio/", "video/")) or media_type == "application/pdf" else "attachment"
         disposition = f"{mode}; filename*=UTF-8''{urllib.parse.quote(filename)}"
         return StreamingResponse(stream_remote_file(), media_type=media_type, headers={"Content-Disposition": disposition})
     _root, candidate = workspace_path(task, path)
@@ -4360,7 +4416,7 @@ async def download_workspace_file(task_id: str, path: str, _: Any = Depends(auth
     if workspace_hidden(candidate):
         raise HTTPException(403, "Sensitive workspace files are not available for browser download")
     media_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
-    disposition = "inline" if media_type.startswith("image/") else "attachment"
+    disposition = "inline" if media_type.startswith(("image/", "audio/", "video/")) or media_type == "application/pdf" else "attachment"
     return FileResponse(candidate, media_type=media_type, content_disposition_type=disposition, filename=candidate.name)
 
 
@@ -4821,7 +4877,7 @@ async def steer_task_message(task_id: str, payload: TaskMessageIn, _: Any = Depe
             {
                 "threadId": thread_id,
                 "expectedTurnId": turn_id,
-                "input": [{"type": "text", "text": message_body}],
+                "input": appserver_turn_inputs(task_or_404(task_id), message_body),
                 "clientUserMessageId": message_id,
             },
         )
