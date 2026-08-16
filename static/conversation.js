@@ -229,7 +229,7 @@ function renderGoalBar() {
   bar.hidden = false;
   const goal = String(task.goal || "").trim();
   const activeTurn = ["running", "retrying", "queued"].includes(task.status);
-  const goalRunning = Boolean(goal) && activeTurn && task.goal_status !== "paused";
+  const goalRunning = Boolean(goal) && activeTurn && task.run_mode === "goal_resume" && task.goal_status !== "paused";
   const inputHasContent = Boolean($("#message-input")?.value.trim() || pendingAttachments.length);
   $("#goal-text").textContent = goal;
   $("#goal-text").classList.toggle("empty", !goal);

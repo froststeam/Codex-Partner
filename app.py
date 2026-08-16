@@ -856,16 +856,17 @@ def persist_external_task_status(task_id: str, dashboard_active: Optional[bool] 
     external = refresh_external_primary(task_id)
     if not external:
         return None
-    task = db.one("SELECT active_session_id FROM tasks WHERE id=?", (task_id,)) or {}
+    task = db.one("SELECT active_session_id,run_mode FROM tasks WHERE id=?", (task_id,)) or {}
     if dashboard_active is None:
         dashboard_active = dashboard_owns_task(task_id)
     active_session_id = task.get("active_session_id") if dashboard_active else external.get("session_id")
     db.execute(
-        "UPDATE tasks SET status='running',active_session_id=?,execution_source=?,execution_turn_id=?,last_error='',updated_at=? WHERE id=?",
+        "UPDATE tasks SET status='running',active_session_id=?,execution_source=?,execution_turn_id=?,run_mode=?,last_error='',updated_at=? WHERE id=?",
         (
             active_session_id,
             "mixed" if dashboard_active else "terminal",
             external.get("turn_id", ""),
+            task.get("run_mode", "") if dashboard_active else "terminal",
             now(),
             task_id,
         ),
@@ -2083,10 +2084,11 @@ async def launch_appserver(
     resume_id = latest_codex_session(task) if mode != "start" else ""
     codex_label = f"ssh {task['ssh_host']} codex" if task.get("ssh_host") else CODEX_BIN
     command = shlex.join([codex_label, "app-server", "thread/resume" if resume_id else "thread/start", "turn/start"])
+    run_mode = requested_run_mode(task, mode, message_id)
     db.execute("INSERT INTO sessions (id,task_id,status,attempt,provider_id,command,started_at,codex_session_id) VALUES (?,?,?,?,?,?,?,?)", (session_id, task["id"], "running", attempt, provider_key if provider_key != "default" else None, command, stamp, resume_id))
     db.execute(
-        "UPDATE tasks SET status='running',retry_count=?,active_session_id=?,execution_source='dashboard',execution_turn_id='',updated_at=? WHERE id=?",
-        (attempt, session_id, stamp, task["id"]),
+        "UPDATE tasks SET status='running',retry_count=?,active_session_id=?,execution_source='dashboard',execution_turn_id='',run_mode=?,updated_at=? WHERE id=?",
+        (attempt, session_id, run_mode, stamp, task["id"]),
     )
     turn_task = asyncio.create_task(
         supervise_appserver_turn(task, provider, mode, message, message_id, session_id, attempted_provider_ids or set())
@@ -2214,7 +2216,7 @@ async def supervise_appserver_turn(
         external = refresh_external_primary(task["id"])
         if external:
             db.execute(
-                "UPDATE tasks SET status='running',active_session_id=?,execution_source='terminal',execution_turn_id=?,last_error='',updated_at=? WHERE id=?",
+                "UPDATE tasks SET status='running',active_session_id=?,execution_source='terminal',execution_turn_id=?,run_mode='terminal',last_error='',updated_at=? WHERE id=?",
                 (external.get("session_id"), external.get("turn_id", ""), now(), task["id"]),
             )
         else:
@@ -2310,9 +2312,10 @@ async def supervise_appserver_turn(
             return
         if not stopped and should_retry:
             db.execute("UPDATE sessions SET status='retrying', finished_at=?, exit_code=1, summary=? WHERE id=?", (now(), error, session_id))
+            next_run_mode = "goal_resume" if goal_continues else task_or_404(task["id"]).get("run_mode", "")
             db.execute(
-                "UPDATE tasks SET status='retrying',execution_source='dashboard',last_error=?,updated_at=? WHERE id=?",
-                (error, now(), task["id"]),
+                "UPDATE tasks SET status='retrying',execution_source='dashboard',run_mode=?,last_error=?,updated_at=? WHERE id=?",
+                (next_run_mode, error, now(), task["id"]),
             )
             if goal_continues:
                 # The user message already completed this turn. Goal resume
@@ -2734,6 +2737,15 @@ def prompt_for(task: dict, override: str = "") -> str:
     return prompt
 
 
+def requested_run_mode(task: dict, mode: str, message_id: str = "") -> str:
+    """Describe why the current turn exists for synchronized browser controls."""
+    if message_id or mode == "message":
+        return "message"
+    if task.get("goal") and mode == "resume":
+        return "goal_resume"
+    return "operation"
+
+
 def turn_settings(task: dict, provider: Optional[dict], sandbox_policy: dict) -> dict[str, Any]:
     """Build sticky turn settings shared by regular and resumed browser turns."""
     settings: dict[str, Any] = {}
@@ -2856,7 +2868,7 @@ async def broadcast_task(task_id: str, payload: dict) -> None:
             "name", "goal", "workspace", "status", "yolo", "retry_count", "retry_forever",
             "provider_id", "model", "reasoning_effort", "service_tier", "last_error",
             "active_session_id", "goal_status", "goal_tokens_used", "updated_at", "archived",
-            "trashed", "execution_source", "execution_turn_id", "external_running",
+            "trashed", "execution_source", "execution_turn_id", "run_mode", "external_running",
             "external_started_at", "external_phase", "external_turn_id", "external_turn_count",
         }
         payload = {
@@ -4316,12 +4328,13 @@ async def launch(
     attempt = int(task["retry_count"]) + 1
     session_id = str(uuid.uuid4())
     provider = ordered[0]
+    run_mode = requested_run_mode(task, mode, message_id)
     if (USE_APP_SERVER or task.get("ssh_host")) and mode in {"start", "resume", "message"}:
         # Reserve the task before any IPC awaits, so a second browser request
         # queues behind this owner instead of opening another thread/reader.
         db.execute(
-            "UPDATE tasks SET status='running',retry_count=?,execution_source='dashboard',execution_turn_id='',last_error='',updated_at=? WHERE id=?",
-            (attempt, now(), task_id),
+            "UPDATE tasks SET status='running',retry_count=?,execution_source='dashboard',execution_turn_id='',run_mode=?,last_error='',updated_at=? WHERE id=?",
+            (attempt, run_mode, now(), task_id),
         )
         result = await launch_appserver(task, provider, mode, message, message_id, attempted_provider_ids)
         await broadcast_overview(task_id, {"type": "session", "status": "running"})
@@ -4332,8 +4345,8 @@ async def launch(
     cmd = command_for(task, provider, resume_id, message)
     db.execute("INSERT INTO sessions (id,task_id,status,attempt,provider_id,command,started_at,codex_session_id) VALUES (?,?,?,?,?,?,?,?)", (session_id, task_id, "running", attempt, provider["id"] if provider else None, shlex.join(cmd), now(), resume_id))
     db.execute(
-        "UPDATE tasks SET status='running',retry_count=?,active_session_id=?,execution_source='dashboard',execution_turn_id='',last_error='',updated_at=? WHERE id=?",
-        (attempt, session_id, now(), task_id),
+        "UPDATE tasks SET status='running',retry_count=?,active_session_id=?,execution_source='dashboard',execution_turn_id='',run_mode=?,last_error='',updated_at=? WHERE id=?",
+        (attempt, session_id, run_mode, now(), task_id),
     )
     asyncio.create_task(supervise(task, session_id, ordered, cmd, resume_id, message_id, message))
     await broadcast_overview(task_id, {"type": "session", "status": "running"})
@@ -5396,7 +5409,7 @@ async def codex_operation(task_id: str, payload: OperationIn, _: Any = Depends(a
     if (USE_APP_SERVER or task.get("ssh_host")) and payload.operation in {"exec", "resume"}:
         provider = next(iter(provider_rows()), None)
         db.execute(
-            "UPDATE tasks SET status='running',retry_count=retry_count+1,execution_source='dashboard',execution_turn_id='',updated_at=? WHERE id=?",
+            "UPDATE tasks SET status='running',retry_count=retry_count+1,execution_source='dashboard',execution_turn_id='',run_mode='operation',updated_at=? WHERE id=?",
             (now(), task_id),
         )
         return await launch_appserver(task, provider, "resume" if payload.operation == "resume" else "start", payload.prompt or "", "")
@@ -5410,7 +5423,7 @@ async def codex_operation(task_id: str, payload: OperationIn, _: Any = Depends(a
     attempt = int(task["retry_count"]) + 1
     db.execute("INSERT INTO sessions (id,task_id,status,attempt,command,started_at) VALUES (?,?,?,?,?,?)", (session_id, task_id, "running", attempt, shlex.join(cmd), stamp))
     db.execute(
-        "UPDATE tasks SET status='running',active_session_id=?,execution_source='dashboard',execution_turn_id='',updated_at=? WHERE id=?",
+        "UPDATE tasks SET status='running',active_session_id=?,execution_source='dashboard',execution_turn_id='',run_mode='operation',updated_at=? WHERE id=?",
         (session_id, stamp, task_id),
     )
     asyncio.create_task(supervise_operation(task, session_id, cmd))

@@ -855,6 +855,7 @@ async function reconcileSelectedTaskStatus() {
     if (state.selectedId !== taskId || !state.selectedTask) return;
     const changed = authoritative.status !== state.selectedTask.status
       || authoritative.active_session_id !== state.selectedTask.active_session_id
+      || authoritative.run_mode !== state.selectedTask.run_mode
       || authoritative.updated_at !== state.selectedTask.updated_at;
     state.selectedTask = { ...state.selectedTask, ...authoritative };
     mergeTask(authoritative);

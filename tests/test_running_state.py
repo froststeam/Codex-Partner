@@ -1114,7 +1114,7 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn("attachmentUploadName", app_js)
         self.assertIn("new File([file]", app_js)
         self.assertIn('uiLabel("binaryAttachment"', app_js)
-        self.assertIn('/app.js?v=20260816-status-reconcile', html)
+        self.assertIn('/app.js?v=20260816-goal-run-mode', html)
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
@@ -1162,6 +1162,20 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn("authoritative.status !== state.selectedTask.status", core_js)
         self.assertIn("setInterval(reconcileSelectedTaskStatus, 5000)", app_js)
         self.assertIn("reconcileSelectedTaskStatus();", app_js)
+
+    def test_goal_button_tracks_goal_resume_instead_of_any_active_turn(self):
+        root = Path(__file__).resolve().parents[1]
+        conversation_js = (root / "static" / "conversation.js").read_text(encoding="utf-8")
+        app_js = (root / "static" / "app.js").read_text(encoding="utf-8")
+        database_py = (root / "codex_partner" / "database.py").read_text(encoding="utf-8")
+        expected = 'task.run_mode === "goal_resume"'
+        self.assertIn(expected, conversation_js)
+        self.assertIn(expected, app_js)
+        self.assertIn("authoritative.run_mode !== state.selectedTask.run_mode", (root / "static" / "core.js").read_text(encoding="utf-8"))
+        self.assertIn("run_mode TEXT DEFAULT ''", database_py)
+        self.assertEqual("message", self.app.requested_run_mode({"goal": "ship it"}, "message", "message-1"))
+        self.assertEqual("goal_resume", self.app.requested_run_mode({"goal": "ship it"}, "resume"))
+        self.assertEqual("operation", self.app.requested_run_mode({"goal": ""}, "resume"))
 
     def test_browser_auth_uses_ssh_cookie_instead_of_access_tokens(self):
         static = Path(__file__).resolve().parents[1] / "static"

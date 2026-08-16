@@ -47,7 +47,8 @@ class Database:
                   trashed_at TEXT,
                   memory_mode TEXT DEFAULT 'enabled',
                   execution_source TEXT DEFAULT '',
-                  execution_turn_id TEXT DEFAULT ''
+                  execution_turn_id TEXT DEFAULT '',
+                  run_mode TEXT DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS sessions (
                   id TEXT PRIMARY KEY, task_id TEXT NOT NULL, status TEXT NOT NULL,
@@ -137,6 +138,7 @@ class Database:
             "permission_profile": "TEXT DEFAULT ''",
             "execution_source": "TEXT DEFAULT ''",
             "execution_turn_id": "TEXT DEFAULT ''",
+            "run_mode": "TEXT DEFAULT ''",
             "ssh_host": "TEXT DEFAULT ''",
         }
         for column, definition in task_migrations.items():
