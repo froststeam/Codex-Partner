@@ -2,6 +2,8 @@
 
 Codex Partner is a self-hosted control panel for long-running Codex work. It keeps one native Codex thread alive and lets terminals, browsers, and multiple devices interact with the same task.
 
+![Codex Partner task workspace](docs/codex-partner.png)
+
 ## Why
 
 - **Long tasks stop too early.** Persistent Goals can resume after a failed turn, disconnect, or service restart until the objective is complete.
