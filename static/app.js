@@ -26,6 +26,20 @@ document.addEventListener("click", async event => {
       pendingAttachments.splice(Number(button.dataset.composerAttachmentRemove), 1);
       renderComposerAttachments(); renderGoalBar(); return;
     }
+    if (button.dataset.approvalId) {
+      const requestId = button.dataset.approvalId;
+      const decision = button.dataset.approvalDecision || "decline";
+      $$(".approval-action", $("#approval-center")).forEach(node => { node.disabled = true; });
+      try {
+        await api(`/tasks/${encodeURIComponent(state.selectedId)}/approvals/${encodeURIComponent(requestId)}`, {
+          method: "POST",
+          body: JSON.stringify({ decision, answers: approvalAnswers() }),
+        });
+        state.pendingApprovals = state.pendingApprovals.filter(item => item.id !== requestId);
+        renderApprovalCenter(); toast(uiLabel("approvalResolved"));
+      } catch (error) { renderApprovalCenter(); toast(error.message); }
+      return;
+    }
     if (button.dataset.sessionId) return selectSession(button.dataset.sessionId);
     if (button.dataset.queueClear !== undefined) {
       if (!state.selectedId || !await appConfirm(uiLabel("clearQueueConfirm"), { danger: true })) return;

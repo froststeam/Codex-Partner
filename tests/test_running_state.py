@@ -102,6 +102,77 @@ class RunningStateTests(unittest.TestCase):
         self.assertEqual(1, len(lines))
         self.assertEqual(2 * 1024 * 1024, len(json.loads(lines[0])["result"]["text"]))
 
+    def test_controlled_appserver_approval_waits_for_browser_choice(self):
+        task_id, thread_id, server_key = "controlled-approval", "approval-thread", "approval-server"
+        self.make_task(task_id)
+        self.app.db.execute("UPDATE tasks SET yolo=0 WHERE id=?", (task_id,))
+
+        class Stdin:
+            def __init__(self):
+                self.data = bytearray()
+
+            def write(self, value):
+                self.data.extend(value)
+
+            async def drain(self):
+                return None
+
+        class Client:
+            def __init__(self):
+                self.write_lock = asyncio.Lock()
+                self.process = type("Process", (), {"stdin": Stdin()})()
+
+        client = Client()
+        self.app.app_servers[server_key] = client
+        self.app.app_thread_bindings[task_id] = (server_key, thread_id, "approval-session")
+        broadcasts = []
+
+        async def broadcast(_task_id, payload):
+            broadcasts.append(payload)
+            if payload["type"] == "server_request":
+                request = self.app.pending_appserver_requests[payload["request"]["id"]]
+                request["future"].set_result({"decision": "acceptForSession"})
+
+        message = {
+            "id": 81,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": thread_id, "turnId": "turn-1", "itemId": "item-1", "command": "touch approved"},
+        }
+        try:
+            with mock.patch.object(self.app, "broadcast_task", new=broadcast):
+                asyncio.run(self.app.handle_appserver_server_request(server_key, message))
+            response = json.loads(client.process.stdin.data.decode())
+            self.assertEqual({"decision": "acceptForSession"}, response["result"])
+            self.assertEqual(["server_request", "server_request_resolved"], [item["type"] for item in broadcasts])
+            self.assertFalse(self.app.pending_requests_for_task(task_id))
+            permissions = self.app.approval_result(
+                {"method": "item/permissions/requestApproval", "params": {"permissions": {"network": {"enabled": True}}}},
+                self.app.ApprovalResolveIn(decision="acceptForSession"),
+            )
+            self.assertEqual({"permissions": {"network": {"enabled": True}}, "scope": "session"}, permissions)
+            answers = self.app.approval_result(
+                {"method": "item/tool/requestUserInput", "params": {"questions": [{"id": "choice"}]}},
+                self.app.ApprovalResolveIn(decision="accept", answers={"choice": ["Option A"]}),
+            )
+            self.assertEqual({"answers": {"choice": {"answers": ["Option A"]}}}, answers)
+        finally:
+            self.app.app_servers.pop(server_key, None)
+            self.app.app_thread_bindings.pop(task_id, None)
+            self.app.pending_appserver_requests.clear()
+
+    def test_controlled_approval_ui_is_realtime_and_actionable(self):
+        static = Path(__file__).resolve().parents[1] / "static"
+        html = (static / "index.html").read_text(encoding="utf-8")
+        conversation = (static / "conversation.js").read_text(encoding="utf-8")
+        app_js = (static / "app.js").read_text(encoding="utf-8")
+        styles = (static / "styles.css").read_text(encoding="utf-8")
+        self.assertIn('id="approval-center"', html)
+        self.assertIn('"pending_requests": pending_requests_for_task(task_id)', Path(self.app.__file__).read_text(encoding="utf-8"))
+        self.assertIn('data-approval-decision="acceptForSession"', conversation)
+        self.assertIn('data-approval-decision="decline"', conversation)
+        self.assertIn("/approvals/${encodeURIComponent(requestId)}", app_js)
+        self.assertIn(".approval-card {", styles)
+
     def test_timeline_uses_cursor_pages_without_overlap(self):
         task_id = f"timeline-{time.time_ns()}"
         self.make_task(task_id, "available")
@@ -1216,7 +1287,7 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn("attachmentUploadName", app_js)
         self.assertIn("new File([file]", app_js)
         self.assertIn('uiLabel("binaryAttachment"', app_js)
-        self.assertIn('/app.js?v=20260816-composer-toggle', html)
+        self.assertIn('/app.js?v=20260816-controlled-approvals', html)
         self.assertIn('/core.js?v=20260816-composer-toggle', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
@@ -1405,7 +1476,7 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260816-remove-goal-meta', html)
+        self.assertIn('/conversation.js?v=20260816-controlled-approvals', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
         self.assertIn('/styles.css?v=20260816-aligned-queue', html)
         self.assertIn(".queued-messages { width: auto; height: auto; min-height: 0; max-height: none; align-self: stretch;", styles)

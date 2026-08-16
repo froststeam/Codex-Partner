@@ -47,7 +47,7 @@ async function syncQueuedMessages() {
     queueSyncInFlight = false;
   }
 }
-function showEmptyConversation() { if (terminalTaskId) destroyTerminal(); stopQueueSync(); state.editingQueuedId = null; state.inspectorClosed = true; $("#empty-conversation").hidden = false; $("#conversation-view").hidden = true; $("#goal-bar").hidden = true; $("#queued-messages").hidden = true; setInspectorOpen(false); }
+function showEmptyConversation() { if (terminalTaskId) destroyTerminal(); stopQueueSync(); state.editingQueuedId = null; state.pendingApprovals = []; state.inspectorClosed = true; $("#empty-conversation").hidden = false; $("#conversation-view").hidden = true; $("#goal-bar").hidden = true; $("#queued-messages").hidden = true; $("#approval-center").hidden = true; setInspectorOpen(false); }
 function resetWorkspaceBrowser() {
   state.workspacePath = "";
   state.workspaceFile = null;
@@ -61,7 +61,7 @@ async function selectSession(id, openSocket = true) {
   const wasEmpty = $("#conversation-view").hidden;
   if (state.selectedId !== id) {
     resetWorkspaceBrowser(); state.titleExpanded = false; state.historyCursor = ""; state.historyHasMore = false;
-    state.historyLoading = false; state.chatBlocks = []; state.chatVirtualStart = null;
+    state.historyLoading = false; state.chatBlocks = []; state.chatVirtualStart = null; state.pendingApprovals = [];
   }
   state.selectedId = id; localStorage.setItem("codex-dashboard-session", id);
   const task = state.tasks.find(item => item.id === id);
@@ -111,6 +111,7 @@ function renderConversation() {
   renderContextUsage();
   renderTurnProgress();
   renderGoalBar();
+  renderApprovalCenter();
   refreshComposerHistory();
   renderQueuedMessages();
   renderChat(); renderInspector();
@@ -270,6 +271,47 @@ function renderQueuedMessages() {
   if (!queueSyncTimer) queueSyncTimer = setInterval(syncQueuedMessages, 1500);
   const visible = queued.slice(0, 4);
   strip.innerHTML = `<div class="queued-head"><span><i></i>${uiLabel("queue")}</span><span class="queued-head-actions"><strong>${queued.length}</strong><button type="button" class="queue-icon danger-icon" data-queue-clear title="${uiLabel("clearQueue")}">×</button></span></div>${visible.map((message, index) => { const dispatching = message.status === "dispatching"; return `<div class="queued-message ${dispatching ? "dispatching" : ""} ${state.editingQueuedId === message.id ? "editing" : ""}"><div class="queued-message-main"><span class="queued-index">${index + 1}</span><span class="queued-body">${esc(message.body)}</span></div><div class="queued-actions"><button type="button" class="queue-icon" data-queue-dispatch="${esc(message.id)}" title="${dispatching ? uiLabel("sending") : uiLabel("dispatchNow")}" ${dispatching ? "disabled" : ""}>${dispatching ? "…" : "▶"}</button><button type="button" class="queue-icon" data-queue-edit="${esc(message.id)}" title="${uiLabel("editQueuedAction")}" ${dispatching ? "disabled" : ""}>✎</button><button type="button" class="queue-icon danger-icon" data-queue-delete="${esc(message.id)}" title="${uiLabel("deleteQueuedAction")}" ${dispatching ? "disabled" : ""}>×</button></div></div>`; }).join("")}${queued.length > visible.length ? `<div class="queued-more">${uiLabel("queueMore", { count: queued.length - visible.length })}</div>` : ""}`;
+}
+function approvalTitle(method) {
+  if (method === "item/commandExecution/requestApproval") return uiLabel("approvalCommand");
+  if (method === "item/fileChange/requestApproval") return uiLabel("approvalFile");
+  if (method === "item/permissions/requestApproval") return uiLabel("approvalPermissions");
+  return uiLabel("approvalQuestion");
+}
+function renderApprovalCenter() {
+  const center = $("#approval-center");
+  if (!center) return;
+  const request = (state.pendingApprovals || [])[0];
+  center.hidden = !request;
+  if (!request) { center.innerHTML = ""; return; }
+  const params = request.params || {};
+  const command = params.command || params.grantRoot || "";
+  const cwd = params.cwd || "";
+  const reason = params.reason || "";
+  const permissionText = params.permissions ? JSON.stringify(params.permissions) : "";
+  const questions = Array.isArray(params.questions) ? params.questions : [];
+  const detail = command ? `<div class="approval-detail"><code>${esc(command)}</code></div>` : permissionText ? `<div class="approval-detail"><code>${esc(permissionText)}</code></div>` : "";
+  const context = `${cwd ? `<span>${uiLabel("approvalWorkspace")}: <code>${esc(cwd)}</code></span>` : ""}${reason ? `<span class="approval-reason">${uiLabel("approvalReason")}: ${esc(reason)}</span>` : ""}`;
+  const questionFields = questions.length ? `<div class="approval-questions">${questions.map((question, index) => {
+    const options = Array.isArray(question.options) ? question.options : [];
+    const controls = options.length
+      ? `<div class="approval-options">${options.map((option, optionIndex) => `<label title="${esc(option.description || "")}"><input type="radio" name="approval-question-${index}" value="${esc(option.label)}" ${optionIndex === 0 ? "checked" : ""}/><span>${esc(option.label)}</span></label>`).join("")}</div>`
+      : `<input class="approval-answer" data-question-index="${index}" type="${question.isSecret ? "password" : "text"}" autocomplete="off"/>`;
+    return `<label class="approval-question" data-question-id="${esc(question.id || `question-${index}`)}"><strong>${esc(question.header || question.question || "")}</strong>${question.header ? `<span>${esc(question.question || "")}</span>` : ""}${controls}</label>`;
+  }).join("")}</div>` : "";
+  const actions = questions.length
+    ? `<button type="button" class="approval-action danger" data-approval-id="${esc(request.id)}" data-approval-decision="cancel">${uiLabel("approvalDeny")}</button><button type="button" class="approval-action primary" data-approval-id="${esc(request.id)}" data-approval-decision="accept">${uiLabel("approvalSubmit")}</button>`
+    : `<button type="button" class="approval-action danger" data-approval-id="${esc(request.id)}" data-approval-decision="decline">${uiLabel("approvalDeny")}</button><button type="button" class="approval-action" data-approval-id="${esc(request.id)}" data-approval-decision="acceptForSession">${uiLabel("approvalSession")}</button><button type="button" class="approval-action primary" data-approval-id="${esc(request.id)}" data-approval-decision="accept">${uiLabel("approvalOnce")}</button>`;
+  center.innerHTML = `<article class="approval-card"><div class="approval-copy"><div class="approval-heading"><span>!</span><strong>${approvalTitle(request.method)}</strong><small>${uiLabel("approvalWaiting")}</small></div>${detail}<div class="approval-detail approval-context">${context}</div></div><div class="approval-actions">${actions}</div>${questionFields}</article>`;
+}
+function approvalAnswers() {
+  const answers = {};
+  $$(".approval-question", $("#approval-center")).forEach((node, index) => {
+    const checked = $("input[type=radio]:checked", node);
+    const text = $(".approval-answer", node);
+    answers[node.dataset.questionId] = checked ? [checked.value] : text?.value ? [text.value] : [];
+  });
+  return answers;
 }
 function renderChat() {
   const stream = $("#chat-log");
@@ -803,6 +845,7 @@ function connectSocket(id, reconnect = false) {
     if (data.type === "snapshot" && state.selectedId === id) {
       state.selectedTask = { ...state.selectedTask, ...(data.task || {}) };
       if (data.messages) replaceTaskMessages(data.messages);
+      state.pendingApprovals = data.pending_requests || [];
       renderConversation();
       return;
     }
@@ -829,7 +872,8 @@ function connectSocket(id, reconnect = false) {
     }
     if (data.type === "message" && state.selectedId === id) { upsertTaskMessage(data); renderQueuedMessages(); scheduleRenderChat(); }
     if (data.type === "message_removed" && state.selectedId === id) { removeTaskMessage(data.message_id); if (state.editingQueuedId === data.message_id) { state.editingQueuedId = null; $("#message-input").value = ""; } renderQueuedMessages(); scheduleRenderChat(); }
-    if (data.type === "server_request" && state.selectedId === id) { livePhases.set(id, "phaseInteraction"); renderTurnProgress(); }
+    if (data.type === "server_request" && state.selectedId === id) { if (data.request && !state.pendingApprovals.some(item => item.id === data.request.id)) state.pendingApprovals.push(data.request); livePhases.set(id, "phaseInteraction"); renderApprovalCenter(); renderTurnProgress(); }
+    if (data.type === "server_request_resolved" && state.selectedId === id) { state.pendingApprovals = state.pendingApprovals.filter(item => item.id !== data.request_id); renderApprovalCenter(); }
     if ((data.type === "session" || data.type === "provider_failover") && state.selectedId === id) {
       if (data.type === "provider_failover") livePhases.set(id, "phaseProvider");
       await refreshSelectedConversation(id);

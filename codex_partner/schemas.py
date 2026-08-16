@@ -127,6 +127,11 @@ class TaskMessagePatch(BaseModel):
     message: str = Field(min_length=1, max_length=20000)
 
 
+class ApprovalResolveIn(BaseModel):
+    decision: Literal["accept", "acceptForSession", "decline", "cancel"] = "decline"
+    answers: dict[str, list[str]] = Field(default_factory=dict)
+
+
 class SlashCommandIn(BaseModel):
     command: str = Field(min_length=1, max_length=20000)
     client_message_id: Optional[str] = None

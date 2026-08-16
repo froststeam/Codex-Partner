@@ -57,6 +57,7 @@ from codex_partner.discovery import (
     vscode_candidates,
 )
 from codex_partner.schemas import (
+    ApprovalResolveIn,
     AvatarIn,
     ContextPatch,
     GoalPatch,
@@ -397,6 +398,7 @@ app_thread_bindings: dict[str, tuple[str, str, str]] = {}
 turn_waiters: dict[str, asyncio.Future] = {}
 appserver_turn_tasks: dict[str, asyncio.Task] = {}
 appserver_turn_ids: dict[str, str] = {}
+pending_appserver_requests: dict[str, dict[str, Any]] = {}
 appserver_lock = asyncio.Lock()
 codex_install_lock = asyncio.Lock()
 native_sync_lock = asyncio.Lock()
@@ -2049,7 +2051,7 @@ async def handle_appserver_notification(server_key: str, message: dict) -> None:
 
 
 async def handle_appserver_server_request(server_key: str, message: dict) -> None:
-    """Resolve Codex approval/input RPCs without ever stopping the shared turn."""
+    """Route Codex approval/input RPCs to every browser viewing the task."""
     params = message.get("params") or {}
     thread_id = params.get("threadId")
     binding = next(((task_id, sid) for task_id, (key, tid, sid) in app_thread_bindings.items() if key == server_key and tid == thread_id), None)
@@ -2057,23 +2059,85 @@ async def handle_appserver_server_request(server_key: str, message: dict) -> Non
     if not client:
         return
     method, request_id = message.get("method", ""), message.get("id")
+    public_id = ""
     allow = bool(binding and task_or_404(binding[0]).get("yolo"))
-    if method == "item/commandExecution/requestApproval":
-        result = {"decision": "accept" if allow else "decline"}
-    elif method == "item/fileChange/requestApproval":
-        result = {"decision": "accept" if allow else "decline"}
-    elif method == "item/permissions/requestApproval":
-        result = {"permissions": {"network": None, "fileSystem": None}, "scope": "turn"} if allow else {"permissions": {}, "scope": "turn"}
-    elif method == "item/tool/requestUserInput":
-        result = {"answers": {q.get("id", "answer"): {"answer": ""} for q in params.get("questions", [])}}
+    approval_methods = {
+        "item/commandExecution/requestApproval",
+        "item/fileChange/requestApproval",
+        "item/permissions/requestApproval",
+    }
+    if not binding or method not in approval_methods | {"item/tool/requestUserInput"}:
+        result = {"decision": "decline"} if method in approval_methods else {}
+    elif allow and method in approval_methods:
+        result = {"permissions": params.get("permissions") or {}, "scope": "turn"} if method == "item/permissions/requestApproval" else {"decision": "accept"}
     else:
-        result = {}
-    async with client.write_lock:
-        if client.process and client.process.stdin:
-            client.process.stdin.write((json.dumps({"id": request_id, "result": result}, ensure_ascii=False) + "\n").encode())
-            await client.process.stdin.drain()
-    if binding:
-        await broadcast_task(binding[0], {"type": "server_request", "method": method, "params": params})
+        public_id = str(uuid.uuid4())
+        future = asyncio.get_running_loop().create_future()
+        request = {
+            "id": public_id,
+            "task_id": binding[0],
+            "server_key": server_key,
+            "request_id": request_id,
+            "method": method,
+            "params": params,
+            "created_at": now(),
+            "future": future,
+        }
+        pending_appserver_requests[public_id] = request
+        await broadcast_task(binding[0], {"type": "server_request", "request": public_server_request(request)})
+        try:
+            result = await future
+        except asyncio.CancelledError:
+            pending_appserver_requests.pop(public_id, None)
+            await broadcast_task(binding[0], {"type": "server_request_resolved", "request_id": public_id})
+            raise
+    try:
+        async with client.write_lock:
+            if client.process and client.process.stdin:
+                client.process.stdin.write((json.dumps({"id": request_id, "result": result}, ensure_ascii=False) + "\n").encode())
+                await client.process.stdin.drain()
+    finally:
+        if public_id:
+            pending_appserver_requests.pop(public_id, None)
+        if binding and public_id:
+            await broadcast_task(binding[0], {"type": "server_request_resolved", "request_id": public_id})
+    if binding and not public_id:
+        await broadcast_task(binding[0], {"type": "server_request_auto_resolved", "method": method})
+
+
+def public_server_request(request: dict[str, Any]) -> dict[str, Any]:
+    """Return the browser-safe portion of a pending app-server request."""
+    return {
+        "id": request["id"],
+        "method": request["method"],
+        "params": request["params"],
+        "created_at": request["created_at"],
+    }
+
+
+def pending_requests_for_task(task_id: str) -> list[dict[str, Any]]:
+    return [
+        public_server_request(request)
+        for request in pending_appserver_requests.values()
+        if request["task_id"] == task_id and not request["future"].done()
+    ]
+
+
+def approval_result(request: dict[str, Any], payload: ApprovalResolveIn) -> dict[str, Any]:
+    method, params = request["method"], request["params"]
+    if method == "item/tool/requestUserInput":
+        answers = {
+            question.get("id", "answer"): {"answers": payload.answers.get(question.get("id", "answer"), [])}
+            for question in params.get("questions", [])
+        }
+        return {"answers": answers}
+    if method == "item/permissions/requestApproval":
+        accepted = payload.decision in {"accept", "acceptForSession"}
+        return {
+            "permissions": params.get("permissions") or {} if accepted else {},
+            "scope": "session" if payload.decision == "acceptForSession" else "turn",
+        }
+    return {"decision": payload.decision}
 
 
 async def launch_appserver(
@@ -4813,7 +4877,12 @@ async def task_socket(websocket: WebSocket, task_id: str):
     await websocket.accept()
     task_clients.setdefault(task_id, set()).add(websocket)
     try:
-        await websocket.send_json({"type": "snapshot", "task": task_or_404(task_id), "messages": db.all("SELECT * FROM task_messages WHERE task_id=? ORDER BY created_at, id", (task_id,))})
+        await websocket.send_json({
+            "type": "snapshot",
+            "task": task_or_404(task_id),
+            "messages": db.all("SELECT * FROM task_messages WHERE task_id=? ORDER BY created_at, id", (task_id,)),
+            "pending_requests": pending_requests_for_task(task_id),
+        })
         while True:
             incoming = await websocket.receive_json()
             if incoming.get("type") == "message" and str(incoming.get("message", "")).strip():
@@ -4844,6 +4913,19 @@ async def retry_task(task_id: str, _: Any = Depends(auth)):
     return await launch(task_id, "resume" if task.get("native") else "manual-retry")
 
 
+@app.post("/api/tasks/{task_id}/approvals/{request_id}")
+async def resolve_task_approval(task_id: str, request_id: str, payload: ApprovalResolveIn, _: Any = Depends(auth)):
+    task_or_404(task_id)
+    request = pending_appserver_requests.get(request_id)
+    if not request or request["task_id"] != task_id:
+        raise HTTPException(404, "Approval request is no longer pending")
+    future = request["future"]
+    if future.done():
+        raise HTTPException(409, "Approval request was already resolved")
+    future.set_result(approval_result(request, payload))
+    return {"ok": True, "request_id": request_id, "decision": payload.decision}
+
+
 @app.post("/api/tasks/{task_id}/stop")
 async def stop_task(task_id: str, _: Any = Depends(auth)):
     return await stop_task_run(task_id)
@@ -4851,6 +4933,9 @@ async def stop_task(task_id: str, _: Any = Depends(auth)):
 
 async def stop_task_run(task_id: str) -> dict:
     task = task_or_404(task_id)
+    for request in list(pending_appserver_requests.values()):
+        if request["task_id"] == task_id and not request["future"].done():
+            request["future"].set_result(approval_result(request, ApprovalResolveIn(decision="cancel")))
     tracked_external = list((external_turn_sets.get(task_id) or {}).values())
     async with running_lock:
         process = running.get(task_id)
