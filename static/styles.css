@@ -203,9 +203,9 @@ body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56p
 .chat-file-copy { min-width: 0; flex: 1; }.chat-file-copy strong, .chat-file-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.chat-file-copy strong { color: #d8e8d2; font-size: 10px; }.chat-file-copy small { margin-top: 2px; color: #7f9690; font: 8px ui-monospace, monospace; }
 .chat-file-preview { display: block; flex: 0 0 auto; width: 82px; height: 58px; overflow: hidden; border-radius: 5px; background: #0e1718; }.chat-file-preview img { display: block; width: 100%; height: 100%; object-fit: cover; }.chat-file-attachment.file-only { border-color: #3f4a54; background: #182128; }.chat-file-attachment.unavailable { opacity: .55; }
 .chat-image-attachment { display: block; width: min(440px, 68vw); max-width: 100%; margin-top: 8px; padding: 0; overflow: hidden; border: 0; border-radius: 6px; background: transparent; }
-.chat-image-attachment .chat-file-preview { width: 100%; height: auto; overflow: hidden; border-radius: 6px; background: #0e1718; }
+.chat-image-attachment .chat-file-preview { width: 100%; aspect-ratio: 16 / 10; overflow: hidden; border-radius: 6px; background: #0e1718; }
 .chat-image-link { display: block; cursor: zoom-in; }
-.chat-image-attachment .chat-file-preview img { width: 100%; height: auto; max-height: 420px; object-fit: contain; }
+.chat-image-attachment .chat-file-preview img { width: 100%; height: 100%; object-fit: contain; }
 .chat-load-older { display: block; width: fit-content; margin: 2px auto 22px; padding: 5px 10px; border: 1px solid #3a494f; border-radius: 5px; background: #182126; color: #9eacb1; font-size: 10px; cursor: pointer; }
 .chat-load-older:hover { border-color: #60736b; color: #d1ddd9; }
 .chat-load-older:disabled { cursor: wait; opacity: .55; }

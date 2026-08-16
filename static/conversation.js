@@ -2,7 +2,7 @@
 const chatFileObjectUrls = new Map();
 const chatThumbnailObjectUrls = new Map();
 const chatThumbnailLoads = new Map();
-const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260816-history-pages") : null;
+const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260816-stable-chat-scroll") : null;
 let chatBuildRequestId = 0;
 let chatHistoryLoadPromise = null;
 function renderSidebarStats() {
@@ -273,7 +273,6 @@ function renderQueuedMessages() {
 }
 function renderChat() {
   const stream = $("#chat-log");
-  const stickToBottom = state.chatSnapToBottom || stream.scrollHeight - stream.scrollTop - stream.clientHeight < 96;
   if (!chatWorker) {
     stream.innerHTML = `<div class="chat-empty"><p>${uiLabel("workerUnavailable") || "Chat Worker unavailable"}</p></div>`;
     return;
@@ -293,19 +292,56 @@ function renderChat() {
   chatWorker.onmessage = event => {
     if (event.data.requestId !== chatBuildRequestId || event.data.error) return;
     state.chatBlocks = event.data.blocks || [];
-    paintVirtualChat(stickToBottom);
+    // Decide at paint time. Tool/file events may finish in the worker after the
+    // user has already scrolled away from the bottom.
+    paintVirtualChat(state.chatSnapToBottom || chatIsNearBottom(stream));
   };
 }
 
-function renderChatBlock(block) {
-  if (block.role === "activities") return `<details class="activity-group"><summary><span>⌁</span>${uiLabel("activity")} <small>${block.items.length}</small></summary><div class="activity-events">${block.items.slice(-10).map(item => `<div class="activity-event">${esc(item)}</div>`).join("")}${block.items.length > 10 ? `<div class="activity-event">… ${block.items.length - 10}</div>` : ""}</div></details>`;
+function chatIsNearBottom(stream = $("#chat-log")) {
+  return !stream || stream.scrollHeight - stream.scrollTop - stream.clientHeight < 96;
+}
+
+function captureChatViewport(stream) {
+  const streamTop = stream.getBoundingClientRect().top;
+  const nodes = $$("[data-chat-block-index]", stream);
+  const anchor = nodes.find(node => node.getBoundingClientRect().bottom >= streamTop);
+  return {
+    scrollTop: stream.scrollTop,
+    anchorIndex: anchor?.dataset.chatBlockIndex || "",
+    anchorOffset: anchor ? anchor.getBoundingClientRect().top - streamTop : 0,
+    openActivities: new Set($$("details.activity-group[open]", stream).map(node => node.dataset.chatBlockIndex)),
+  };
+}
+
+function restoreChatViewport(stream, viewport, stickToBottom) {
+  for (const node of $$("details.activity-group", stream)) {
+    node.open = viewport.openActivities.has(node.dataset.chatBlockIndex);
+  }
+  if (stickToBottom) {
+    stream.scrollTop = stream.scrollHeight;
+    return;
+  }
+  const anchor = viewport.anchorIndex ? $(`[data-chat-block-index="${viewport.anchorIndex}"]`, stream) : null;
+  if (anchor) {
+    const streamTop = stream.getBoundingClientRect().top;
+    stream.scrollTop += anchor.getBoundingClientRect().top - streamTop - viewport.anchorOffset;
+    return;
+  }
+  stream.scrollTop = Math.min(viewport.scrollTop, Math.max(0, stream.scrollHeight - stream.clientHeight));
+}
+
+function renderChatBlock(block, blockIndex) {
+  const blockAttribute = ` data-chat-block-index="${blockIndex}"`;
+  if (block.role === "activities") return `<details class="activity-group"${blockAttribute}><summary><span>⌁</span>${uiLabel("activity")} <small>${block.items.length}</small></summary><div class="activity-events">${block.items.slice(-10).map(item => `<div class="activity-event">${esc(item)}</div>`).join("")}${block.items.length > 10 ? `<div class="activity-event">… ${block.items.length - 10}</div>` : ""}</div></details>`;
   const deliveryLabels = { sending: uiLabel("sending"), steering: uiLabel("steering"), steered: uiLabel("steering"), queued: uiLabel("queued"), running: `${statusLabel("running")} · Codex`, failed: uiLabel("failedSend") };
   const label = block.role === "user" ? (block.commandBlock ? uiLabel("commandLabel") : "") : (block.commandBlock ? uiLabel("commandResult") : uiLabel("codexPartner"));
-  return `<article class="message ${block.role}${block.commandBlock ? " command-message" : ""}${block.streaming ? " streaming" : ""}" data-item-id="${esc(block.itemId || "")}"><div class="message-avatar" role="img" aria-label="${block.role === "user" ? uiLabel("you") : uiLabel("codexPartner")}" title="${block.role === "user" ? uiLabel("you") : uiLabel("codexPartner")}">${block.role === "user" ? humanMarkup() : mascotMarkup("mascot-chat")}</div><div class="message-body"><div class="message-meta">${label ? `<strong>${label}</strong>` : ""}${block.origin === "terminal" ? `<span>${uiLabel("messageFromTerminal")}</span>` : ""}${block.time ? `<time datetime="${esc(block.time)}">${esc(shortDate(block.time))}</time>` : ""}</div><div class="message-content">${block.html || ""}${block.streaming ? `<span class="stream-cursor"></span>` : ""}</div>${deliveryLabels[block.delivery] ? `<div class="message-delivery ${esc(block.delivery)}" title="${esc(block.error)}">${esc(deliveryLabels[block.delivery])}</div>` : ""}</div></article>`;
+  return `<article class="message ${block.role}${block.commandBlock ? " command-message" : ""}${block.streaming ? " streaming" : ""}"${blockAttribute} data-item-id="${esc(block.itemId || "")}"><div class="message-avatar" role="img" aria-label="${block.role === "user" ? uiLabel("you") : uiLabel("codexPartner")}" title="${block.role === "user" ? uiLabel("you") : uiLabel("codexPartner")}">${block.role === "user" ? humanMarkup() : mascotMarkup("mascot-chat")}</div><div class="message-body"><div class="message-meta">${label ? `<strong>${label}</strong>` : ""}${block.origin === "terminal" ? `<span>${uiLabel("messageFromTerminal")}</span>` : ""}${block.time ? `<time datetime="${esc(block.time)}">${esc(shortDate(block.time))}</time>` : ""}</div><div class="message-content">${block.html || ""}${block.streaming ? `<span class="stream-cursor"></span>` : ""}</div>${deliveryLabels[block.delivery] ? `<div class="message-delivery ${esc(block.delivery)}" title="${esc(block.error)}">${esc(deliveryLabels[block.delivery])}</div>` : ""}</div></article>`;
 }
 
 function paintVirtualChat(stickToBottom = false) {
   const stream = $("#chat-log"); const blocks = state.chatBlocks || []; const windowSize = 90;
+  const viewport = captureChatViewport(stream);
   if (!blocks.length) { stream.innerHTML = `<div class="chat-empty">${mascotMarkup("mascot-chat")}<p>${uiLabel("firstMessage")}</p></div>`; return; }
   if (state.chatVirtualStart === null || stickToBottom) state.chatVirtualStart = Math.max(0, blocks.length - windowSize);
   const start = Math.max(0, Math.min(state.chatVirtualStart, Math.max(0, blocks.length - windowSize)));
@@ -313,7 +349,7 @@ function paintVirtualChat(stickToBottom = false) {
   const average = Math.max(72, state.chatAverageHeight || 112);
   const topHeight = start * average; const bottomHeight = (blocks.length - end) * average;
   const olderControl = state.historyHasMore && start === 0 ? `<button type="button" class="chat-load-older" ${state.historyLoading ? "disabled" : ""}>${uiLabel("loadEarlierMessages")}</button>` : "";
-  stream.innerHTML = `<div class="chat-virtual-spacer" style="height:${topHeight}px"></div>${olderControl}${blocks.slice(start, end).map(renderChatBlock).join("")}<div class="chat-virtual-spacer" style="height:${bottomHeight}px"></div>`;
+  stream.innerHTML = `<div class="chat-virtual-spacer" style="height:${topHeight}px"></div>${olderControl}${blocks.slice(start, end).map((block, index) => renderChatBlock(block, start + index)).join("")}<div class="chat-virtual-spacer" style="height:${bottomHeight}px"></div>`;
   const rendered = $$(".message, .activity-group", stream);
   if (rendered.length) {
     const measured = rendered.reduce((total, node) => total + node.getBoundingClientRect().height + 24, 0) / rendered.length;
@@ -331,7 +367,7 @@ function paintVirtualChat(stickToBottom = false) {
       if ((bounded === 0 && currentStart !== 0) || Math.abs(bounded - currentStart) >= 18) { state.chatVirtualStart = bounded; paintVirtualChat(false); stream.scrollTop = target * state.chatAverageHeight; }
     }, { passive: true });
   }
-  if (stickToBottom) stream.scrollTop = stream.scrollHeight;
+  restoreChatViewport(stream, viewport, stickToBottom);
   state.chatSnapToBottom = false;
 }
 

@@ -106,7 +106,7 @@ function markdown(text) {
     .replace(/\n/g, "<br>");
   return body + [...new Set(files)].map(path => {
     const safePath = escapeHtml(path);
-    if (/\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(path)) return `<div class="chat-file-attachment chat-image-attachment" data-chat-file="${safePath}"><span class="chat-file-preview" hidden></span></div>`;
+    if (/\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(path)) return `<div class="chat-file-attachment chat-image-attachment" data-chat-file="${safePath}"><span class="chat-file-preview"></span></div>`;
     const name = escapeHtml(path.split("/").pop() || path);
     return `<div class="chat-file-attachment" data-chat-file="${safePath}"><span class="chat-file-icon">▤</span><span class="chat-file-copy"><strong>${name}</strong><small>${safePath}</small></span><span class="chat-file-preview" hidden></span></div>`;
   }).join("");
