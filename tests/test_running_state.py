@@ -1236,6 +1236,9 @@ class RunningStateTests(unittest.TestCase):
         expected = 'task.run_mode === "goal_resume"'
         self.assertIn(expected, conversation_js)
         self.assertIn(expected, app_js)
+        self.assertIn('active: "enabled"', conversation_js)
+        self.assertIn('goalProgress.textContent = goalStatusLabel', conversation_js)
+        self.assertNotIn('active: "running"', conversation_js)
         self.assertIn("authoritative.run_mode !== state.selectedTask.run_mode", (root / "static" / "core.js").read_text(encoding="utf-8"))
         self.assertIn("run_mode TEXT DEFAULT ''", database_py)
         self.assertEqual("message", self.app.requested_run_mode({"goal": "ship it"}, "message", "message-1"))
@@ -1363,7 +1366,7 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260816-stable-chat-scroll', html)
+        self.assertIn('/conversation.js?v=20260816-goal-state-labels', html)
         self.assertIn('/styles.css?v=20260816-stable-chat-scroll', html)
         self.assertIn('/chat-worker.js?v=20260816-stable-chat-scroll', conversation_js)
         self.assertIn("scroll-behavior: auto", styles)

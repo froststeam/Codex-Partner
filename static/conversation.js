@@ -219,8 +219,10 @@ async function loadComposerModels(task) {
 }
 function goalStatusLabel(value) {
   if (value === "none") return ({ zh: "未设置", en: "Unset", fr: "Non défini", ja: "未設定", ko: "미설정" }[state.language] || "Unset");
-  const labels = { active: "running", paused: "statusStopped", blocked: "statusFailed", usageLimited: "statusRetrying", budgetLimited: "statusRetrying", complete: "statusSucceeded", none: "available" };
-  return labels[value] === "running" ? t("statusRunning") : labels[value] ? t(labels[value]) : value || t("unknown");
+  // "active" means the Goal is enabled and unfinished, not that a
+  // goal_resume turn is currently executing.
+  const labels = { active: "enabled", paused: "statusStopped", blocked: "statusFailed", usageLimited: "statusRetrying", budgetLimited: "statusRetrying", complete: "statusSucceeded", none: "available" };
+  return labels[value] ? t(labels[value]) : value || t("unknown");
 }
 function renderGoalBar() {
   const task = state.selectedTask;
@@ -523,6 +525,8 @@ function renderInspector() {
   if (workspaceSection?.dataset.taskId === task.id) content.append(workspaceSection);
   else if (workspaceError?.dataset.taskId === task.id) content.append(workspaceError);
   localizeInspectorText(content);
+  const goalProgress = $(".inspector-goal + .inspector-row span:last-child", content);
+  if (goalProgress) goalProgress.textContent = goalStatusLabel(task.goal_status || (task.goal ? "active" : "none"));
 }
 async function loadWorkspace(path = "") {
   if (!state.selectedTask) return;
