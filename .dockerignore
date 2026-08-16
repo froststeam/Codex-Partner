@@ -1,0 +1,16 @@
+.env
+.git/
+.gitignore
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+artifacts/
+build/
+data/
+dist/
+tests/
+image*.png
+PLAN.md

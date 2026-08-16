@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Codex Partner</title>
+  <link rel="stylesheet" href="/styles.css?v=20260816-game-sprites" />
+  <link rel="stylesheet" href="/mascot-dance.css?v=20260816-game-sprites" />
+  <link rel="stylesheet" href="/vendor/toastui-editor/toastui-editor.css" />
+  <link rel="stylesheet" href="/vendor/toastui-editor/toastui-editor-dark.css" />
+  <link rel="stylesheet" href="/vendor/xterm/xterm.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><button id="theme-toggle" class="theme-toggle" type="button" title="切换废土终端主题" aria-label="切换废土终端主题"><span class="mascot mascot-mini" role="img" aria-hidden="true"><i></i><b></b><em></em></span></button><span>Codex Partner</span></div>
+    <div class="shortcut-hints" aria-label="快捷键">
+      <span class="shortcut-hint" title="单按反引号键 (`) 显示/隐藏终端"><kbd class="key-backquote" aria-label="反引号键"><span aria-hidden="true">~</span><span aria-hidden="true">`</span></kbd><span class="shortcut-label">终端</span></span>
+      <span class="shortcut-hint" title="下一个会话"><kbd class="combo-key" aria-label="Shift N"><span aria-hidden="true">⇧</span> N</kbd><span class="shortcut-label">下一个会话</span></span>
+      <span class="shortcut-hint" title="上一个会话"><kbd class="combo-key" aria-label="Shift P"><span aria-hidden="true">⇧</span> P</kbd><span class="shortcut-label">上一个会话</span></span>
+      <span class="shortcut-hint" title="回到最顶端会话"><kbd class="combo-key" aria-label="Shift C"><span aria-hidden="true">⇧</span> C</kbd><span class="shortcut-label">首个会话</span></span>
+    </div>
+    <div class="top-actions"><label class="language-picker"><span class="sr-only">界面语言</span><select id="language-select" aria-label="界面语言"><option value="zh">中文</option><option value="en">English</option><option value="fr">Français</option><option value="ja">日本語</option><option value="ko">한국어</option></select></label><button id="new-task" class="new-session" title="新建会话">＋ <span>新会话</span></button><button id="open-terminal" class="icon-btn" title="显示/隐藏远程终端（单按反引号键）">&gt;_</button></div>
+  </header>
+  <button id="connection-status" class="connection-popover connecting" type="button" title="查看当前服务器、Provider 和实时指标" aria-label="查看当前服务器、Provider 和实时指标"><span class="connection-signal" aria-hidden="true"><i></i></span><span class="connection-copy"><small id="connection-server-label">服务器</small><strong id="connection-status-label">连接中</strong></span><span class="connection-runtime"><small id="connection-provider-label">当前 API · 自动选择</small><small id="connection-metrics-label">TTFT -- · TPOT --</small></span></button>
+  <div id="codex-install-notice" class="codex-install-notice" role="alert" hidden><span class="codex-install-mark" aria-hidden="true">!</span><span class="codex-install-copy"><strong>未找到 Codex CLI</strong><small id="codex-install-command">正在检查安装环境</small></span><button id="install-codex" class="primary" type="button">一键安装</button></div>
+  <main class="workspace-app">
+    <aside class="session-sidebar" aria-label="Codex 会话列表">
+      <div class="sidebar-top"><div><h1>会话</h1></div><button id="sync-native" class="icon-action" title="同步本机 Codex">⟳</button></div>
+      <div class="session-search"><span>⌕</span><input id="session-search" placeholder="搜索会话" /></div>
+      <div class="session-filters"><button class="filter active" data-filter="all">全部</button><button class="filter" data-filter="running">进行中</button><button class="filter" data-filter="available">待处理</button><button class="filter trash-filter" data-panel="trash" title="打开回收站">回收站</button></div>
+      <div id="running-summary" class="running-summary" hidden></div>
+      <div id="task-list" class="session-list"><div class="empty">加载会话中…</div></div>
+      <div class="sidebar-bottom"><button class="sidebar-link" data-panel="memories">⌁ <span>记忆</span></button><button class="sidebar-link" data-panel="skills">◇ <span>Skills</span></button><span id="sidebar-stats">0 个会话</span></div>
+    </aside>
+    <section class="conversation-shell">
+      <div id="empty-conversation" class="empty-conversation"><div class="mascot mascot-large" aria-hidden="true"><i></i><b></b><em></em></div><h2>开始一个 Codex 会话</h2><p>从左侧选择已有线程，或新建一个会话开始工作。</p><button id="empty-new-task" class="primary">新建会话</button></div>
+      <div id="conversation-view" class="conversation-view" hidden>
+        <header class="conversation-head"><div class="conversation-title"><button id="mobile-sessions" class="icon-action mobile-only" title="打开会话列表">☰</button><div><div class="conversation-title-line"><h2 id="conversation-name">Codex 会话</h2><button id="conversation-title-toggle" class="title-toggle" type="button" hidden>展开</button></div><p id="conversation-subtitle"></p></div></div><div class="conversation-actions"><button id="conversation-rename" class="icon-action" title="重命名">✎</button><button id="conversation-fork" class="icon-action" title="复制会话">⑂</button><button id="conversation-more" class="icon-action" title="更多操作">⋯</button></div></header>
+        <div id="chat-log" class="chat-stream"></div>
+        <div class="conversation-status-row">
+          <div id="turn-progress" class="turn-progress" aria-hidden="true"><div class="turn-progress-inner"><span class="codex-working-mark" aria-hidden="true"><i></i></span><span class="turn-progress-copy" role="status" aria-live="polite"><small id="turn-progress-tip"></small></span><span class="turn-progress-rail" aria-hidden="true"></span></div></div>
+          <section id="goal-bar" class="goal-bar" hidden aria-label="Goal 控制"><div class="goal-bar-main"><div class="goal-bar-heading"><span class="eyebrow">GOAL</span><span id="goal-task-status" class="goal-task-status"></span></div><div id="goal-text" class="goal-text"></div><form id="goal-edit-form" class="goal-edit-form" hidden><input id="goal-input" maxlength="2000" autocomplete="off" placeholder="输入要持续完成的目标"/><div class="goal-edit-actions"><button type="button" class="goal-button danger-small" id="goal-clear">清空</button><button type="button" class="goal-button subtle" id="goal-edit-cancel">取消</button><button class="goal-button primary-small">保存</button></div></form></div><div class="goal-bar-controls"><button type="button" id="goal-edit" class="goal-button subtle" title="修改 Goal" aria-label="修改 Goal">✎</button><button type="button" id="goal-run-toggle" class="goal-button" title="暂停 Goal" aria-label="暂停 Goal"><span id="goal-run-icon">Ⅱ</span><span id="goal-run-label" class="sr-only">暂停 Goal</span></button><button type="button" id="goal-retry-toggle" class="goal-button retry" title="打开 Goal 自动续跑" aria-label="切换 Goal 自动续跑"><span>↻</span><strong id="goal-retry-label">关</strong></button></div></section>
+        </div>
+        <div class="composer-dock"><div id="queued-messages" class="queued-messages" hidden aria-live="polite"></div><form id="message-form" class="composer"><div id="composer-context" class="composer-context"></div><div id="command-palette" class="command-palette" hidden role="listbox" aria-label="Codex 斜杠命令"></div><textarea id="message-input" rows="1" placeholder="给 Codex 发送消息…"></textarea><div class="composer-bottom"><div class="composer-send-actions"><button type="submit" class="send-codex-button" id="send-codex" title="发送到 Codex（Enter）"><span id="send-codex-label">发送</span><span aria-hidden="true">↑</span></button></div></div><div id="composer-meta" class="composer-meta" aria-label="当前会话控制"><div class="composer-meta-tools"><button type="button" class="tool-button" id="attach-button" title="添加本地文本文件">＋</button><input id="attach-file" type="file" hidden /><button type="button" class="tool-button" id="command-button" title="打开 Codex 斜杠命令">/</button></div><span id="composer-live-state" class="composer-live-state"><i></i><span>待命</span></span><button type="button" class="tool-button composer-yolo" id="permission-toggle" title="切换 YOLO/受控模式">✦ <span>YOLO</span></button><label class="composer-model-control"><span>模型</span><select id="composer-model-select" class="composer-select" aria-label="选择模型"><option value="">Provider 默认模型</option></select></label><span id="composer-context-usage" class="composer-context-usage"><span class="context-usage-copy">Context --</span><span class="context-usage-track" aria-hidden="true"><i></i></span></span><label class="composer-effort-control"><span>思考</span><select id="composer-effort-select" class="composer-select" aria-label="选择思考程度"><option value="">Provider 默认</option><option value="minimal">最小</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">很高</option><option value="ultra">极高</option></select></label><span id="composer-goal-meta" class="meta-pill goal-pill" hidden></span></div></form></div>
+      </div>
+    </section>
+    <aside id="inspector" class="inspector" aria-label="会话详情"><div class="inspector-head"><h2>工作区</h2><button id="close-inspector" class="icon-action" title="关闭详情">×</button></div><div id="inspector-content"></div></aside>
+  </main>
+  <aside id="drawer" class="drawer" aria-hidden="true"><div class="drawer-inner"><button id="close-drawer" class="close">×</button><div id="drawer-content"></div></div></aside>
+  <div id="panel" class="panel" aria-hidden="true"><div class="panel-inner"><button id="close-panel" class="close">×</button><div id="panel-content"></div></div></div>
+  <div id="terminal-window" class="terminal-window" aria-hidden="true"><section class="terminal-shell" role="dialog" aria-modal="true" aria-labelledby="terminal-title"><header class="terminal-head"><div><span id="terminal-eyebrow" class="eyebrow">远程 Shell</span><h2 id="terminal-title">远程终端</h2><small id="terminal-cwd">未连接</small></div><div class="terminal-head-actions"><span id="terminal-status" class="terminal-status">未连接</span><button id="terminal-close" class="icon-action" title="关闭终端">×</button></div></header><div id="terminal-screen" class="terminal-screen" aria-label="远程终端输出"></div><footer class="terminal-foot"><span id="terminal-hint">点击终端后输入 · Enter 执行 · Ctrl+C 中断</span><button id="terminal-reconnect" class="secondary">重连</button></footer></section></div>
+  <input id="workspace-upload-input" type="file" multiple hidden /><input id="user-avatar-file" type="file" accept="image/*" hidden />
+  <dialog id="app-dialog" class="app-dialog" aria-labelledby="app-dialog-title"><form id="app-dialog-form"><div class="app-dialog-heading"><span class="mascot mascot-inline" aria-hidden="true"><i></i><b></b><em></em></span><div><h2 id="app-dialog-title"></h2><p id="app-dialog-message"></p></div></div><label id="app-dialog-field" hidden><span id="app-dialog-label"></span><input id="app-dialog-input" autocomplete="off" /></label><div class="app-dialog-actions"><button type="button" class="secondary" id="app-dialog-cancel"></button><button type="submit" class="primary" id="app-dialog-confirm"></button></div></form></dialog>
+  <div id="toast" class="toast" role="status"></div>
+  <script src="/vendor/xterm/xterm.js"></script>
+  <script src="/vendor/xterm/addons/fit.js"></script>
+  <script src="/vendor/xterm/addons/unicode11.js"></script>
+  <script src="/vendor/xterm/addons/web-links.js"></script>
+  <script src="/vendor/toastui-editor/toastui-editor.js"></script>
+  <script src="/vendor/toastui-editor/zh-cn.js"></script>
+  <script src="/vendor/i18next/i18next.min.js"></script>
+  <script src="/vendor/ace/ace.js"></script>
+  <script src="/vendor/ace/ext-modelist.js"></script>
+  <script src="/core.js?v=20260816-game-sprites"></script>
+  <script src="/mascot-dance.js?v=20260816-game-sprites"></script>
+  <script src="/editor.js?v=20260816-game-sprites"></script>
+  <script src="/conversation.js?v=20260816-game-sprites"></script>
+  <script src="/settings.js?v=20260816-game-sprites"></script>
+  <script src="/app.js?v=20260816-game-sprites"></script>
+</body>
+</html>

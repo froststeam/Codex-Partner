@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""Tiny deterministic Codex stand-in for queue and multi-client tests."""
+import json
+import os
+import sys
+import time
+
+resume = "resume" in sys.argv
+print(json.dumps({"type": "thread.started", "thread_id": "fake-shared-session"}), flush=True)
+if "fail" in os.getenv("OPENAI_BASE_URL", ""):
+    print(json.dumps({"type": "error", "message": "simulated provider failure"}), flush=True)
+    raise SystemExit(12)
+time.sleep(0.15 if resume else 0.25)
+print(json.dumps({"type": "message.completed", "text": sys.argv[-1]}), flush=True)

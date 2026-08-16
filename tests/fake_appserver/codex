@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Deterministic Codex app-server stand-in for browser streaming tests."""
+import json
+import sys
+import threading
+import time
+import uuid
+
+
+write_lock = threading.Lock()
+threads = {}
+
+
+def send(message):
+    with write_lock:
+        print(json.dumps(message, ensure_ascii=False), flush=True)
+
+
+def result(request_id, value):
+    send({"id": request_id, "result": value})
+
+
+def stream_turn(thread_id, turn_id, text, client_id):
+    user_id = f"user-{uuid.uuid4()}"
+    message_id = f"agent-{uuid.uuid4()}"
+    user = {"type": "userMessage", "id": user_id, "clientId": client_id, "content": [{"type": "text", "text": text}]}
+    send({"method": "item/started", "params": {"threadId": thread_id, "turnId": turn_id, "item": user}})
+    send({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": user}})
+    send({"method": "item/started", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": "agentMessage", "id": message_id, "text": ""}}})
+    chunks = ["实时", "响应", "：", text]
+    for chunk in chunks:
+        time.sleep(0.12)
+        send({"method": "item/agentMessage/delta", "params": {"threadId": thread_id, "turnId": turn_id, "itemId": message_id, "delta": chunk}})
+    final_text = "".join(chunks)
+    send({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": "agentMessage", "id": message_id, "text": final_text}}})
+    threads[thread_id]["turns"].append({"id": turn_id, "status": "completed", "items": [user, {"type": "agentMessage", "id": message_id, "text": final_text}]})
+    send({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed"}}})
+
+
+for raw in sys.stdin:
+    try:
+        request = json.loads(raw)
+    except json.JSONDecodeError:
+        continue
+    if "id" not in request:
+        continue
+    request_id = request["id"]
+    method = request.get("method", "")
+    params = request.get("params") or {}
+    if method == "initialize":
+        result(request_id, {"serverInfo": {"name": "fake-codex", "version": "1"}})
+    elif method == "thread/list":
+        result(request_id, {"data": [], "nextCursor": None})
+    elif method == "thread/start":
+        thread_id = f"thread-{uuid.uuid4()}"
+        threads[thread_id] = {"id": thread_id, "turns": []}
+        result(request_id, {"thread": {"id": thread_id}})
+    elif method == "thread/resume":
+        thread_id = params["threadId"]
+        threads.setdefault(thread_id, {"id": thread_id, "turns": []})
+        result(request_id, {"thread": {"id": thread_id}})
+    elif method == "thread/read":
+        thread_id = params["threadId"]
+        thread = threads.setdefault(thread_id, {"id": thread_id, "turns": []})
+        result(request_id, {"thread": thread})
+    elif method == "turn/start":
+        thread_id = params["threadId"]
+        turn_id = f"turn-{uuid.uuid4()}"
+        text = "\n".join(item.get("text", "") for item in params.get("input", []) if item.get("type") == "text")
+        result(request_id, {"turn": {"id": turn_id, "status": "inProgress"}})
+        threading.Thread(target=stream_turn, args=(thread_id, turn_id, text, params.get("clientUserMessageId")), daemon=True).start()
+    elif method == "turn/interrupt":
+        result(request_id, {})
+    elif method == "turn/steer":
+        text = "\n".join(item.get("text", "") for item in params.get("input", []) if item.get("type") == "text")
+        if text == "[reject-steer]":
+            send({"id": request_id, "error": {"code": -32001, "message": "turn is no longer steerable"}})
+        else:
+            result(request_id, {})
+    elif method == "thread/goal/get":
+        result(request_id, {"goal": {"objective": "", "status": "none", "tokensUsed": 0}})
+    elif method == "thread/goal/set":
+        result(request_id, {"goal": {"objective": params.get("objective", ""), "status": params.get("status", "active"), "tokensUsed": 0}})
+    else:
+        result(request_id, {})

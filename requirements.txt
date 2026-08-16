@@ -1,0 +1,7 @@
+fastapi>=0.110
+uvicorn[standard]>=0.27
+tomli>=2.0; python_version < "3.11"
+PyYAML>=6.0
+pexpect>=4.8; platform_system != "Windows"
+python-dotenv>=1.0
+Pillow>=10.0

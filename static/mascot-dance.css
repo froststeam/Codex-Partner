@@ -1,0 +1,100 @@
+/* Layered SVG game sprites for the keyboard dance easter egg. */
+.mascot-dance { position: fixed; z-index: 95; inset: 0; overflow: hidden; pointer-events: none; }
+.mascot-dance-stage { position: absolute; bottom: 7%; left: 50%; width: min(520px, 100vw); height: 250px; transform: translateX(-50%); }
+.mascot-dance-stage::before { content: ""; position: absolute; right: 5%; bottom: 5px; left: 5%; height: 48px; border: 1px solid #99e97842; border-radius: 50%; background: radial-gradient(ellipse, #a3ff7135 0, #81d95d14 45%, transparent 72%); box-shadow: 0 0 50px #80ff5830; animation: dance-stage-breathe 1.25s ease-in-out infinite alternate; }
+.mascot-dance-stage::after { content: ""; position: absolute; right: 13%; bottom: 18px; left: 13%; height: 1px; background: linear-gradient(90deg, transparent, #d9ffacaa, transparent); box-shadow: 0 0 14px #9cff76; }
+.dance-beam { position: absolute; z-index: 0; bottom: 20px; width: 150px; height: 225px; opacity: .28; clip-path: polygon(42% 0, 58% 0, 100% 100%, 0 100%); background: linear-gradient(180deg, #dfffad55, #8cff7208); filter: blur(2px); }
+.beam-left { left: 38px; transform: rotate(-8deg); }.beam-right { right: 38px; transform: rotate(8deg); }
+.dance-figure { position: absolute; z-index: 2; bottom: 22px; width: 150px; height: 193px; transform-origin: 50% 92%; will-change: transform, opacity; }
+.dance-sprite { display: block; width: 100%; height: 100%; overflow: visible; filter: drop-shadow(0 10px 8px #0008); }
+.dance-partner-figure { left: 58px; animation: partner-game-entry 10s cubic-bezier(.42, 0, .25, 1) both; }
+.dance-scout-figure { right: 58px; animation: scout-game-entry 10s cubic-bezier(.42, 0, .25, 1) both; }
+.sprite-shadow { fill: #07120c99; transform-origin: center; animation: sprite-shadow-pulse .7s ease-in-out infinite alternate; }
+.sprite-head, .sprite-body, .sprite-arm, .sprite-leg { transform-box: fill-box; }
+.partner-head { transform-origin: 50% 85%; animation: partner-head-dance 2.2s ease-in-out infinite; }
+.partner-body { transform-origin: 50% 20%; animation: partner-body-dance 1.4s ease-in-out infinite; }
+.partner-arm-left { transform-origin: 88% 16%; animation: partner-arm-left-dance 2.8s ease-in-out infinite; }
+.partner-arm-right { transform-origin: 12% 16%; animation: partner-arm-right-dance 2.8s ease-in-out infinite; }
+.partner-leg-left { transform-origin: 55% 10%; animation: partner-step-left .7s ease-in-out infinite alternate; }
+.partner-leg-right { transform-origin: 45% 10%; animation: partner-step-right .7s ease-in-out infinite alternate; }
+.partner-eyes { transform-box: fill-box; transform-origin: center; animation: partner-game-blink 3.6s steps(1, end) infinite; }
+.scout-head { transform-origin: 50% 88%; animation: scout-head-dance 1.15s steps(2, end) infinite; }
+.scout-body { transform-origin: center; animation: scout-body-hit .8s steps(2, end) infinite; }
+.scout-arm-left { transform-origin: 90% 15%; animation: scout-arm-left-dance 3.2s steps(1, end) infinite; }
+.scout-arm-right { transform-origin: 10% 15%; animation: scout-arm-right-dance 3.2s steps(1, end) infinite; }
+.scout-leg-left { transform-origin: 55% 10%; animation: scout-step-left .8s steps(2, end) infinite; }
+.scout-leg-right { transform-origin: 45% 10%; animation: scout-step-right .8s steps(2, end) infinite; }
+.scout-eyes { transform-box: fill-box; transform-origin: center; animation: scout-optics 1.6s steps(2, end) infinite; }
+.scout-core, .scout-signal { animation: scout-light-pulse .8s ease-in-out infinite alternate; }
+.scout-scan { animation: scout-visor-scan 1.6s linear infinite; }
+.dance-particles { position: absolute; z-index: 3; inset: 0; }
+.dance-particles > * { position: absolute; display: block; width: 8px; height: 8px; border: 2px solid #bcff91; opacity: 0; box-shadow: 0 0 9px #8cff72; animation: dance-particle 2.4s ease-out infinite; }
+.dance-particles i { top: 34%; left: 44%; transform: rotate(45deg); }.dance-particles b { top: 22%; left: 55%; border-radius: 50%; animation-delay: .55s; }.dance-particles em { top: 47%; left: 52%; width: 5px; height: 13px; border-width: 0 2px; animation-delay: 1.1s; }.dance-particles strong { top: 30%; left: 48%; border-radius: 50%; animation-delay: 1.65s; }
+
+@keyframes partner-game-entry {
+  0% { opacity: 0; transform: translateX(-62vw) translateY(8px) rotate(-8deg) scale(.88); }
+  4% { opacity: 1; }
+  7% { transform: translateX(-50vw) translateY(-15px) rotate(5deg) scale(.92); }
+  11% { transform: translateX(-40vw) translateY(2px) rotate(-3deg) scale(.95); }
+  15% { transform: translateX(-30vw) translateY(-18px) rotate(6deg); }
+  19% { transform: translateX(-20vw) translateY(0) rotate(-4deg); }
+  23% { transform: translateX(-10vw) translateY(-13px) rotate(4deg); }
+  28% { transform: translateX(0) translateY(0); }
+  34% { transform: translate(-14px, -10px) rotate(-6deg); }
+  42% { transform: translate(18px, -2px) rotate(7deg); }
+  50% { transform: translate(30px, -15px) rotate(-5deg); }
+  58% { transform: translate(-6px, 0) rotate(4deg); }
+  66% { transform: translate(-22px, -12px) rotate(-8deg); }
+  74% { transform: translate(12px, -3px) rotate(6deg); }
+  82% { transform: translate(26px, -18px) rotate(-7deg) scale(1.04); }
+  89% { transform: translateY(-25px) rotate(8deg) scale(1.08); }
+  94% { opacity: 1; transform: translateY(0) rotate(-3deg); }
+  100% { opacity: 0; transform: translateX(-24vw) translateY(-10px) rotate(-12deg) scale(.94); }
+}
+@keyframes scout-game-entry {
+  0% { opacity: 0; transform: translateX(62vw) translateY(8px) rotate(8deg) scale(.88); }
+  4% { opacity: 1; }
+  7% { transform: translateX(50vw) translateY(-12px) rotate(-4deg) scale(.92); }
+  11% { transform: translateX(40vw) translateY(2px) rotate(3deg) scale(.95); }
+  15% { transform: translateX(30vw) translateY(-16px) rotate(-5deg); }
+  19% { transform: translateX(20vw) translateY(0) rotate(4deg); }
+  23% { transform: translateX(10vw) translateY(-12px) rotate(-3deg); }
+  28% { transform: translateX(0) translateY(0); }
+  34% { transform: translate(14px, -2px) rotate(5deg); }
+  42% { transform: translate(-18px, -11px) rotate(-7deg); }
+  50% { transform: translate(-30px, 0) rotate(5deg); }
+  58% { transform: translate(6px, -15px) rotate(-4deg); }
+  66% { transform: translate(22px, 0) rotate(8deg); }
+  74% { transform: translate(-12px, -12px) rotate(-6deg); }
+  82% { transform: translate(-26px, -4px) rotate(7deg) scale(1.04); }
+  89% { transform: translateY(-25px) rotate(-8deg) scale(1.08); }
+  94% { opacity: 1; transform: translateY(0) rotate(3deg); }
+  100% { opacity: 0; transform: translateX(24vw) translateY(-10px) rotate(12deg) scale(.94); }
+}
+@keyframes partner-head-dance { 0%, 100% { transform: rotate(-4deg) translateY(1px); } 50% { transform: rotate(6deg) translateY(-4px); } }
+@keyframes partner-body-dance { 0%, 100% { transform: skewX(-2deg) scaleY(.97); } 50% { transform: skewX(3deg) scaleY(1.04); } }
+@keyframes partner-arm-left-dance { 0%, 100% { transform: rotate(8deg); } 25% { transform: rotate(-38deg) translateY(-3px); } 50% { transform: rotate(18deg); } 75% { transform: rotate(-58deg) translateY(-5px); } }
+@keyframes partner-arm-right-dance { 0%, 100% { transform: rotate(-8deg); } 25% { transform: rotate(42deg) translateY(-4px); } 50% { transform: rotate(-20deg); } 75% { transform: rotate(54deg) translateY(-3px); } }
+@keyframes partner-step-left { to { transform: translate(5px, -8px) rotate(7deg); } }
+@keyframes partner-step-right { to { transform: translate(-5px, 7px) rotate(-6deg); } }
+@keyframes partner-game-blink { 0%, 45%, 49%, 100% { transform: scaleY(1); } 47% { transform: scaleY(.12); } }
+@keyframes scout-head-dance { 0%, 49% { transform: translateX(-3px) rotate(-3deg); } 50%, 100% { transform: translateX(3px) rotate(4deg); } }
+@keyframes scout-body-hit { 0%, 49% { transform: scale(1); } 50%, 100% { transform: scale(1.04, .96); } }
+@keyframes scout-arm-left-dance { 0%, 24% { transform: rotate(8deg); } 25%, 49% { transform: rotate(-70deg) translateY(-4px); } 50%, 74% { transform: rotate(-18deg); } 75%, 100% { transform: rotate(-92deg) translateY(-7px); } }
+@keyframes scout-arm-right-dance { 0%, 24% { transform: rotate(-8deg); } 25%, 49% { transform: rotate(15deg); } 50%, 74% { transform: rotate(72deg) translateY(-4px); } 75%, 100% { transform: rotate(92deg) translateY(-7px); } }
+@keyframes scout-step-left { 0%, 49% { transform: translateY(-7px) rotate(5deg); } 50%, 100% { transform: translateY(3px); } }
+@keyframes scout-step-right { 0%, 49% { transform: translateY(3px); } 50%, 100% { transform: translateY(-7px) rotate(-5deg); } }
+@keyframes scout-optics { 50% { filter: brightness(1.8); transform: scaleY(.88); } }
+@keyframes scout-light-pulse { to { filter: brightness(1.5); opacity: .55; } }
+@keyframes scout-visor-scan { 0% { transform: translateY(0); opacity: 0; } 15%, 80% { opacity: .8; } 100% { transform: translateY(28px); opacity: 0; } }
+@keyframes sprite-shadow-pulse { to { transform: scaleX(.82); opacity: .55; } }
+@keyframes dance-particle { 0%, 20% { opacity: 0; transform: translateY(12px) rotate(0) scale(.5); } 35% { opacity: .9; } 100% { opacity: 0; transform: translateY(-55px) rotate(135deg) scale(1.15); } }
+@keyframes dance-stage-breathe { to { opacity: .6; transform: scaleX(.9); } }
+
+@media (max-width: 600px) {
+  .mascot-dance-stage { bottom: 9%; height: 215px; }
+  .dance-figure { width: 122px; height: 157px; }
+  .dance-partner-figure { left: 16px; }.dance-scout-figure { right: 16px; }
+  .dance-beam { width: 110px; height: 185px; }.beam-left { left: 14px; }.beam-right { right: 14px; }
+}
+@media (prefers-reduced-motion: reduce) { .mascot-dance { display: none; } }

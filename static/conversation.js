@@ -1,0 +1,894 @@
+// Session list, conversation rendering, workspace browser, and live terminal.
+const chatFileObjectUrls = new Map();
+const chatThumbnailObjectUrls = new Map();
+const chatThumbnailLoads = new Map();
+const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260816-history-pages") : null;
+let chatBuildRequestId = 0;
+let chatHistoryLoadPromise = null;
+function renderSidebarStats() {
+  const running = sortTasks(state.tasks.filter(task => ["running", "retrying"].includes(task.status)));
+  const queued = sortTasks(state.tasks.filter(task => task.status === "queued"));
+  const live = [...running, ...queued];
+  $("#sidebar-stats").textContent = `${state.tasks.length} ${t("sessions")} · ${running.length} ${t("statusRunning")}`;
+  const summary = $("#running-summary");
+  if (!summary) return;
+  summary.hidden = !live.length;
+  if (!live.length) { summary.innerHTML = ""; return; }
+  const title = running.length ? `${t("statusRunning")} ${running.length} ${t("sessions")}${queued.length ? ` · ${t("statusQueued")} ${queued.length}` : ""}` : `${t("statusQueued")} ${queued.length} ${t("sessions")}`;
+  summary.innerHTML = `<div class="running-summary-head"><span class="live-dot"></span><strong>${title}</strong></div><div class="running-summary-list">${live.slice(0, 4).map(task => `<button data-session-id="${esc(task.id)}"><span>${esc(task.name || "Codex 会话")}</span><small>${esc(statusLabel(task.status))}${task.provider_id ? ` · ${esc(state.providers.find(provider => provider.id === task.provider_id)?.name || task.provider_id)}` : ""}</small></button>`).join("")}</div>${live.length > 4 ? `<small class="running-summary-more">还有 ${live.length - 4} 个活动会话</small>` : ""}`;
+}
+function renderSessionList() {
+  const list = $("#task-list"); const tasks = sortTasks(state.tasks.filter(taskMatches));
+  if (!tasks.length) { list.innerHTML = `<div class="empty">${state.query ? "没有匹配的会话" : "还没有 Codex 会话"}</div>`; return; }
+  list.innerHTML = tasks.map(task => { const active = ["running", "retrying"].includes(task.status); const name = task.name || t("sessions"); return `<button class="session-card ${task.id === state.selectedId ? "selected" : ""} ${active ? "running" : "paused"}" data-session-id="${esc(task.id)}" title="${esc(name)}"><span class="session-card-body"><strong title="${esc(name)}">${esc(name)}</strong><time class="session-card-time">${esc(shortDate(task.updated_at))}</time></span></button>`; }).join("");
+}
+function scrollSessionIntoView(id) {
+  const card = $$(".session-card").find(node => node.dataset.sessionId === id);
+  card?.scrollIntoView({ block: "nearest" });
+}
+function stopQueueSync() {
+  clearInterval(queueSyncTimer);
+  queueSyncTimer = null;
+  queueSyncInFlight = false;
+}
+async function syncQueuedMessages() {
+  if (queueSyncInFlight || !state.selectedId) return;
+  const taskId = state.selectedId;
+  queueSyncInFlight = true;
+  try {
+    const messages = await api(`/tasks/${taskId}/messages`);
+    if (state.selectedId !== taskId) return;
+    replaceTaskMessages(messages);
+    renderQueuedMessages();
+    scheduleRenderChat();
+  } catch (_) {
+    // The websocket remains the primary channel; the next interval retries.
+  } finally {
+    queueSyncInFlight = false;
+  }
+}
+function showEmptyConversation() { if (terminalTaskId) destroyTerminal(); stopQueueSync(); state.editingQueuedId = null; state.inspectorClosed = true; $("#empty-conversation").hidden = false; $("#conversation-view").hidden = true; $("#goal-bar").hidden = true; $("#queued-messages").hidden = true; setInspectorOpen(false); }
+function resetWorkspaceBrowser() {
+  state.workspacePath = "";
+  state.workspaceFile = null;
+  state.workspaceRequestId += 1;
+  $("#workspace-section")?.remove();
+  $(".workspace-error")?.remove();
+}
+async function selectSession(id, openSocket = true) {
+  const requestId = ++state.sessionRequestId;
+  if (terminalTaskId && terminalTaskId !== id) closeTerminal();
+  const wasEmpty = $("#conversation-view").hidden;
+  if (state.selectedId !== id) {
+    resetWorkspaceBrowser(); state.titleExpanded = false; state.historyCursor = ""; state.historyHasMore = false;
+    state.historyLoading = false; state.chatBlocks = []; state.chatVirtualStart = null;
+  }
+  state.selectedId = id; localStorage.setItem("codex-dashboard-session", id);
+  const task = state.tasks.find(item => item.id === id);
+  if (task) state.selectedTask = task;
+  // Reflect keyboard navigation immediately, then replace the row with the full task after loading.
+  renderSessionList();
+  scrollSessionIntoView(id);
+  const [fullTask, timeline, messages] = await Promise.all([api(`/tasks/${id}`), api(`/tasks/${id}/timeline?limit=160`), api(`/tasks/${id}/messages`)]);
+  if (requestId !== state.sessionRequestId || state.selectedId !== id) return;
+  state.selectedTask = fullTask;
+  state.selectedEvents = [...(timeline.items || []), ...(timeline.metrics || [])];
+  state.historyCursor = timeline.next_cursor || ""; state.historyHasMore = Boolean(timeline.has_more);
+  replaceTaskMessages(messages);
+  // A newly selected thread should open at its latest message. Consume this
+  // once in renderChat instead of smooth-scrolling on every intermediate
+  // update while the history/socket is loading.
+  state.chatSnapToBottom = true;
+  $("#empty-conversation").hidden = true; $("#conversation-view").hidden = false;
+  if (wasEmpty && window.innerWidth >= 861) state.inspectorClosed = false;
+  setInspectorOpen(window.innerWidth >= 861 && !state.inspectorClosed);
+  renderSessionList(); renderConversation(); await loadWorkspace("");
+  if (openSocket) connectSocket(id); if (window.innerWidth < 900) $(".session-sidebar").classList.remove("open");
+}
+function renderConversation() {
+  const task = state.selectedTask; if (!task) return;
+  const title = String(task.name || t("sessions"));
+  const titleNode = $("#conversation-name");
+  const titleToggle = $("#conversation-title-toggle");
+  titleNode.textContent = title;
+  const longTitle = title.length > 36;
+  titleNode.title = title;
+  titleToggle.hidden = true;
+  titleNode.classList.toggle("expanded", false);
+  titleToggle.onclick = () => { state.titleExpanded = !state.titleExpanded; renderConversation(); };
+  const threadId = task.codex_session_id || task.id || "";
+  const workspace = task.workspace || "";
+  const location = task.ssh_host ? `${task.ssh_host} · ` : "";
+  $("#conversation-subtitle").textContent = `${location}${workspace} · ${uiLabel("threadId")} ${threadId || "—"}`;
+  $("#composer-goal-meta").hidden = !task.goal;
+  $("#composer-goal-meta").textContent = task.goal ? `${uiLabel("goal")} · ${goalStatusLabel(task.goal_status || "active")}` : "";
+  const composerSettings = composerModelCache.get(`${task.id}:${task.provider_id || "default"}`) || {};
+  renderComposerModelSelect(task, Array.isArray(composerSettings) ? composerSettings : composerSettings.models || []);
+  renderComposerEffortSelect(task, Array.isArray(composerSettings) ? "" : composerSettings.reasoning_effort || task.reasoning_effort || "");
+  loadComposerModels(task);
+  $("#permission-toggle").classList.toggle("active", task.yolo);
+  $("#permission-toggle span").textContent = task.yolo ? "YOLO" : "受控";
+  state.runtimeMetrics = calculateRuntimeMetrics(task, state.selectedEvents);
+  renderConnectionStatus();
+  renderContextUsage();
+  renderTurnProgress();
+  renderGoalBar();
+  refreshComposerHistory();
+  renderQueuedMessages();
+  renderChat(); renderInspector();
+}
+const composerModelCache = new Map();
+const composerModelLoads = new Map();
+function normalizeModelItems(raw) {
+  const items = (Array.isArray(raw) ? raw : []).map(item => typeof item === "string" ? { id: item, label: item } : { id: item?.id || item?.model || item?.slug || "", label: item?.displayName || item?.display_name || item?.label || item?.name || item?.id || item?.model || item?.slug || "" }).filter(item => item.id);
+  return [...new Map(items.map(item => [item.id, item])).values()];
+}
+function renderComposerModelSelect(task, models = []) {
+  const select = $("#composer-model-select");
+  if (!select) return;
+  const current = task.model || "";
+  const unique = normalizeModelItems(models);
+  if (current && !unique.some(item => item.id === current)) unique.unshift({ id: current, label: `${current}（当前）` });
+  select.innerHTML = `<option value="">${uiLabel("providerDefaultModel")}</option>${unique.map(item => `<option value="${esc(item.id)}">${esc(item.label)}</option>`).join("")}`;
+  select.value = current;
+  if (select.value !== current && current) {
+    select.insertAdjacentHTML("beforeend", `<option value="${esc(current)}">${esc(current)}（当前）</option>`);
+    select.value = current;
+  }
+  select.onchange = async () => {
+    const model = select.value;
+    if (model === current) return;
+    select.disabled = true;
+    try {
+      const updated = await api(`/tasks/${encodeURIComponent(task.id)}`, { method: "PATCH", body: JSON.stringify({ model }) });
+      state.selectedTask = { ...state.selectedTask, ...updated }; mergeTask(updated); renderConversation();
+      toast(model ? `已切换模型：${model}` : "已恢复 Provider 默认模型");
+    } catch (error) { select.value = current; toast(`模型切换失败：${error.message}`); }
+    finally { select.disabled = false; }
+  };
+  select.title = unique.length ? `已加载 ${unique.length} 个模型，可直接选择` : "Provider 未返回模型列表，将使用默认模型";
+}
+function renderComposerEffortSelect(task, value = "") {
+  const select = $("#composer-effort-select");
+  if (!select) return;
+  const options = [["", uiLabel("providerDefault")], ["minimal", uiLabel("minimal")], ["low", uiLabel("low")], ["medium", uiLabel("medium")], ["high", uiLabel("high")], ["xhigh", uiLabel("xhigh")], ["ultra", uiLabel("ultra")]];
+  const current = task.reasoning_effort || "";
+  select.innerHTML = options.map(([id, label]) => `<option value="${id}">${label}</option>`).join("");
+  select.value = value || current;
+  select.onchange = async () => {
+    const reasoning_effort = select.value;
+    if (reasoning_effort === current) return;
+    select.disabled = true;
+    try {
+      const updated = await api(`/tasks/${encodeURIComponent(task.id)}`, { method: "PATCH", body: JSON.stringify({ reasoning_effort }) });
+      state.selectedTask = { ...state.selectedTask, ...updated }; mergeTask(updated); renderConversation();
+      toast(reasoning_effort ? `思考程度：${select.options[select.selectedIndex]?.text || reasoning_effort}` : "已恢复 Provider 默认思考程度");
+    } catch (error) { select.value = current; toast(`思考程度切换失败：${error.message}`); }
+    finally { select.disabled = false; }
+  };
+  select.title = "选择 Codex 思考程度";
+}
+async function loadComposerModels(task) {
+  const cacheKey = `${task.id}:${task.provider_id || "default"}`;
+  if (composerModelCache.has(cacheKey)) {
+    const cached = composerModelCache.get(cacheKey);
+    renderComposerModelSelect(task, Array.isArray(cached) ? cached : cached.models || []);
+    renderComposerEffortSelect(task, Array.isArray(cached) ? task.reasoning_effort || "" : cached.reasoning_effort || task.reasoning_effort || "");
+    return;
+  }
+  if (composerModelLoads.has(cacheKey)) return;
+  const request = api(`/tasks/${encodeURIComponent(task.id)}/models`).then(result => {
+    const models = normalizeModelItems(result.models);
+    const settings = { models, reasoning_effort: result.reasoning_effort || "" };
+    composerModelCache.set(cacheKey, settings);
+    if (state.selectedId === task.id) {
+      renderComposerModelSelect(state.selectedTask, models);
+      renderComposerEffortSelect(state.selectedTask, settings.reasoning_effort || state.selectedTask.reasoning_effort || "");
+    }
+  }).catch(error => {
+    if (state.selectedId === task.id) {
+      const select = $("#composer-model-select");
+      if (select) { select.disabled = false; select.title = `模型列表读取失败：${error.message}`; }
+    }
+  }).finally(() => composerModelLoads.delete(cacheKey));
+  composerModelLoads.set(cacheKey, request);
+}
+function goalStatusLabel(value) {
+  if (value === "none") return ({ zh: "未设置", en: "Unset", fr: "Non défini", ja: "未設定", ko: "미설정" }[state.language] || "Unset");
+  const labels = { active: "running", paused: "statusStopped", blocked: "statusFailed", usageLimited: "statusRetrying", budgetLimited: "statusRetrying", complete: "statusSucceeded", none: "available" };
+  return labels[value] === "running" ? t("statusRunning") : labels[value] ? t(labels[value]) : value || t("unknown");
+}
+function renderGoalBar() {
+  const task = state.selectedTask;
+  const bar = $("#goal-bar");
+  if (!task) { bar.hidden = true; return; }
+  bar.hidden = false;
+  const goal = String(task.goal || "").trim();
+  const activeTurn = ["running", "retrying", "queued"].includes(task.status);
+  const goalRunning = Boolean(goal) && activeTurn && task.goal_status !== "paused";
+  const inputHasContent = Boolean($("#message-input")?.value.trim() || pendingAttachments.length);
+  $("#goal-text").textContent = goal;
+  $("#goal-text").classList.toggle("empty", !goal);
+  $("#goal-task-status").textContent = `${statusLabel(task.status)} · ${goalStatusLabel(task.goal_status || (goal ? "active" : "none"))}`;
+  $("#goal-run-toggle").classList.toggle("active", goalRunning);
+  $("#goal-run-toggle").disabled = !goal;
+  $("#goal-run-toggle").title = !goal ? uiLabel("setGoal") : (goalRunning ? uiLabel("goalPause") : uiLabel("goalStart"));
+  $("#goal-run-toggle").setAttribute("aria-label", $("#goal-run-toggle").title);
+  $("#goal-run-icon").textContent = goalRunning ? "Ⅱ" : "▶";
+  $("#goal-run-label").textContent = goalRunning ? uiLabel("pause") : uiLabel("start");
+  const retryToggle = $("#goal-retry-toggle");
+  retryToggle.disabled = !goal;
+  retryToggle.classList.toggle("active", Boolean(goal && task.retry_forever));
+  retryToggle.title = goal ? (task.retry_forever ? uiLabel("retryOff") : uiLabel("retryOn")) : uiLabel("setGoal");
+  retryToggle.setAttribute("aria-label", retryToggle.title);
+  $("#goal-retry-label").textContent = goal && task.retry_forever ? uiLabel("on") : uiLabel("off");
+  const liveState = $("#composer-live-state");
+  liveState.className = `composer-live-state ${esc(task.status || "available")}`;
+  $("#composer-live-state span").textContent = statusLabel(task.status);
+  const stopping = !state.editingQueuedId && activeTurn && !inputHasContent;
+  const sendLabel = state.editingQueuedId ? uiLabel("save") : stopping ? uiLabel("stopAction") : uiLabel("send");
+  $("#send-codex-label").textContent = sendLabel;
+  $("#send-codex").classList.toggle("stop-mode", stopping);
+  $("#send-codex").querySelector("span:last-child").textContent = stopping ? "■" : "↑";
+  $("#send-codex").title = state.editingQueuedId ? uiLabel("saveQueued") : (stopping ? uiLabel("stopCodex") : uiLabel("startCodex"));
+  $("#message-input").placeholder = state.editingQueuedId ? uiLabel("editQueued") : t("composerPlaceholder");
+}
+function renderQueuedMessages() {
+  const strip = $("#queued-messages");
+  if (!strip) return;
+  const queued = (state.selectedMessages || []).filter(message => ["queued", "dispatching"].includes(message.status));
+  strip.hidden = false;
+  if (!queued.length) {
+    strip.innerHTML = `<div class="queued-head"><span><i></i>${uiLabel("queue")}</span><span class="queued-head-actions"><strong>0</strong></span></div><div class="queued-empty">${uiLabel("queueEmpty")}</div>`;
+    stopQueueSync();
+    return;
+  }
+  if (!queueSyncTimer) queueSyncTimer = setInterval(syncQueuedMessages, 1500);
+  const visible = queued.slice(0, 4);
+  strip.innerHTML = `<div class="queued-head"><span><i></i>${uiLabel("queue")}</span><span class="queued-head-actions"><strong>${queued.length}</strong><button type="button" class="queue-icon danger-icon" data-queue-clear title="${uiLabel("clearQueue")}">×</button></span></div>${visible.map((message, index) => { const dispatching = message.status === "dispatching"; return `<div class="queued-message ${dispatching ? "dispatching" : ""} ${state.editingQueuedId === message.id ? "editing" : ""}"><div class="queued-message-main"><span class="queued-index">${index + 1}</span><span class="queued-body">${esc(message.body)}</span></div><div class="queued-actions"><button type="button" class="queue-icon" data-queue-dispatch="${esc(message.id)}" title="${dispatching ? uiLabel("sending") : uiLabel("dispatchNow")}" ${dispatching ? "disabled" : ""}>${dispatching ? "…" : "▶"}</button><button type="button" class="queue-icon" data-queue-edit="${esc(message.id)}" title="${uiLabel("editQueuedAction")}" ${dispatching ? "disabled" : ""}>✎</button><button type="button" class="queue-icon danger-icon" data-queue-delete="${esc(message.id)}" title="${uiLabel("deleteQueuedAction")}" ${dispatching ? "disabled" : ""}>×</button></div></div>`; }).join("")}${queued.length > visible.length ? `<div class="queued-more">${uiLabel("queueMore", { count: queued.length - visible.length })}</div>` : ""}`;
+}
+function renderChat() {
+  const stream = $("#chat-log");
+  const stickToBottom = state.chatSnapToBottom || stream.scrollHeight - stream.scrollTop - stream.clientHeight < 96;
+  if (!chatWorker) {
+    stream.innerHTML = `<div class="chat-empty"><p>${uiLabel("workerUnavailable") || "Chat Worker unavailable"}</p></div>`;
+    return;
+  }
+  const requestId = ++chatBuildRequestId;
+  chatWorker.postMessage({
+    requestId,
+    events: state.selectedEvents,
+    messages: state.selectedMessages,
+    rawActivity: state.rawActivity,
+    labels: {
+      fileChanged: uiLabel("fileChanged"), contextCompressed: uiLabel("contextCompressed"),
+      terminalTurnStarted: uiLabel("terminalTurnStarted"), terminalTurnCompleted: uiLabel("terminalTurnCompleted"),
+      terminalTurnAborted: uiLabel("terminalTurnAborted"), codexActivity: uiLabel("codexActivity"),
+    },
+  });
+  chatWorker.onmessage = event => {
+    if (event.data.requestId !== chatBuildRequestId || event.data.error) return;
+    state.chatBlocks = event.data.blocks || [];
+    paintVirtualChat(stickToBottom);
+  };
+}
+
+function renderChatBlock(block) {
+  if (block.role === "activities") return `<details class="activity-group"><summary><span>⌁</span>${uiLabel("activity")} <small>${block.items.length}</small></summary><div class="activity-events">${block.items.slice(-10).map(item => `<div class="activity-event">${esc(item)}</div>`).join("")}${block.items.length > 10 ? `<div class="activity-event">… ${block.items.length - 10}</div>` : ""}</div></details>`;
+  const deliveryLabels = { sending: uiLabel("sending"), steering: uiLabel("steering"), steered: uiLabel("steering"), queued: uiLabel("queued"), running: `${statusLabel("running")} · Codex`, failed: uiLabel("failedSend") };
+  const label = block.role === "user" ? (block.commandBlock ? uiLabel("commandLabel") : "") : (block.commandBlock ? uiLabel("commandResult") : uiLabel("codexPartner"));
+  return `<article class="message ${block.role}${block.commandBlock ? " command-message" : ""}${block.streaming ? " streaming" : ""}" data-item-id="${esc(block.itemId || "")}"><div class="message-avatar" role="img" aria-label="${block.role === "user" ? uiLabel("you") : uiLabel("codexPartner")}" title="${block.role === "user" ? uiLabel("you") : uiLabel("codexPartner")}">${block.role === "user" ? humanMarkup() : mascotMarkup("mascot-chat")}</div><div class="message-body"><div class="message-meta">${label ? `<strong>${label}</strong>` : ""}${block.origin === "terminal" ? `<span>${uiLabel("messageFromTerminal")}</span>` : ""}${block.time ? `<time datetime="${esc(block.time)}">${esc(shortDate(block.time))}</time>` : ""}</div><div class="message-content">${block.html || ""}${block.streaming ? `<span class="stream-cursor"></span>` : ""}</div>${deliveryLabels[block.delivery] ? `<div class="message-delivery ${esc(block.delivery)}" title="${esc(block.error)}">${esc(deliveryLabels[block.delivery])}</div>` : ""}</div></article>`;
+}
+
+function paintVirtualChat(stickToBottom = false) {
+  const stream = $("#chat-log"); const blocks = state.chatBlocks || []; const windowSize = 90;
+  if (!blocks.length) { stream.innerHTML = `<div class="chat-empty">${mascotMarkup("mascot-chat")}<p>${uiLabel("firstMessage")}</p></div>`; return; }
+  if (state.chatVirtualStart === null || stickToBottom) state.chatVirtualStart = Math.max(0, blocks.length - windowSize);
+  const start = Math.max(0, Math.min(state.chatVirtualStart, Math.max(0, blocks.length - windowSize)));
+  const end = Math.min(blocks.length, start + windowSize);
+  const average = Math.max(72, state.chatAverageHeight || 112);
+  const topHeight = start * average; const bottomHeight = (blocks.length - end) * average;
+  const olderControl = state.historyHasMore && start === 0 ? `<button type="button" class="chat-load-older" ${state.historyLoading ? "disabled" : ""}>${uiLabel("loadEarlierMessages")}</button>` : "";
+  stream.innerHTML = `<div class="chat-virtual-spacer" style="height:${topHeight}px"></div>${olderControl}${blocks.slice(start, end).map(renderChatBlock).join("")}<div class="chat-virtual-spacer" style="height:${bottomHeight}px"></div>`;
+  const rendered = $$(".message, .activity-group", stream);
+  if (rendered.length) {
+    const measured = rendered.reduce((total, node) => total + node.getBoundingClientRect().height + 24, 0) / rendered.length;
+    state.chatAverageHeight = Math.max(72, Math.min(360, state.chatAverageHeight * .75 + measured * .25));
+  }
+  $(".chat-load-older", stream)?.addEventListener("click", loadOlderTimeline);
+  hydrateChatFiles();
+  if (!stream.dataset.virtualScroll) {
+    stream.dataset.virtualScroll = "1";
+    stream.addEventListener("scroll", () => {
+      if (!state.chatBlocks.length) return;
+      const target = Math.max(0, Math.floor(stream.scrollTop / Math.max(72, state.chatAverageHeight)) - 12);
+      const bounded = Math.min(target, Math.max(0, state.chatBlocks.length - windowSize));
+      const currentStart = state.chatVirtualStart || 0;
+      if ((bounded === 0 && currentStart !== 0) || Math.abs(bounded - currentStart) >= 18) { state.chatVirtualStart = bounded; paintVirtualChat(false); stream.scrollTop = target * state.chatAverageHeight; }
+    }, { passive: true });
+  }
+  if (stickToBottom) stream.scrollTop = stream.scrollHeight;
+  state.chatSnapToBottom = false;
+}
+
+async function loadOlderTimeline() {
+  if (!state.selectedId || !state.historyHasMore || state.historyLoading) return chatHistoryLoadPromise;
+  const taskId = state.selectedId; const stream = $("#chat-log"); const previousHeight = stream.scrollHeight;
+  state.historyLoading = true; paintVirtualChat(false);
+  chatHistoryLoadPromise = api(`/tasks/${encodeURIComponent(taskId)}/timeline?limit=160&before=${encodeURIComponent(state.historyCursor)}`)
+    .then(page => {
+      if (state.selectedId !== taskId) return;
+      const existing = new Set(state.selectedEvents.map(event => `${event.stream}:${event.id}`));
+      const older = (page.items || []).filter(event => !existing.has(`${event.stream}:${event.id}`));
+      const metrics = state.selectedEvents.filter(event => event.stream === "metrics");
+      state.selectedEvents = [...older, ...state.selectedEvents.filter(event => event.stream !== "metrics"), ...(page.metrics || metrics)];
+      state.historyCursor = page.next_cursor || ""; state.historyHasMore = Boolean(page.has_more);
+      state.chatVirtualStart = 0; renderChat();
+      requestAnimationFrame(() => { stream.scrollTop = Math.max(0, stream.scrollHeight - previousHeight); });
+    })
+    .catch(error => toast(error.message))
+    .finally(() => { state.historyLoading = false; chatHistoryLoadPromise = null; });
+  return chatHistoryLoadPromise;
+}
+function appendStreamingDelta(payload) {
+  const delta = String(payload?.delta || "");
+  const itemId = String(payload?.item_id || "");
+  if (!delta || !itemId) return false;
+  const stream = $("#chat-log");
+  const articles = $$("article.message.assistant", stream);
+  const article = articles[articles.length - 1];
+  if (!article || article.dataset.itemId !== itemId) return false;
+  const content = $(".message-content", article);
+  if (!content) return false;
+  const stickToBottom = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 96;
+  const cursor = $(".stream-cursor", content);
+  const fragment = document.createDocumentFragment();
+  delta.split("\n").forEach((part, index) => { if (index) fragment.append(document.createElement("br")); if (part) fragment.append(document.createTextNode(part)); });
+  content.insertBefore(fragment, cursor || null);
+  article.classList.add("streaming");
+  if (stickToBottom) stream.scrollTop = stream.scrollHeight;
+  return true;
+}
+async function hydrateChatFiles() {
+  for (const node of $$("[data-chat-file]")) {
+    if (node.dataset.loaded) continue;
+    node.dataset.loaded = "1";
+    const path = node.dataset.chatFile;
+    try {
+      const name = path.toLowerCase();
+      const imageMime = name.endsWith(".png") ? "image/png" : /\.jpe?g$/i.test(name) ? "image/jpeg" : name.endsWith(".gif") ? "image/gif" : name.endsWith(".webp") ? "image/webp" : name.endsWith(".bmp") ? "image/bmp" : name.endsWith(".svg") ? "image/svg+xml" : "";
+      const imageByName = Boolean(imageMime);
+      const taskId = state.selectedId;
+      const cacheKey = `${taskId}:${path}`;
+      const isImage = imageByName;
+      const preview = node.querySelector(".chat-file-preview");
+      if (isImage && preview) {
+        let url = chatThumbnailObjectUrls.get(cacheKey) || "";
+        if (!url) {
+          let load = chatThumbnailLoads.get(cacheKey);
+          if (!load) {
+            load = workspaceFetch(`/tasks/${encodeURIComponent(taskId)}/workspace/thumbnail?size=640&path=${encodeURIComponent(path)}`)
+              .then(async response => {
+                if (!response.ok) throw new Error("thumbnail failed");
+                const objectUrl = URL.createObjectURL(await response.blob());
+                chatThumbnailObjectUrls.set(cacheKey, objectUrl);
+                return objectUrl;
+              })
+              .finally(() => chatThumbnailLoads.delete(cacheKey));
+            chatThumbnailLoads.set(cacheKey, load);
+          }
+          url = await load;
+        }
+        preview.hidden = false;
+        preview.innerHTML = `<a class="chat-image-link" href="#" aria-label="${esc(path.split("/").pop() || path)}"><img src="${url}" alt="${esc(path.split("/").pop() || path)}" /></a>`;
+        $(".chat-image-link", preview).onclick = async event => {
+          event.preventDefault();
+          const tab = window.open("", "_blank");
+          try {
+            let original = chatFileObjectUrls.get(cacheKey) || "";
+            if (!original) {
+              const response = await workspaceFetch(`/tasks/${encodeURIComponent(taskId)}/workspace/download?path=${encodeURIComponent(path)}`);
+              if (!response.ok) throw new Error("download failed");
+              let blob = await response.blob();
+              if (imageMime && !blob.type.startsWith("image/")) blob = new Blob([blob], { type: imageMime });
+              original = URL.createObjectURL(blob); chatFileObjectUrls.set(cacheKey, original);
+            }
+            if (tab) tab.location.href = original; else window.open(original, "_blank", "noopener");
+          } catch (error) { if (tab) tab.close(); toast(error.message); }
+        };
+      } else {
+        node.classList.add("file-only"); node.tabIndex = 0; node.setAttribute("role", "link");
+        node.onclick = async () => {
+          const tab = window.open("", "_blank");
+          try {
+            const response = await workspaceFetch(`/tasks/${encodeURIComponent(taskId)}/workspace/download?path=${encodeURIComponent(path)}`);
+            if (!response.ok) throw new Error("download failed");
+            const url = URL.createObjectURL(await response.blob());
+            if (tab) tab.location.href = url; else window.open(url, "_blank", "noopener");
+            setTimeout(() => URL.revokeObjectURL(url), 60_000);
+          } catch (error) { if (tab) tab.close(); toast(error.message); }
+        };
+      }
+    } catch (_) { node.classList.add("unavailable"); }
+  }
+}
+function localizeInspectorText(root) {
+  const keys = [
+    "session", "state", "thread", "sshHost", "workspacePath", "goal", "noGoal", "progress",
+    "runHistory", "noRunHistory", "threadControls", "copySession", "compactContext", "moveTrash",
+    "workspaceFiles", "changeDirectory", "upload", "edit", "download", "emptyDirectory", "back",
+    "archive", "unarchive", "enableMemory", "disableMemory", "autoProvider",
+  ];
+  const labels = {
+    SESSION: uiLabel("session"), 状态: uiLabel("state"), Thread: uiLabel("thread"),
+    "SSH 主机": uiLabel("sshHost"), 工作目录: uiLabel("workspacePath"), GOAL: uiLabel("goal"),
+    "没有设置 Goal": uiLabel("noGoal"), 进度: uiLabel("progress"), "运行记录": uiLabel("runHistory"),
+    "暂无运行记录": uiLabel("noRunHistory"), "THREAD CONTROLS": uiLabel("threadControls"),
+    "复制会话": uiLabel("copySession"), "压缩上下文": uiLabel("compactContext"),
+    "移到回收站": uiLabel("moveTrash"), "WORKSPACE FILES": uiLabel("workspaceFiles"), "更改目录": uiLabel("changeDirectory"),
+    "上传": uiLabel("upload"), "编辑": uiLabel("edit"), "下载": uiLabel("download"), "目录为空，可将文件拖到这里上传。": uiLabel("emptyDirectory"),
+    none: goalStatusLabel("none"),
+    "返回上级": uiLabel("back"),
+  };
+  // Workspace DOM is preserved across language changes. Accept every previous
+  // translation as input so repeated switching never leaves mixed languages.
+  for (const key of keys) {
+    for (const value of Object.values(UI_LABELS[key] || {})) labels[value] = uiLabel(key);
+  }
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  for (const node of nodes) {
+    const value = node.nodeValue.trim();
+    if (labels[value]) node.nodeValue = node.nodeValue.replace(value, labels[value]);
+    else {
+      const attemptPrefix = Object.values(UI_LABELS.attempt || {}).find(prefix => value.startsWith(`${prefix} `));
+      if (attemptPrefix) node.nodeValue = node.nodeValue.replace(attemptPrefix, uiLabel("attempt"));
+    }
+  }
+}
+function renderInspector() {
+  const task = state.selectedTask; if (!task) return;
+  const content = $("#inspector-content");
+  const workspaceSection = $("#workspace-section", content);
+  const workspaceError = $(".workspace-error", content);
+  const sessions = task.sessions || state.sessions.filter(s => s.task_id === task.id);
+  const threadId = task.codex_session_id || "";
+  const memoryEnabled = task.memory_mode === "enabled";
+  const archiveAction = task.archived ? "unarchive" : "archive";
+  const archiveLabel = task.archived ? uiLabel("unarchive") : uiLabel("archive");
+  const memoryAction = memoryEnabled ? "memory-disable" : "memory-enable";
+  const memoryLabel = memoryEnabled ? uiLabel("disableMemory") : uiLabel("enableMemory");
+  content.innerHTML = `<section class="inspector-section"><span class="inspector-label">SESSION</span><div class="inspector-row"><span>状态</span>${status(task.status)}</div><div class="inspector-row"><span>Thread</span><button class="path-button thread-copy" data-copy-thread="${esc(threadId)}" title="${threadId ? "点击复制 Thread ID" : "Thread 尚未创建"}" ${threadId ? "" : "disabled"}>${esc(threadId || "未创建")}</button></div>${task.ssh_host ? `<div class="inspector-row"><span>SSH 主机</span><button class="path-button" data-panel="ssh">${esc(task.ssh_host)}</button></div>` : ""}<div class="inspector-row"><span>工作目录</span><button class="path-button" data-workspace-change title="重新设置工作目录">${esc(task.workspace)}</button></div></section><section class="inspector-section"><span class="inspector-label">GOAL</span><p class="inspector-goal">${esc(task.goal || "没有设置 Goal")}</p><div class="inspector-row"><span>进度</span><span>${esc(task.goal_status || "none")}</span></div></section><details class="inspector-section run-history"><summary><span>运行记录</span><small>${sessions.length}</small></summary><div class="run-history-list">${sessions.length ? sessions.map(session => `<div class="run-row"><span class="run-dot ${esc(session.status)}"></span><span><strong>尝试 ${session.attempt || 0}</strong><small>${esc(session.provider_id || "自动 Provider")} · ${esc(shortDate(session.started_at))}</small></span>${status(session.status)}</div>`).join("") : `<p class="muted">暂无运行记录</p>`}</div></details><section class="inspector-section"><span class="inspector-label">THREAD CONTROLS</span><div class="inspector-actions"><button data-thread-action="fork">复制会话</button><button data-thread-action="compact">压缩上下文</button><button data-thread-action="${archiveAction}">${archiveLabel}</button><button data-thread-action="delete" class="danger">移到回收站</button><button data-thread-action="${memoryAction}" title="当前状态：记忆${memoryEnabled ? "已开启" : "已关闭"}">${memoryLabel}</button></div></section>`;
+  if (workspaceSection?.dataset.taskId === task.id) content.append(workspaceSection);
+  else if (workspaceError?.dataset.taskId === task.id) content.append(workspaceError);
+  localizeInspectorText(content);
+}
+async function loadWorkspace(path = "") {
+  if (!state.selectedTask) return;
+  const taskId = state.selectedTask.id;
+  const requestId = ++state.workspaceRequestId;
+  state.workspacePath = path;
+  $(".workspace-error")?.remove();
+  try {
+    const data = await api(`/tasks/${taskId}/workspace?path=${encodeURIComponent(path)}`);
+    if (requestId !== state.workspaceRequestId || state.selectedTask?.id !== taskId) return;
+    renderWorkspace(data, taskId);
+  } catch (error) {
+    if (requestId !== state.workspaceRequestId || state.selectedTask?.id !== taskId) return;
+    const existing = $("#workspace-section");
+    if (existing) existing.remove();
+    $(".workspace-error")?.remove();
+    $("#inspector-content").insertAdjacentHTML("beforeend", `<p class="inspector-error workspace-error" data-task-id="${esc(taskId)}">${esc(error.message)}</p>`);
+  }
+}
+function renderWorkspace(data, taskId = state.selectedTask?.id || "") {
+  const existing = $("#workspace-section"); if (existing) existing.remove();
+  $(".workspace-error")?.remove();
+  const path = data.entry.path || "";
+  const isDirectory = data.entry.kind === "directory";
+  state.workspaceFile = isDirectory ? null : { path, name: data.entry.name, size: data.entry.size || 0, content: data.content || "", editable: data.editable === true };
+  const workspaceLocked = ["running", "retrying", "queued"].includes(state.selectedTask?.status);
+  const parts = path.split("/").filter(Boolean);
+  const breadcrumbs = [`<button class="workspace-crumb ${parts.length ? "" : "current"}" data-browse="" title="工作区根目录">/</button>`];
+  parts.forEach((part, index) => {
+    const target = parts.slice(0, index + 1).join("/");
+    breadcrumbs.push(`<span class="workspace-crumb-separator">/</span><button class="workspace-crumb ${index === parts.length - 1 ? "current" : ""}" data-browse="${esc(target)}">${esc(part)}</button>`);
+  });
+  const parent = parts.slice(0, -1).join("/");
+  const toolbar = `<div class="workspace-toolbar"><button type="button" class="workspace-tool" data-workspace-change title="${workspaceLocked ? "停止当前 Codex turn 后更改工作目录" : "选择工作目录"}" ${workspaceLocked ? "disabled" : ""}><span aria-hidden="true">▰</span> 更改目录</button>${isDirectory ? `<button type="button" class="workspace-tool" data-workspace-upload title="上传文件到当前目录"><span aria-hidden="true">↑</span> 上传</button>` : `${data.editable === true ? `<button type="button" class="workspace-tool" data-workspace-edit="${esc(path)}" title="编辑当前文件"><span aria-hidden="true">✎</span> 编辑</button>` : ""}<button type="button" class="workspace-tool" data-workspace-download="${esc(path)}" title="下载当前文件"><span aria-hidden="true">↓</span> 下载</button>`}</div>`;
+  const entries = data.entry.kind === "file"
+    ? `<div class="file-preview"><div class="file-preview-head"><span>▣ ${esc(data.entry.name)}</span><small>${formatBytes(data.entry.size)}</small></div><pre>${esc(data.content || "")}</pre></div>`
+    : `<div class="workspace-browser" id="workspace-browser">${(data.entries || []).map(entry => `<div class="file-row ${entry.kind}"><button type="button" class="file-open" data-browse="${esc(entry.path)}"><span>${entry.kind === "directory" ? "▰" : "▤"}</span><span>${esc(entry.name)}</span><small>${entry.kind === "directory" ? "目录" : formatBytes(entry.size)}</small></button>${entry.kind === "file" ? `<button type="button" class="file-download" data-workspace-download="${esc(entry.path)}" title="下载 ${esc(entry.name)}" aria-label="下载 ${esc(entry.name)}">↓</button>` : ""}</div>`).join("") || `<p class="muted">目录为空，可将文件拖到这里上传。</p>`}</div>`;
+  $("#inspector-content").insertAdjacentHTML("beforeend", `<section class="inspector-section workspace-section" id="workspace-section" data-task-id="${esc(taskId)}" data-entry-kind="${esc(data.entry.kind)}" data-path="${esc(path)}"><span class="inspector-label">WORKSPACE FILES</span>${toolbar}<nav class="workspace-breadcrumbs" aria-label="工作区路径">${breadcrumbs.join("")}</nav>${path ? `<button class="file-up" data-browse="${esc(parent)}">‹ 返回上级</button>` : ""}${entries}</section>`);
+  const workspace = $("#workspace-section");
+  localizeInspectorText(workspace);
+  workspace.querySelector("nav")?.setAttribute("aria-label", uiLabel("workspacePath"));
+  workspace.querySelector("[data-workspace-change]")?.setAttribute("title", uiLabel("chooseWorkspace"));
+  workspace.querySelector("[data-workspace-upload]")?.setAttribute("title", uiLabel("upload"));
+  workspace.querySelector("[data-workspace-edit]")?.setAttribute("title", uiLabel("edit"));
+  workspace.querySelector("[data-workspace-download]")?.setAttribute("title", uiLabel("download"));
+  workspace.querySelector(".file-up")?.setAttribute("title", uiLabel("back"));
+}
+
+async function loadWorkspacePicker(path = "") {
+  if (!state.selectedId) return;
+  const content = $("#workspace-picker-content");
+  if (content) content.innerHTML = `<p class="muted">${uiLabel("readingDirectory")}</p>`;
+  try {
+    const data = await api(`/tasks/${state.selectedId}/workspace-picker?path=${encodeURIComponent(path)}`);
+    state.workspacePickerPath = data.path;
+    const input = $("#workspace-picker-input"); if (input) input.value = data.path;
+    if (!content) return;
+    const roots = (data.roots || []).map(root => `<button type="button" class="workspace-root" data-picker-browse="${esc(root.path)}" title="${esc(root.path)}">${esc(root.name)}</button>`).join("");
+    const entries = (data.entries || []).map(entry => `<button type="button" class="workspace-picker-row" data-picker-browse="${esc(entry.path)}"><span aria-hidden="true">▰</span><span>${esc(entry.name)}</span><small>${uiLabel("open")}</small></button>`).join("") || `<p class="muted">${uiLabel("noSubdirectories")}</p>`;
+    content.innerHTML = `<div class="workspace-picker-roots">${roots}</div><div class="workspace-picker-location">${data.parent ? `<button type="button" class="workspace-picker-up" data-picker-browse="${esc(data.parent)}" title="返回上级">‹</button>` : ""}<code title="${esc(data.path)}">${esc(data.path)}</code></div><div class="workspace-picker-list">${entries}</div>`;
+    const select = $("#workspace-picker-select"); if (select) select.disabled = false;
+  } catch (error) {
+    if (content) content.innerHTML = `<p class="inspector-error">${esc(error.message)}</p>`;
+    const select = $("#workspace-picker-select"); if (select) select.disabled = true;
+  }
+}
+
+function openWorkspacePicker() {
+  if (!state.selectedTask) return;
+  if (["running", "retrying", "queued"].includes(state.selectedTask.status)) return toast("请先停止当前 Codex turn，再更改工作目录");
+  state.workspacePickerPath = state.selectedTask.workspace;
+  openDrawer(`<h2>${uiLabel("chooseWorkspace")}</h2><form id="workspace-picker-form" class="workspace-picker-form"><label for="workspace-picker-input">${uiLabel("serverDirectory")}</label><div><input id="workspace-picker-input" value="${esc(state.selectedTask.workspace)}" autocomplete="off" spellcheck="false"/><button class="secondary" type="submit">${uiLabel("go")}</button></div></form><div id="workspace-picker-content" class="workspace-picker-content"><p class="muted">${uiLabel("readingDirectory")}</p></div><div class="form-actions workspace-picker-actions"><button type="button" class="secondary" id="cancel">${uiLabel("cancel")}</button><button type="button" class="primary" id="workspace-picker-select" disabled>${uiLabel("selectCurrentDirectory")}</button></div>`);
+  $("#workspace-picker-form").onsubmit = event => { event.preventDefault(); loadWorkspacePicker($("#workspace-picker-input").value.trim()); };
+  loadWorkspacePicker(state.workspacePickerPath);
+}
+
+async function selectWorkspaceDirectory() {
+  if (!state.selectedId || !state.workspacePickerPath) return;
+  const task = await api(`/tasks/${state.selectedId}`, { method: "PATCH", body: JSON.stringify({ workspace: state.workspacePickerPath }) });
+  resetWorkspaceBrowser();
+  state.selectedTask = { ...state.selectedTask, ...task };
+  mergeTask(task);
+  closeDrawer(); renderConversation(); renderSessionList();
+  await loadWorkspace("");
+  toast(`工作目录已切换到 ${task.workspace}`);
+}
+
+async function workspaceFetch(path, options = {}, canPrompt = true) {
+  const headers = { ...(options.headers || {}) };
+  if (authToken) headers.Authorization = `Bearer ${authToken}`;
+  const response = await fetch(`/api${path}`, { ...options, headers });
+  if (response.status === 401 && canPrompt) {
+    const token = await requestAccessToken();
+    if (token) { authToken = token.trim(); localStorage.setItem("codex-dashboard-token", authToken); return workspaceFetch(path, options, false); }
+  }
+  return response;
+}
+
+async function workspaceResponseError(response) {
+  const payload = await response.json().catch(() => ({ detail: response.statusText }));
+  return Error(payload.detail || response.statusText);
+}
+
+async function uploadWorkspaceFile(taskId, destination, file, overwrite = false) {
+  const query = new URLSearchParams({ path: destination, filename: file.name, overwrite: String(overwrite) });
+  const response = await workspaceFetch(`/tasks/${taskId}/workspace/upload?${query}`, { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: file });
+  if (response.status === 409 && !overwrite) {
+    const conflict = await workspaceResponseError(response);
+    if (await appConfirm(uiLabel("overwriteFileConfirm", { name: file.name }))) return uploadWorkspaceFile(taskId, destination, file, true);
+    return { skipped: true, error: conflict.message };
+  }
+  if (!response.ok) throw await workspaceResponseError(response);
+  return response.json();
+}
+
+async function uploadWorkspaceFiles(files, destination = state.workspacePath) {
+  if (!state.selectedId || !files.length || state.workspaceUploading) return;
+  const taskId = state.selectedId;
+  state.workspaceUploading = true;
+  const button = $("[data-workspace-upload]");
+  if (button) { button.disabled = true; button.innerHTML = `<span aria-hidden="true">↑</span> 0/${files.length}`; }
+  let uploaded = 0; let skipped = 0;
+  try {
+    for (const [index, file] of [...files].entries()) {
+      if (button) button.innerHTML = `<span aria-hidden="true">↑</span> ${index + 1}/${files.length}`;
+      const result = await uploadWorkspaceFile(taskId, destination, file);
+      if (result?.skipped) skipped += 1; else uploaded += 1;
+    }
+    if (state.selectedId === taskId) await loadWorkspace(destination);
+    toast(`已上传 ${uploaded} 个文件${skipped ? `，跳过 ${skipped} 个` : ""}`);
+  } catch (error) {
+    toast(`上传失败：${error.message}`);
+    if (state.selectedId === taskId) await loadWorkspace(destination);
+  } finally {
+    state.workspaceUploading = false;
+    const input = $("#workspace-upload-input"); if (input) input.value = "";
+  }
+}
+
+async function downloadWorkspaceFile(path) {
+  if (!state.selectedId) return;
+  const response = await workspaceFetch(`/tasks/${state.selectedId}/workspace/download?path=${encodeURIComponent(path)}`);
+  if (!response.ok) throw await workspaceResponseError(response);
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url; link.download = path.split("/").filter(Boolean).pop() || "download";
+  document.body.append(link); link.click(); link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+function openWorkspaceFileEditor(path) {
+  const file = state.workspaceFile;
+  if (!file || file.path !== path || !file.editable) return toast(uiLabel("unsupportedFileEdit"));
+  openDrawer(`<div class="drawer-heading"><div><h2>${uiLabel("editFile")}</h2><p class="drawer-meta">${esc(file.path)} · ${formatBytes(file.size)}</p></div></div><form id="workspace-file-form" class="form unified-editor-form workspace-file-form"><div class="editor-field"><span class="form-label">${uiLabel("content")}</span>${textEditorMarkup("workspace-file-editor")}</div><div class="form-actions"><button type="button" class="secondary" id="cancel">${uiLabel("cancel")}</button><button type="submit" class="primary">${uiLabel("save")} <kbd>Ctrl S</kbd></button></div></form>`, { editor: true });
+  const editor = mountTextEditor("#workspace-file-editor", { filename: file.path, value: file.content });
+  $("#cancel").onclick = closeDrawer;
+  $("#workspace-file-form").onsubmit = async event => {
+    event.preventDefault(); const restore = setFormBusy(event.target, uiLabel("saving")); const content = editor.getValue();
+    try {
+      const response = await workspaceFetch(`/tasks/${state.selectedId}/workspace/file?path=${encodeURIComponent(path)}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content }) });
+      if (!response.ok) throw await workspaceResponseError(response);
+      closeDrawer(); await loadWorkspace(path); toast(uiLabel("fileSaved"));
+    } catch (error) { restore(); toast(uiLabel("saveFailed", { message: error.message })); }
+  };
+}
+function commandToken(value) { return value.trim().slice(1).split(/\s+/, 1)[0].toLowerCase(); }
+function commandMatches(value) {
+  const token = commandToken(value); const commands = state.commands || [];
+  if (!token) return commands;
+  return commands.filter(command => command.name.startsWith(token) || (command.aliases || []).some(alias => alias.startsWith(token)));
+}
+function renderCommandPalette() {
+  const input = $("#message-input"); const palette = $("#command-palette");
+  if (!input || !input.value.startsWith("/") || input.value.includes("\n")) { palette.hidden = true; return; }
+  const matches = commandMatches(input.value); if (!matches.length) { palette.hidden = true; return; }
+  state.commandIndex = Math.max(0, Math.min(state.commandIndex, matches.length - 1));
+  palette.innerHTML = matches.slice(0, 18).map((command, index) => `<button type="button" class="command-option ${index === state.commandIndex ? "active" : ""}" data-command-index="${index}" role="option" aria-selected="${index === state.commandIndex}"><span class="command-name">/${esc(command.name)} <small>${esc(command.args || "")}</small></span><span class="command-description">${esc(command.description)}${command.destructive ? " · 需要确认" : ""}</span></button>`).join("");
+  palette.hidden = false;
+}
+function selectedCommand() { const matches = commandMatches($("#message-input").value); return matches[state.commandIndex] || matches[0]; }
+function completeCommand(command = selectedCommand()) {
+  if (!command) return; const input = $("#message-input"); input.value = `/${command.name}${command.args ? " " : ""}`; input.focus(); resizeComposerInput(input); renderCommandPalette();
+}
+async function applyCommandAction(result) {
+  const action = result?.ui_action; if (!action) return;
+  if (action === "new_conversation") return createQuickSession();
+  if (action === "select_task" && result.task_id) { await refresh(false); await selectSession(result.task_id); $("#message-input").focus(); return; }
+  if (action === "clear_selection") { state.selectedId = null; state.selectedTask = null; showEmptyConversation(); return refresh(false); }
+  if (action === "refresh") return refresh(false);
+  if (action === "open_panel") return openPanel(result.panel || "skills");
+  if (action === "open_inspector") { state.inspectorClosed = false; setInspectorOpen(true); return; }
+  if (action === "open_workspace") { state.inspectorClosed = false; setInspectorOpen(true); return loadWorkspace(state.workspacePath || ""); }
+  if (action === "focus_composer") { $("#message-input").focus(); return; }
+  if (action === "attach_text") { pendingAttachments = [result.attachment]; renderComposerAttachments(); $("#message-input").focus(); return; }
+  if (action === "copy_last") {
+    const last = [...(state.selectedEvents || [])].reverse().find(event => isAssistantEvent(event) && eventText(event.payload));
+    if (!last) return toast("还没有可复制的 Codex 回复");
+    try { await navigator.clipboard.writeText(eventText(last.payload)); toast("已复制最近一条回复"); } catch (_) { toast("浏览器拒绝了剪贴板访问"); }
+    return;
+  }
+  if (action === "toggle_raw") { const value = result.value === "on" ? true : result.value === "off" ? false : !state.rawActivity; state.rawActivity = value; return renderChat(); }
+  if (action === "theme") { const value = result.value === "toggle" ? (document.documentElement.dataset.theme === "wasteland" ? "dark" : "wasteland") : result.value; setTheme(value, true); return; }
+  if (action === "title") { const value = result.value === "toggle" ? localStorage.getItem("codex-dashboard-title") !== "on" : result.value !== "off"; localStorage.setItem("codex-dashboard-title", value ? "on" : "off"); document.title = value && state.selectedTask ? `${state.selectedTask.name || "Codex"} · Codex Partner` : "Codex Partner"; return; }
+  if (action === "vim") { localStorage.setItem("codex-dashboard-vim", result.value === "off" ? "off" : "on"); return toast("Vim 模式标记已更新"); }
+  if (action === "show_keymap") return toast("Enter 发送到当前 turn · Alt+Enter 排到下一轮 · Shift+Enter 换行 · Esc 停止 · 空输入框 ↑/↓ 历史");
+  if (action === "disconnect") { socketPaused = true; clearTimeout(socketReconnectTimer); if (socket) { socket.onclose = null; socket.close(); socket = null; } setRealtimeChannel("task", "paused"); return toast("当前会话的实时连接已暂停"); }
+}
+async function submitSlashCommand(raw) {
+  if (!state.selectedId) return;
+  const clientMessageId = crypto.randomUUID ? crypto.randomUUID() : String(Date.now());
+  let result = await api(`/tasks/${state.selectedId}/commands`, { method: "POST", body: JSON.stringify({ command: raw, client_message_id: clientMessageId }) });
+  if (result.requires_confirmation && await appConfirm(uiLabel("destructiveCommandConfirm", { command: raw.split(/\s+/)[0] }), { danger: true })) result = await api(`/tasks/${state.selectedId}/commands`, { method: "POST", body: JSON.stringify({ command: raw, confirmed: true, client_message_id: `${clientMessageId}-confirmed` }) });
+  if (!result.ok) toast(result.message || "命令执行失败");
+  await applyCommandAction(result);
+  if (result.ok && !["new_conversation", "select_task", "clear_selection", "disconnect", "open_panel", "open_inspector", "attach_text", "focus_composer"].includes(result.ui_action)) await refresh(false);
+  return result;
+}
+function connectOverviewSocket() {
+  if (overviewSocket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(overviewSocket.readyState)) return;
+  if (realtimeChannels.overview !== "reconnecting") setRealtimeChannel("overview", "connecting");
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  const token = authToken ? `?token=${encodeURIComponent(authToken)}` : "";
+  overviewSocket = new WebSocket(`${scheme}://${location.host}/ws/overview${token}`);
+  overviewSocket.onopen = () => { noteRealtime("overview"); setRealtimeChannel("overview", "live"); };
+  overviewSocket.onmessage = event => {
+    noteRealtime("overview"); setRealtimeChannel("overview", "live");
+    const data = JSON.parse(event.data);
+    if (data.type === "overview_snapshot") {
+      mergeOverviewSnapshot(data.tasks || []);
+      renderSessionList(); renderSidebarStats();
+      return;
+    }
+    if (data.type === "task_status" && data.task) {
+      mergeTask(data.task);
+      renderSessionList(); renderSidebarStats();
+      if (state.selectedId === data.task.id && state.selectedTask) {
+        const workspaceChanged = Boolean(data.task.workspace && data.task.workspace !== state.selectedTask.workspace);
+        if (workspaceChanged) resetWorkspaceBrowser();
+        state.selectedTask = { ...state.selectedTask, ...data.task };
+        renderConversation();
+        if (workspaceChanged) loadWorkspace("");
+      }
+    }
+    if (data.type === "task_removed" && data.task_id) {
+      state.tasks = state.tasks.filter(task => task.id !== data.task_id);
+      if (state.selectedId === data.task_id) {
+        state.selectedId = null; state.selectedTask = null; state.selectedMessages = [];
+        if (socketTaskId === data.task_id && socket) { socket.onclose = null; socket.close(); socket = null; }
+        showEmptyConversation();
+      }
+      renderSessionList(); renderSidebarStats();
+    }
+  };
+  overviewSocket.onerror = () => setRealtimeChannel("overview", "reconnecting");
+  overviewSocket.onclose = () => {
+    overviewSocket = null;
+    setRealtimeChannel("overview", "reconnecting");
+    clearTimeout(overviewReconnectTimer);
+    overviewReconnectTimer = setTimeout(() => { if (document.visibilityState !== "hidden") connectOverviewSocket(); }, 1200);
+  };
+}
+function connectSocket(id, reconnect = false) {
+  clearTimeout(socketReconnectTimer);
+  if (!reconnect) socketPaused = false;
+  if (socket) { socket.onclose = null; socket.close(); }
+  setRealtimeChannel("task", reconnect ? "reconnecting" : "connecting");
+  const scheme = location.protocol === "https:" ? "wss" : "ws"; const token = authToken ? `?token=${encodeURIComponent(authToken)}` : "";
+  const nextSocket = new WebSocket(`${scheme}://${location.host}/ws/tasks/${id}${token}`);
+  socket = nextSocket; socketTaskId = id;
+  nextSocket.onopen = () => { noteRealtime("task"); setRealtimeChannel("task", "live"); if (state.selectedId === id && reconnect) refreshSelectedConversation(id); };
+  nextSocket.onmessage = async event => {
+    noteRealtime("task"); setRealtimeChannel("task", "live");
+    const data = JSON.parse(event.data);
+    if (data.type === "snapshot" && state.selectedId === id) {
+      state.selectedTask = { ...state.selectedTask, ...(data.task || {}) };
+      if (data.messages) replaceTaskMessages(data.messages);
+      renderConversation();
+      return;
+    }
+    if ((data.type === "task_patch" || data.type === "task_status") && state.selectedId === id) {
+      const patch = data.type === "task_patch" ? (data.patch || {}) : (data.task || {});
+      state.selectedTask = { ...state.selectedTask, ...patch };
+      mergeTask({ id, ...patch });
+      renderConversation(); renderSessionList(); renderSidebarStats();
+      return;
+    }
+    if (data.type === "workspace_changed" && state.selectedId === id) {
+      if (!state.workspaceUploading) loadWorkspace(state.workspacePath || "");
+      return;
+    }
+    if (data.type === "event" && state.selectedId === id) {
+      state.selectedEvents.push({ session_id: data.session_id, ts: data.ts, stream: data.stream, payload: JSON.stringify(data.payload) });
+      state.runtimeMetrics = calculateRuntimeMetrics(state.selectedTask, state.selectedEvents);
+      renderConnectionStatus();
+      renderContextUsage();
+      const phase = activityPhase(data.payload);
+      if (phase) { livePhases.set(id, phase); renderTurnProgress(); }
+      if (String(data.payload?.type || "").toLowerCase() !== "agent_delta" || !appendStreamingDelta(data.payload)) scheduleRenderChat();
+      if (!isAssistantEvent({ stream: data.stream, payload: data.payload }) && !isUserEvent({ stream: data.stream, payload: data.payload })) showActivity(data.payload);
+    }
+    if (data.type === "message" && state.selectedId === id) { upsertTaskMessage(data); renderQueuedMessages(); scheduleRenderChat(); }
+    if (data.type === "message_removed" && state.selectedId === id) { removeTaskMessage(data.message_id); if (state.editingQueuedId === data.message_id) { state.editingQueuedId = null; $("#message-input").value = ""; } renderQueuedMessages(); scheduleRenderChat(); }
+    if (data.type === "server_request" && state.selectedId === id) { livePhases.set(id, "phaseInteraction"); renderTurnProgress(); }
+    if ((data.type === "session" || data.type === "provider_failover") && state.selectedId === id) {
+      if (data.type === "provider_failover") livePhases.set(id, "phaseProvider");
+      await refreshSelectedConversation(id);
+    }
+  };
+  nextSocket.onerror = () => { if (socket === nextSocket && !socketPaused) setRealtimeChannel("task", "reconnecting"); };
+  nextSocket.onclose = () => {
+    if (socket === nextSocket) socket = null;
+    if (state.selectedId !== id) { setRealtimeChannel("task", "idle"); return; }
+    if (socketPaused) { setRealtimeChannel("task", "paused"); return; }
+    setRealtimeChannel("task", "reconnecting");
+    socketReconnectTimer = setTimeout(() => connectSocket(id, true), 900);
+  };
+}
+function showActivity(payload) {
+  const task = state.selectedTask;
+  if (!task || !["running", "retrying", "queued"].includes(task.status)) return;
+  const text = activityPhase(payload) || eventText(payload);
+  if (!text) return;
+  livePhases.set(task.id, String(text).replace(/\s+/g, " ").trim().slice(0, 180));
+  renderTurnProgress();
+}
+function terminalStatus(label, kind = "") { const node = $("#terminal-status"); node.textContent = label; node.className = `terminal-status ${kind}`; }
+function ensureTerminalEmulator() {
+  if (terminalEmulator) return true;
+  if (!window.Terminal || !window.FitAddon || !window.Unicode11Addon || !window.WebLinksAddon) {
+    terminalStatus(uiLabel("terminalModuleError"), "error");
+    toast(uiLabel("terminalModuleToast"));
+    return false;
+  }
+  terminalEmulator = new window.Terminal({
+    cursorBlink: true,
+    convertEol: false,
+    scrollback: 10000,
+    allowProposedApi: true,
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+    fontSize: 13,
+    lineHeight: 1.35,
+    theme: { background: "#070a0b", foreground: "#d5e6d0", cursor: "#d6f77f", selectionBackground: "#52683e88" },
+  });
+  terminalFitAddon = new window.FitAddon.FitAddon();
+  terminalEmulator.loadAddon(terminalFitAddon);
+  terminalEmulator.loadAddon(new window.Unicode11Addon.Unicode11Addon());
+  terminalEmulator.loadAddon(new window.WebLinksAddon.WebLinksAddon());
+  terminalEmulator.open($("#terminal-screen"));
+  terminalEmulator.onData(data => sendTerminal({ type: "input", data }));
+  terminalEmulator.onResize(({ cols, rows }) => sendTerminal({ type: "resize", cols, rows }));
+  return true;
+}
+function fitTerminal() {
+  if (!terminalFitAddon || !terminalEmulator) return;
+  try { terminalFitAddon.fit(); } catch (_) { /* The modal may not have layout dimensions yet. */ }
+}
+function sendTerminal(payload) {
+  if (terminalSocket?.readyState !== WebSocket.OPEN) return false;
+  terminalSocket.send(JSON.stringify(payload));
+  return true;
+}
+function sendTerminalResize() {
+  fitTerminal();
+  if (!terminalSocket || terminalSocket.readyState !== WebSocket.OPEN || !terminalEmulator) return;
+  sendTerminal({ type: "resize", cols: terminalEmulator.cols, rows: terminalEmulator.rows });
+}
+function connectTerminal(taskId, reconnect = false) {
+  if (!taskId) return toast(uiLabel("selectSessionFirst"));
+  if (!ensureTerminalEmulator()) return;
+  clearTimeout(terminalReconnectTimer);
+  if (terminalSocket) { terminalSocket.onclose = null; terminalSocket.close(); terminalSocket = null; }
+  terminalTaskId = taskId;
+  terminalShouldReconnect = true;
+  if (reconnect) terminalEmulator.write(`\r\n[${uiLabel("terminalReconnectNotice")}]\r\n`);
+  else terminalEmulator.reset();
+  terminalStatus(reconnect ? uiLabel("terminalReconnecting") : uiLabel("terminalConnecting"), reconnect ? "reconnecting" : "");
+  setRealtimeChannel("terminal", reconnect ? "reconnecting" : "connecting");
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  const token = authToken ? `?token=${encodeURIComponent(authToken)}` : "";
+  const nextSocket = new WebSocket(`${scheme}://${location.host}/ws/terminal/${encodeURIComponent(taskId)}${token}`);
+  terminalSocket = nextSocket;
+  nextSocket.onopen = () => { noteRealtime("terminal"); terminalStatus(uiLabel("terminalConnecting")); sendTerminalResize(); terminalEmulator.focus(); };
+  nextSocket.onmessage = event => {
+    noteRealtime("terminal");
+    const data = JSON.parse(event.data);
+    if (data.type === "ready") { terminalReconnectAttempt = 0; $("#terminal-cwd").textContent = `${data.cwd} · ${data.shell}`; terminalStatus(uiLabel("terminalConnected"), "connected"); setRealtimeChannel("terminal", "live"); sendTerminalResize(); return; }
+    if (data.type === "output") { terminalEmulator.write(data.data); return; }
+    if (data.type === "exit") { terminalShouldReconnect = false; setRealtimeChannel("terminal", "closed"); terminalStatus(`${uiLabel("terminalClosed")}${data.code == null ? "" : ` · ${data.code}`}`, "error"); terminalEmulator.write(`\r\n[${uiLabel("terminalClosed")}]\r\n`); return; }
+    if (data.type === "pong") { terminalStatus(uiLabel("terminalConnected"), "connected"); setRealtimeChannel("terminal", "live"); }
+  };
+  nextSocket.onerror = () => { if (terminalSocket === nextSocket) { terminalStatus(uiLabel("terminalReconnecting"), "reconnecting"); setRealtimeChannel("terminal", "reconnecting"); } };
+  nextSocket.onclose = () => {
+    if (terminalSocket !== nextSocket) return;
+    terminalSocket = null;
+    const stillOpen = $("#terminal-window").classList.contains("open") && terminalTaskId === taskId;
+    if (!terminalShouldReconnect || !stillOpen) { setRealtimeChannel("terminal", terminalShouldReconnect ? "idle" : "closed"); return; }
+    terminalStatus(uiLabel("terminalReconnecting"), "reconnecting"); setRealtimeChannel("terminal", "reconnecting");
+    const delay = Math.min(5000, 700 * (2 ** terminalReconnectAttempt));
+    terminalReconnectAttempt += 1;
+    terminalReconnectTimer = setTimeout(() => connectTerminal(taskId, true), delay);
+  };
+}
+function openTerminal() {
+  if (!state.selectedId) return toast("请先选择一个会话");
+  const windowNode = $("#terminal-window");
+  windowNode.classList.add("open"); windowNode.setAttribute("aria-hidden", "false");
+  if (!ensureTerminalEmulator()) return;
+  requestAnimationFrame(fitTerminal);
+  const socketActive = terminalSocket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(terminalSocket.readyState);
+  if (terminalTaskId !== state.selectedId || !socketActive) {
+    const preserveHistory = terminalTaskId === state.selectedId && terminalShouldReconnect;
+    connectTerminal(state.selectedId, preserveHistory);
+  }
+  else terminalEmulator.focus();
+  if (!terminalResizeObserver) { terminalResizeObserver = new ResizeObserver(sendTerminalResize); terminalResizeObserver.observe($("#terminal-screen")); }
+}
+function hideTerminal() {
+  $("#terminal-window").classList.remove("open");
+  $("#terminal-window").setAttribute("aria-hidden", "true");
+  renderConnectionStatus();
+}
+function closeTerminal() { hideTerminal(); }
+function destroyTerminal() {
+  clearTimeout(terminalReconnectTimer); terminalShouldReconnect = false; terminalReconnectAttempt = 0;
+  if (terminalSocket) { terminalSocket.onclose = null; try { terminalSocket.send(JSON.stringify({ type: "close" })); } catch (_) {} terminalSocket.close(); terminalSocket = null; }
+  terminalTaskId = null;
+  hideTerminal();
+  setRealtimeChannel("terminal", "idle"); terminalStatus(uiLabel("terminalNotConnected")); $("#terminal-cwd").textContent = uiLabel("terminalNotConnected");
+}
