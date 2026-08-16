@@ -1250,13 +1250,14 @@ class RunningStateTests(unittest.TestCase):
         core_js = (static / "core.js").read_text(encoding="utf-8")
         app_js = (static / "app.js").read_text(encoding="utf-8")
         styles = (static / "styles.css").read_text(encoding="utf-8")
-        self.assertIn('initial-scale=0.9', html)
+        self.assertIn('initial-scale=0.8', html)
         self.assertIn('id="sidebar-toggle"', html)
         self.assertIn('id="sidebar-close"', html)
         self.assertIn("function setSessionSidebarOpen", core_js)
         self.assertIn('codex-partner-sidebar-collapsed', core_js)
         self.assertIn('button.id === "sidebar-close"', app_js)
         self.assertIn(".workspace-app.sidebar-collapsed", styles)
+        self.assertIn("max-width: min(84%, calc(100% - 42px))", styles)
 
     def test_send_queues_behind_active_turn(self):
         static = Path(__file__).resolve().parents[1] / "static"
