@@ -55,35 +55,19 @@ docker exec -it codex-partner codex login
 
 ## systemd
 
-Create a dedicated service user and install Codex Partner:
+After completing the installation above, stop the foreground process and install the user service:
 
 ```bash
-sudo useradd --system --create-home --home-dir /home/codex --shell /bin/bash codex
-sudo install -d -o codex -g codex /opt/codex-partner /var/lib/codex-partner
-sudo -u codex -H git clone https://github.com/froststeam/Codex-Partner.git /opt/codex-partner
-sudo -u codex -H python3 -m venv /opt/codex-partner/.venv
-sudo -u codex -H /opt/codex-partner/.venv/bin/pip install /opt/codex-partner
-sudo -u codex -H cp /opt/codex-partner/.env.example /opt/codex-partner/.env
-sudoedit /opt/codex-partner/.env
+mkdir -p ~/.config/systemd/user
+cp codex-partner.user.service.example ~/.config/systemd/user/codex-partner.service
+systemctl --user daemon-reload
+systemctl --user enable --now codex-partner.service
+systemctl --user status codex-partner.service
 ```
 
-Ensure the `codex` user can run and authenticate the Codex CLI:
+This service uses the current user's existing Codex login, configuration, memories, and Skills. The example assumes the repository is at `~/Codex-Partner`; edit the two paths in the unit if it is elsewhere.
 
-```bash
-sudo -u codex -H codex login
-sudo -u codex -H codex --version
-```
-
-Install and start the service:
-
-```bash
-sudo cp /opt/codex-partner/codex-partner.service.example /etc/systemd/system/codex-partner.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now codex-partner.service
-sudo systemctl status codex-partner.service
-```
-
-View logs with `sudo journalctl -u codex-partner.service -f`.
+View logs with `journalctl --user -u codex-partner.service -f`. To keep it running after logout, run `sudo loginctl enable-linger "$USER"` once.
 
 ## Use
 

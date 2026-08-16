@@ -1,0 +1,17 @@
+[Unit]
+Description=Codex Partner
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Codex-Partner
+EnvironmentFile=-%h/Codex-Partner/.env
+ExecStart=%h/Codex-Partner/.venv/bin/codex-partner
+Restart=always
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=30
+UMask=0077
+
+[Install]
+WantedBy=default.target
