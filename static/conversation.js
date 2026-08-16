@@ -320,7 +320,7 @@ function renderApprovalCenter() {
   const actions = questions.length
     ? `<button type="button" class="approval-action danger" data-approval-id="${esc(request.id)}" data-approval-decision="cancel">${uiLabel("approvalDeny")}</button><button type="button" class="approval-action primary" data-approval-id="${esc(request.id)}" data-approval-decision="accept">${uiLabel("approvalSubmit")}</button>`
     : `<button type="button" class="approval-action danger" data-approval-id="${esc(request.id)}" data-approval-decision="decline">${uiLabel("approvalDeny")}</button><button type="button" class="approval-action" data-approval-id="${esc(request.id)}" data-approval-decision="acceptForSession">${uiLabel("approvalSession")}</button><button type="button" class="approval-action primary" data-approval-id="${esc(request.id)}" data-approval-decision="accept">${uiLabel("approvalOnce")}</button>`;
-  center.innerHTML = `<article class="approval-card"><div class="approval-copy"><div class="approval-heading"><span>!</span><strong>${approvalTitle(request.method)}</strong><small>${uiLabel("approvalWaiting")}</small></div>${detail}<div class="approval-detail approval-context">${context}</div></div><div class="approval-actions">${actions}</div>${questionFields}</article>`;
+  center.innerHTML = `<article class="approval-card${questions.length ? " has-questions" : ""}"><div class="approval-copy"><div class="approval-heading"><span>!</span><strong>${approvalTitle(request.method)}</strong><small>${uiLabel("approvalWaiting")}</small></div>${detail}<div class="approval-detail approval-context">${context}</div></div><div class="approval-actions">${actions}</div>${questionFields}</article>`;
 }
 function approvalAnswers() {
   const answers = {};

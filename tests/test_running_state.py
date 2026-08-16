@@ -210,6 +210,9 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn('data-approval-decision="decline"', conversation)
         self.assertIn("/approvals/${encodeURIComponent(requestId)}", app_js)
         self.assertIn(".approval-card {", styles)
+        self.assertIn('approval-card${questions.length ? " has-questions"', conversation)
+        self.assertIn("grid-auto-columns: clamp(78px, 7vw, 92px)", styles)
+        self.assertIn("repeat(auto-fit, minmax(min(132px, 100%), 1fr))", styles)
 
     def test_timeline_uses_cursor_pages_without_overlap(self):
         task_id = f"timeline-{time.time_ns()}"
@@ -1555,9 +1558,9 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260816-structured-inputs', html)
+        self.assertIn('/conversation.js?v=20260816-approval-layout', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
-        self.assertIn('/styles.css?v=20260816-structured-inputs', html)
+        self.assertIn('/styles.css?v=20260816-approval-layout', html)
         self.assertIn(".queued-messages { width: auto; height: auto; min-height: 0; max-height: none; align-self: stretch;", styles)
         self.assertIn('/chat-worker.js?v=20260816-structured-inputs', conversation_js)
         self.assertIn("scroll-behavior: auto", styles)
