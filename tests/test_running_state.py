@@ -111,7 +111,7 @@ class RunningStateTests(unittest.TestCase):
     def test_rollout_plan_steps_extracts_wrapped_update_plan(self):
         payload = {
             "type": "custom_tool_call",
-            "input": 'const p = await tools.update_plan({plan:[{step:"Inspect events",status:"completed"},{step:"Filter noise",status:"in_progress"}]}); text(p);',
+            "input": 'const p = await tools.update_plan({plan:[{step:"Inspect events","status":"completed"},{"step":"Filter noise",status:"in_progress"}]}); text(p);',
         }
         self.assertEqual([
             {"step": "Inspect events", "status": "completed"},

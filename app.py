@@ -866,9 +866,9 @@ def rollout_plan_steps(payload: dict) -> list[dict[str, str]]:
     if "update_plan" not in raw_input:
         return []
     steps: list[dict[str, str]] = []
-    for block in re.findall(r"\{[^{}]*\bstep\s*:\s*\"(?:\\.|[^\"\\])*\"[^{}]*\}", raw_input, re.DOTALL):
-        step_match = re.search(r'\bstep\s*:\s*("(?:\\.|[^"\\])*")', block, re.DOTALL)
-        status_match = re.search(r'\bstatus\s*:\s*("(?:\\.|[^"\\])*")', block, re.DOTALL)
+    for block in re.findall(r'\{[^{}]*["\']?step["\']?\s*:\s*"(?:\\.|[^"\\])*"[^{}]*\}', raw_input, re.DOTALL):
+        step_match = re.search(r'["\']?step["\']?\s*:\s*("(?:\\.|[^"\\])*")', block, re.DOTALL)
+        status_match = re.search(r'["\']?status["\']?\s*:\s*("(?:\\.|[^"\\])*")', block, re.DOTALL)
         if not step_match:
             continue
         try:
