@@ -2722,9 +2722,11 @@ async def supervise_appserver_turn(
         if aligned_workspace:
             task["workspace"] = str(aligned_workspace)
             sandbox_policy = {"type": "dangerFullAccess"} if task["yolo"] else {"type": "workspaceWrite", "writableRoots": [task["workspace"]]}
-        canonical_task_id = canonicalize_task_thread_id(task["id"], thread_id)
+        previous_task_id = task["id"]
+        canonical_task_id = canonicalize_task_thread_id(previous_task_id, thread_id)
         if canonical_task_id != task["id"]:
             task["id"] = canonical_task_id
+            await broadcast_overview_rekeyed(previous_task_id, canonical_task_id)
             if message_id:
                 await broadcast_task(task["id"], {"type": "message", "message_id": message_id, "status": "queued", "session_id": session_id})
         session_id = canonicalize_session_thread_id(task["id"], session_id, thread_id)
@@ -3655,6 +3657,24 @@ async def broadcast_overview(task_id: str, source: Optional[dict] = None) -> Non
 async def broadcast_overview_removed(task_id: str) -> None:
     stale = []
     payload = {"type": "task_removed", "task_id": task_id}
+    for websocket in list(overview_clients):
+        try:
+            await websocket.send_json(payload)
+        except Exception:
+            stale.append(websocket)
+    for websocket in stale:
+        overview_clients.discard(websocket)
+        overview_client_users.pop(websocket, None)
+
+
+async def broadcast_overview_rekeyed(old_task_id: str, new_task_id: str) -> None:
+    stale = []
+    payload = {
+        "type": "task_rekeyed",
+        "old_task_id": old_task_id,
+        "new_task_id": new_task_id,
+        "task": task_summary(new_task_id),
+    }
     for websocket in list(overview_clients):
         try:
             await websocket.send_json(payload)

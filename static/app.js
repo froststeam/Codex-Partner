@@ -242,7 +242,7 @@ async function submitMessage(mode = "codex") {
   const clientMessageId = crypto.randomUUID ? crypto.randomUUID() : String(Date.now());
   const delivery = mode === "queue" || activeTurn ? "queue" : "auto";
   const optimisticStatus = delivery === "queue" ? "queued" : "sending";
-  const optimistic = { id: clientMessageId, body: message, status: optimisticStatus, created_at: new Date().toISOString() };
+  const optimistic = { id: clientMessageId, body: message, status: optimisticStatus, created_at: new Date().toISOString(), _optimistic: true };
   upsertTaskMessage(optimistic); state.historyIndex = -1; input.value = ""; resizeComposerInput(input); pendingAttachments = []; $("#composer-context").textContent = ""; $("#attach-file").value = ""; $("#command-palette").hidden = true; renderGoalBar(); scheduleRenderChat(); input.focus();
   try {
     const delivered = await api(`/tasks/${taskId}/messages`, { method: "POST", body: JSON.stringify({ message, client_message_id: clientMessageId, delivery }) });

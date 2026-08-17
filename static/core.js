@@ -995,7 +995,7 @@ function normalizeTaskMessage(message, current = null) {
   if (current && !message.error && incomingRank !== undefined && currentRank !== undefined && incomingRank < currentRank) {
     message = { ...message, status: current.status, started_at: current.started_at, finished_at: current.finished_at, session_id: current.session_id, error: current.error || "" };
   }
-  return { id, ...(current || {}), ...message, body: message.body ?? current?.body ?? "" };
+  return { id, ...(current || {}), ...message, body: message.body ?? current?.body ?? "", _optimistic: message._optimistic === true };
 }
 function upsertTaskMessage(message) {
   const id = message.id || message.message_id;
@@ -1007,7 +1007,10 @@ function upsertTaskMessage(message) {
 }
 function replaceTaskMessages(messages) {
   const current = new Map(state.selectedMessages.map(message => [message.id, message]));
-  state.selectedMessages = (messages || []).map(message => normalizeTaskMessage(message, current.get(message.id || message.message_id))).filter(Boolean);
+  const authoritative = (messages || []).map(message => normalizeTaskMessage(message, current.get(message.id || message.message_id))).filter(Boolean);
+  const authoritativeIds = new Set(authoritative.map(message => message.id));
+  const pending = state.selectedMessages.filter(message => message._optimistic === true && !authoritativeIds.has(message.id));
+  state.selectedMessages = [...authoritative, ...pending].sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")) || String(a.id).localeCompare(String(b.id)));
 }
 function removeTaskMessage(messageId) {
   state.selectedMessages = state.selectedMessages.filter(message => message.id !== messageId);

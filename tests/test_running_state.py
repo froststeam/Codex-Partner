@@ -2131,11 +2131,11 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn("attachmentUploadName", app_js)
         self.assertIn("new File([file]", app_js)
         self.assertIn('uiLabel("binaryAttachment"', app_js)
-        self.assertIn('/app.js?v=20260817-goal-auto-resume', html)
-        self.assertIn('/core.js?v=20260817-copy-friendly', html)
+        self.assertIn('/app.js?v=20260817-queue-races', html)
+        self.assertIn('/core.js?v=20260817-queue-races', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260817-copy-friendly-v2', html)
+        self.assertIn('/conversation.js?v=20260817-queue-races', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -2364,10 +2364,10 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260817-copy-friendly-v2', html)
+        self.assertIn('/conversation.js?v=20260817-queue-races', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
-        self.assertIn('/app.js?v=20260817-goal-auto-resume', html)
+        self.assertIn('/app.js?v=20260817-queue-races', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
         self.assertIn('/styles.css?v=20260817-copy-friendly', html)
         self.assertIn('<span id="goal-run-label">暂停</span>', html)
@@ -2405,6 +2405,44 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn("chatHasTextSelection() && event.target.closest", conversation_js)
         self.assertIn("user-select: text", styles)
         self.assertIn(".chat-copy-button", styles)
+
+    def test_optimistic_queue_messages_survive_authoritative_refresh(self):
+        static = Path(__file__).resolve().parents[1] / "static"
+        core_js = (static / "core.js").read_text(encoding="utf-8")
+        app_js = (static / "app.js").read_text(encoding="utf-8")
+        self.assertIn("_optimistic: true", app_js)
+        self.assertIn("message._optimistic === true", core_js)
+        self.assertIn("const pending = state.selectedMessages.filter", core_js)
+        self.assertIn("state.selectedMessages = [...authoritative, ...pending]", core_js)
+
+    def test_task_rekey_event_replaces_provisional_sidebar_card(self):
+        task_id = f"rekey-target-{time.time_ns()}"
+        self.make_task(task_id, "available")
+
+        class Socket:
+            def __init__(self):
+                self.payloads = []
+
+            async def send_json(self, payload):
+                self.payloads.append(payload)
+
+        socket = Socket()
+        self.app.overview_clients.add(socket)
+        try:
+            asyncio.run(self.app.broadcast_overview_rekeyed("provisional-id", task_id))
+        finally:
+            self.app.overview_clients.discard(socket)
+        self.assertEqual("task_rekeyed", socket.payloads[0]["type"])
+        self.assertEqual("provisional-id", socket.payloads[0]["old_task_id"])
+        self.assertEqual(task_id, socket.payloads[0]["new_task_id"])
+
+        static = Path(__file__).resolve().parents[1] / "static"
+        conversation_js = (static / "conversation.js").read_text(encoding="utf-8")
+        worker_js = (static / "chat-worker.js").read_text(encoding="utf-8")
+        styles = (static / "styles.css").read_text(encoding="utf-8")
+        self.assertIn('data.type === "task_rekeyed"', conversation_js)
+        self.assertIn("task.id !== oldTaskId && task.id !== newTaskId", conversation_js)
+        self.assertIn("connectSocket(newTaskId, true)", conversation_js)
         self.assertIn("native.aggregatedOutput", worker_js)
         self.assertIn('uiLabel("earlierActivity"', conversation_js)
         self.assertIn("inactiveTrashReason", (static / "settings.js").read_text(encoding="utf-8"))

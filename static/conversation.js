@@ -1143,6 +1143,23 @@ function connectOverviewSocket() {
   overviewSocket.onmessage = event => {
     noteRealtime("overview"); setRealtimeChannel("overview", "live");
     const data = JSON.parse(event.data);
+    if (data.type === "task_rekeyed" && data.old_task_id && data.new_task_id && data.task) {
+      const oldTaskId = data.old_task_id;
+      const newTaskId = data.new_task_id;
+      state.taskAliases ||= {};
+      state.taskAliases[oldTaskId] = newTaskId;
+      state.tasks = state.tasks.filter(task => task.id !== oldTaskId && task.id !== newTaskId);
+      state.tasks.push(data.task);
+      if (state.selectedId === oldTaskId) {
+        state.selectedId = newTaskId;
+        state.selectedTask = data.task;
+        state.selectedMessages = state.selectedMessages.map(message => ({ ...message, task_id: newTaskId }));
+        connectSocket(newTaskId, true);
+        refreshSelectedConversation(newTaskId);
+      }
+      renderSessionList(); renderSidebarStats(); renderConversation();
+      return;
+    }
     if (data.type === "overview_snapshot") {
       applyUserProfile(data.profile, true);
       mergeOverviewSnapshot(data.tasks || []);
