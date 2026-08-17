@@ -2,7 +2,7 @@
 const chatFileObjectUrls = new Map();
 const chatThumbnailObjectUrls = new Map();
 const chatThumbnailLoads = new Map();
-const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260817-terminal-activity") : null;
+const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260817-focused-activity") : null;
 let chatBuildRequestId = 0;
 let chatHistoryLoadPromise = null;
 let mediaViewerMarkdown = null;
@@ -462,15 +462,18 @@ function renderActivityEvent(item, active = false) {
   const output = String(item.output || "").trim();
   const args = String(item.arguments || "").trim();
   const changes = Array.isArray(item.changes) ? item.changes : [];
+  const plan = Array.isArray(item.plan) ? item.plan.filter(step => step && (step.step || step.text)) : [];
   const isWait = kind.includes("wait") || /(?:^|[._])wait$/.test(String(item.tool || ""));
   const toolName = String(item.tool || "").toLowerCase();
-  if (!command && ["exec", "functions.exec"].includes(toolName)) return "";
-  const action = isWait ? "Waited" : changes.length || kind.includes("file") ? "Edited" : kind.includes("mcp") || (!command && item.tool) ? "Called" : kind.includes("search") || kind.includes("explor") ? "Explored" : kind.includes("reason") ? "Reasoned" : command ? "Ran" : item.label || uiLabel("activityWorking");
+  if (!command && !plan.length && ["exec", "functions.exec"].includes(toolName)) return "";
+  const action = plan.length || kind.includes("plan") ? "Planned" : isWait ? "Waited" : changes.length || kind.includes("file") ? "Edited" : kind.includes("mcp") || (!command && item.tool) ? "Called" : kind.includes("search") || kind.includes("explor") ? "Explored" : kind.includes("reason") ? "Reasoned" : command ? "Ran" : item.label || uiLabel("activityWorking");
   const inlineArgs = args ? args.replace(/\s+/g, " ") : "";
-  const subject = isWait ? "for background task" : command || (item.tool ? `${item.tool}${inlineArgs ? `(${inlineArgs})` : ""}` : String(item.detail || ""));
+  const completedPlanSteps = plan.filter(step => step.status === "completed").length;
+  const subject = plan.length ? `${completedPlanSteps}/${plan.length} steps` : isWait ? "for background task" : command || (item.tool ? `${item.tool}${inlineArgs ? `(${inlineArgs})` : ""}` : String(item.detail || ""));
   const cwd = item.cwd ? `<small class="activity-cwd" title="${esc(item.cwd)}">${esc(item.cwd)}</small>` : "";
   const subjectBlock = subject ? `<code class="activity-inline-subject" title="${esc(subject)}">${esc(subject)}</code>` : "";
   const changesBlock = changes.length ? `<div class="activity-changes">${changes.slice(0, 8).map(change => `<span>${esc(change.kind || "update")} · ${esc(change.path || change)}</span>`).join("")}</div>` : "";
+  const planBlock = plan.length ? `<ol class="activity-plan">${plan.map(step => { const state = String(step.status || "pending"); const mark = state === "completed" ? "✓" : state === "in_progress" ? "›" : "·"; return `<li class="${esc(state)}"><span>${mark}</span><span>${esc(step.step || step.text)}</span></li>`; }).join("")}</ol>` : "";
   let outputBlock = "";
   if (output && !isWait) {
     const outputLines = output.split(/\r?\n/);
@@ -485,7 +488,7 @@ function renderActivityEvent(item, active = false) {
   } else if (!active && (status === "completed" || status === "succeeded") && command) {
     outputBlock = `<div class="activity-output empty"><code>(no output)</code></div>`;
   }
-  return `<div class="activity-event${active ? " current" : ""}${statusClass}"><span class="activity-event-dot" aria-hidden="true"></span><div class="activity-event-body"><div class="activity-event-head"><strong>${action}</strong>${subjectBlock}${cwd}<span class="activity-event-status">${statusText}</span></div>${changesBlock}${outputBlock}</div></div>`;
+  return `<div class="activity-event${active ? " current" : ""}${statusClass}"><span class="activity-event-dot" aria-hidden="true"></span><div class="activity-event-body"><div class="activity-event-head"><strong>${action}</strong>${subjectBlock}${cwd}<span class="activity-event-status">${statusText}</span></div>${planBlock}${changesBlock}${outputBlock}</div></div>`;
 }
 
 function renderChatBlock(block, blockIndex, liveActivity = false) {

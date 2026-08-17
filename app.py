@@ -843,6 +843,44 @@ def decoded_tool_arguments(payload: dict) -> dict[str, Any]:
     return {}
 
 
+def structured_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        return structured_text(value.get("text") or value.get("content") or value.get("summary"))
+    if isinstance(value, list):
+        return "\n".join(filter(None, (structured_text(entry) for entry in value))).strip()
+    return ""
+
+
+def rollout_plan_steps(payload: dict) -> list[dict[str, str]]:
+    arguments = decoded_tool_arguments(payload)
+    plan = arguments.get("plan")
+    if isinstance(plan, list):
+        return [
+            {"step": str(entry.get("step") or "").strip(), "status": str(entry.get("status") or "pending")}
+            for entry in plan
+            if isinstance(entry, dict) and str(entry.get("step") or "").strip()
+        ]
+    raw_input = str(payload.get("input") or "")
+    if "update_plan" not in raw_input:
+        return []
+    steps: list[dict[str, str]] = []
+    for block in re.findall(r"\{[^{}]*\bstep\s*:\s*\"(?:\\.|[^\"\\])*\"[^{}]*\}", raw_input, re.DOTALL):
+        step_match = re.search(r'\bstep\s*:\s*("(?:\\.|[^"\\])*")', block, re.DOTALL)
+        status_match = re.search(r'\bstatus\s*:\s*("(?:\\.|[^"\\])*")', block, re.DOTALL)
+        if not step_match:
+            continue
+        try:
+            step = json.loads(step_match.group(1)).strip()
+            status = json.loads(status_match.group(1)) if status_match else "pending"
+        except (AttributeError, json.JSONDecodeError):
+            continue
+        if step:
+            steps.append({"step": step, "status": status})
+    return steps
+
+
 def decoded_tool_output(value: Any) -> tuple[Any, Optional[int]]:
     if isinstance(value, str):
         try:
@@ -942,9 +980,14 @@ def rollout_browser_payload(record: dict) -> Optional[dict]:
                 "turn_id": turn_id,
             }
         if lowered == "reasoning":
-            return {"type": "reasoning", "text": "正在分析与规划", "item_id": payload.get("id", ""), "turn_id": turn_id}
+            text = structured_text(payload.get("summary") or payload.get("content") or payload.get("text"))
+            return {"type": "reasoning", "text": compact_activity_detail(text, 1200), "item_id": payload.get("id", ""), "turn_id": turn_id}
         if lowered in {"custom_tool_call", "function_call"}:
             event_type, detail = rollout_tool_activity(payload)
+            plan = rollout_plan_steps(payload)
+            if plan:
+                event_type = "planUpdate"
+                detail = f"{len(plan)} 个步骤"
             arguments = decoded_tool_arguments(payload)
             raw_input = str(payload.get("input") or "")
             command = arguments.get("cmd") or arguments.get("command")
@@ -964,6 +1007,7 @@ def rollout_browser_payload(record: dict) -> Optional[dict]:
                 "command": activity_transcript(command),
                 "cwd": activity_transcript(arguments.get("workdir"), 1000),
                 "tool": compact_activity_detail(payload.get("name") or "tool", 160),
+                "plan": plan,
             }
         if lowered in {"custom_tool_call_output", "function_call_output"}:
             output, exit_code = decoded_tool_output(payload.get("output"))
@@ -2349,7 +2393,7 @@ async def native_history_events(task: dict) -> list[dict]:
                         part.get("text", "") for part in item.get("content", []) if isinstance(part, dict) and part.get("text")
                     )
                 if not text and item_type in {"reasoning", "plan"}:
-                    text = json.dumps(item.get("summary") or item.get("content") or item, ensure_ascii=False)
+                    text = structured_text(item.get("summary") or item.get("content"))
                 if not text:
                     if item_type == "fileChange":
                         changes = item.get("changes") or []
@@ -2381,6 +2425,7 @@ async def native_history_events(task: dict) -> list[dict]:
                         "tool": compact_activity_detail(item.get("tool") or item.get("name"), 160),
                         "arguments": activity_transcript(item.get("arguments"), 3000),
                         "changes": item.get("changes") or [],
+                        "plan": item.get("plan") or item.get("steps") or [],
                         "exit_code": item.get("exitCode"),
                     }, ensure_ascii=False),
                 })

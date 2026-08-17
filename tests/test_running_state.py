@@ -108,6 +108,19 @@ class RunningStateTests(unittest.TestCase):
         self.assertEqual(0, payload["exit_code"])
         self.assertEqual("completed", payload["status"])
 
+    def test_rollout_plan_steps_extracts_wrapped_update_plan(self):
+        payload = {
+            "type": "custom_tool_call",
+            "input": 'const p = await tools.update_plan({plan:[{step:"Inspect events",status:"completed"},{step:"Filter noise",status:"in_progress"}]}); text(p);',
+        }
+        self.assertEqual([
+            {"step": "Inspect events", "status": "completed"},
+            {"step": "Filter noise", "status": "in_progress"},
+        ], self.app.rollout_plan_steps(payload))
+        browser = self.app.rollout_browser_payload({"type": "response_item", "payload": payload})
+        self.assertEqual("planUpdate", browser["type"])
+        self.assertEqual(2, len(browser["plan"]))
+
         patch_payload = self.app.rollout_browser_payload({
             "type": "response_item",
             "payload": {"type": "custom_tool_call", "name": "exec", "input": "text(await tools.apply_patch(patch));"},
@@ -2122,7 +2135,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn('/core.js?v=20260817-inactive-trash', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260817-detailed-activity-v4', html)
+        self.assertIn('/conversation.js?v=20260817-detailed-activity-v5', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -2351,18 +2364,18 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260817-detailed-activity-v4', html)
+        self.assertIn('/conversation.js?v=20260817-detailed-activity-v5', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260817-goal-auto-resume', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
-        self.assertIn('/styles.css?v=20260817-terminal-activity', html)
+        self.assertIn('/styles.css?v=20260817-focused-activity', html)
         self.assertIn('<span id="goal-run-label">暂停</span>', html)
         self.assertNotIn('id="goal-run-label" class="sr-only"', html)
         self.assertIn(".session-card.selected::before", styles)
         self.assertNotIn("renderSessionList(); renderConversation(); await loadWorkspace(\"\")", conversation_js)
         self.assertIn(".queued-messages { width: auto; height: auto; min-height: 0; max-height: none; align-self: stretch;", styles)
-        self.assertIn('/chat-worker.js?v=20260817-terminal-activity', conversation_js)
+        self.assertIn('/chat-worker.js?v=20260817-focused-activity', conversation_js)
         self.assertIn('data-live="true" open', conversation_js)
         self.assertIn("activity-event.current::after", styles)
         self.assertIn("function renderActivityEvent", conversation_js)
@@ -2371,6 +2384,9 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn('… +${hidden} lines', conversation_js)
         self.assertIn('["exec", "functions.exec"].includes(toolName)', conversation_js)
         self.assertIn('isWait ? "for background task"', conversation_js)
+        self.assertIn('class="activity-plan"', conversation_js)
+        self.assertIn('const protocolNoise = ["updated", "update", "diff", "output", "delta"', worker_js)
+        self.assertIn('if (item.hidden) continue', worker_js)
         self.assertIn("native.aggregatedOutput", worker_js)
         self.assertIn('uiLabel("earlierActivity"', conversation_js)
         self.assertIn("inactiveTrashReason", (static / "settings.js").read_text(encoding="utf-8"))

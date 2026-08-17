@@ -52,6 +52,7 @@ function activityItem(raw, labels, event) {
   const payload = valueOf(raw);
   const native = payload?.item && typeof payload.item === "object" ? payload.item : {};
   const type = String(payload?.type || "activity").toLowerCase();
+  const normalizedType = type.replace(/[^a-z0-9]/g, "");
   const status = String(payload?.status || "").toLowerCase();
   const detail = eventText(payload, labels).trim();
   let label = labels.activityWorking || "Working";
@@ -73,6 +74,10 @@ function activityItem(raw, labels, event) {
   const tool = stringify(payload?.tool || native.tool || native.name);
   const args = stringify(payload?.arguments || native.arguments || native.input);
   const changes = Array.isArray(payload?.changes) ? payload.changes : (Array.isArray(native.changes) ? native.changes : []);
+  const plan = Array.isArray(payload?.plan) ? payload.plan : (Array.isArray(native.plan) ? native.plan : (Array.isArray(native.steps) ? native.steps : []));
+  const protocolNoise = ["updated", "update", "diff", "output", "delta", "itemupdated", "itemdelta", "turnupdated", "turndiff"].includes(normalizedType);
+  const reasoningText = String(payload?.text || native.summary || native.content || "").trim();
+  const emptyReasoning = type.includes("reason") && (!reasoningText || ["reasoning", "正在分析与规划", "正在处理"].includes(reasoningText));
   return {
     text: generic || !detail ? label : `${label} · ${detail}`,
     kind: type,
@@ -84,6 +89,8 @@ function activityItem(raw, labels, event) {
     tool,
     arguments: args,
     changes,
+    plan,
+    hidden: protocolNoise || emptyReasoning,
     exitCode: payload?.exit_code ?? native.exitCode ?? null,
     status: status || (type.includes("reason") ? "started" : ""),
     type,
@@ -196,6 +203,7 @@ function buildBlocks(events, rawActivity, labels) {
     if (role === "activity") {
       if (!rawActivity && ["app-server", "stdout", "stderr"].includes(event.stream)) continue;
       const item = activityItem(payload, labels, event);
+      if (item.hidden) continue;
       if (item.itemId && activityItems.has(item.itemId)) {
         Object.assign(activityItems.get(item.itemId), item);
         current = null;
