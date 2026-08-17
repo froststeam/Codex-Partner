@@ -50,6 +50,7 @@ function isAssistant(event) {
 
 function activityItem(raw, labels, event) {
   const payload = valueOf(raw);
+  const native = payload?.item && typeof payload.item === "object" ? payload.item : {};
   const type = String(payload?.type || "activity").toLowerCase();
   const status = String(payload?.status || "").toLowerCase();
   const detail = eventText(payload, labels).trim();
@@ -61,8 +62,28 @@ function activityItem(raw, labels, event) {
   else if (type.includes("tool") || type.includes("mcp")) label = status === "completed" ? (labels.activityToolDone || label) : (labels.activityTool || label);
   else if (type === "contextcompaction") label = labels.contextCompressed || label;
   const generic = detail === label || ["exec", "exec_command", "toolCall", "mcpToolCall"].includes(detail);
+  const stringify = value => {
+    if (value == null) return "";
+    if (typeof value === "string") return value;
+    try { return JSON.stringify(value, null, 2); } catch (_) { return String(value); }
+  };
+  const command = stringify(payload?.command || native.command);
+  const output = stringify(payload?.output || native.aggregatedOutput || native.output || native.result || native.error);
+  const cwd = stringify(payload?.cwd || native.cwd);
+  const tool = stringify(payload?.tool || native.tool || native.name);
+  const args = stringify(payload?.arguments || native.arguments || native.input);
+  const changes = Array.isArray(payload?.changes) ? payload.changes : (Array.isArray(native.changes) ? native.changes : []);
   return {
     text: generic || !detail ? label : `${label} · ${detail}`,
+    label,
+    detail: generic ? "" : detail,
+    command,
+    output,
+    cwd,
+    tool,
+    arguments: args,
+    changes,
+    exitCode: payload?.exit_code ?? native.exitCode ?? null,
     status: status || (type.includes("reason") ? "started" : ""),
     type,
     itemId: String(payload?.item_id || payload?.id || ""),

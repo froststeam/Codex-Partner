@@ -2,7 +2,7 @@
 const chatFileObjectUrls = new Map();
 const chatThumbnailObjectUrls = new Map();
 const chatThumbnailLoads = new Map();
-const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260817-live-activity") : null;
+const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260817-detailed-activity") : null;
 let chatBuildRequestId = 0;
 let chatHistoryLoadPromise = null;
 let mediaViewerMarkdown = null;
@@ -453,14 +453,33 @@ function restoreChatViewport(stream, viewport, stickToBottom) {
   stream.scrollTop = Math.min(viewport.scrollTop, Math.max(0, stream.scrollHeight - stream.clientHeight));
 }
 
+function renderActivityEvent(item, active = false) {
+  const status = String(item.status || "").toLowerCase();
+  const statusText = status === "completed" || status === "succeeded" ? "完成" : status === "failed" ? "失败" : status === "started" || active ? "执行中" : "";
+  const statusClass = status === "failed" ? " failed" : statusText === "完成" ? " completed" : "";
+  const command = String(item.command || "").trim();
+  const output = String(item.output || "").trim();
+  const args = String(item.arguments || "").trim();
+  const changes = Array.isArray(item.changes) ? item.changes : [];
+  const lines = output ? output.split(/\r?\n/).length : 0;
+  const detail = item.detail && item.detail !== command ? `<code class="activity-detail">${esc(item.detail)}</code>` : "";
+  const cwd = item.cwd ? `<small class="activity-cwd" title="${esc(item.cwd)}">${esc(item.cwd)}</small>` : "";
+  const commandBlock = command ? `<pre class="activity-command"><code>${esc(command)}</code></pre>` : "";
+  const toolBlock = !command && item.tool ? `<div class="activity-tool-name">${esc(item.tool)}</div>` : "";
+  const argsBlock = args ? `<details class="activity-transcript"><summary>参数</summary><pre><code>${esc(args)}</code></pre></details>` : "";
+  const outputBlock = output ? `<details class="activity-transcript"${status === "failed" ? " open" : ""}><summary>${status === "failed" ? "错误输出" : "输出"}${lines ? ` · ${lines} 行` : ""}${item.exitCode != null ? ` · exit ${esc(item.exitCode)}` : ""}</summary><pre><code>${esc(output)}</code></pre></details>` : "";
+  const changesBlock = changes.length ? `<div class="activity-changes">${changes.slice(0, 8).map(change => `<span>${esc(change.kind || "update")} · ${esc(change.path || change)}</span>`).join("")}</div>` : "";
+  return `<div class="activity-event${active ? " current" : ""}${statusClass}"><span class="activity-event-dot" aria-hidden="true"></span><div class="activity-event-body"><div class="activity-event-head"><strong>${esc(item.label || uiLabel("activityWorking"))}</strong>${detail}${cwd}<span class="activity-event-status">${statusText}</span></div>${commandBlock}${toolBlock}${changesBlock}${argsBlock}${outputBlock}</div></div>`;
+}
+
 function renderChatBlock(block, blockIndex, liveActivity = false) {
   const blockAttribute = ` data-chat-block-index="${blockIndex}"`;
   if (block.role === "activities") {
-    const items = block.items.slice(-10);
+    const items = block.items.slice(-16);
     const latest = items[items.length - 1] || {};
     const current = liveActivity ? `<span class="activity-current">${esc(latest.text || uiLabel("activityWorking"))}</span>` : "";
     const older = block.items.length > items.length ? `<div class="activity-older">${uiLabel("earlierActivity", { count: block.items.length - items.length })}</div>` : "";
-    return `<details class="activity-group${liveActivity ? " live" : ""}"${blockAttribute}${liveActivity ? ' data-live="true" open' : ""}><summary><span class="activity-pulse" aria-hidden="true"><i></i></span><strong>${uiLabel("activity")}</strong>${current}<small>${block.items.length}</small></summary><div class="activity-events">${older}${items.map((item, index) => { const active = liveActivity && index === items.length - 1; return `<div class="activity-event${active ? " current" : ""}"><span class="activity-event-dot" aria-hidden="true"></span><span>${esc(item.text || item)}</span></div>`; }).join("")}</div></details>`;
+    return `<details class="activity-group${liveActivity ? " live" : ""}"${blockAttribute}${liveActivity ? ' data-live="true" open' : ""}><summary><span class="activity-pulse" aria-hidden="true"><i></i></span><strong>${uiLabel("activity")}</strong>${current}<small>${block.items.length}</small></summary><div class="activity-events">${older}${items.map((item, index) => renderActivityEvent(item, liveActivity && index === items.length - 1)).join("")}</div></details>`;
   }
   const deliveryLabels = { sending: uiLabel("sending"), steering: uiLabel("steering"), steered: uiLabel("steering"), queued: uiLabel("queued"), running: `${statusLabel("running")} · Codex`, failed: uiLabel("failedSend") };
   const label = block.role === "user" ? (block.commandBlock ? uiLabel("commandLabel") : "") : (block.commandBlock ? uiLabel("commandResult") : uiLabel("codexPartner"));

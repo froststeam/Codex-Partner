@@ -60,6 +60,21 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn("curl -H", payload["text"])
         self.assertIn("Bearer ***", payload["text"])
         self.assertNotIn("secret-value", payload["text"])
+        self.assertIn("Bearer ***", payload["command"])
+        self.assertNotIn("secret-value", payload["command"])
+
+        output_payload = self.app.rollout_browser_payload({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "tool-command",
+                "output": json.dumps({"output": "line one\nline two", "metadata": {"exit_code": 1}}),
+            },
+        })
+        self.assertEqual("toolOutput", output_payload["type"])
+        self.assertEqual("failed", output_payload["status"])
+        self.assertEqual(1, output_payload["exit_code"])
+        self.assertEqual("line one\nline two", output_payload["output"])
 
         patch_payload = self.app.rollout_browser_payload({
             "type": "response_item",
@@ -2075,7 +2090,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn('/core.js?v=20260817-inactive-trash', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260817-goal-auto-resume', html)
+        self.assertIn('/conversation.js?v=20260817-detailed-activity', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -2279,6 +2294,7 @@ process.stdout.write(JSON.stringify(blocks));
         html = (static / "index.html").read_text(encoding="utf-8")
         app_js = (static / "app.js").read_text(encoding="utf-8")
         conversation_js = (static / "conversation.js").read_text(encoding="utf-8")
+        worker_js = (static / "chat-worker.js").read_text(encoding="utf-8")
         styles = (static / "styles.css").read_text(encoding="utf-8")
         self.assertIn('class="key-backquote"', html)
         self.assertIn('<span aria-hidden="true">~</span><span aria-hidden="true">`</span>', html)
@@ -2303,20 +2319,24 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260817-goal-auto-resume', html)
+        self.assertIn('/conversation.js?v=20260817-detailed-activity', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260817-goal-auto-resume', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
-        self.assertIn('/styles.css?v=20260817-goal-pause-label', html)
+        self.assertIn('/styles.css?v=20260817-detailed-activity', html)
         self.assertIn('<span id="goal-run-label">暂停</span>', html)
         self.assertNotIn('id="goal-run-label" class="sr-only"', html)
         self.assertIn(".session-card.selected::before", styles)
         self.assertNotIn("renderSessionList(); renderConversation(); await loadWorkspace(\"\")", conversation_js)
         self.assertIn(".queued-messages { width: auto; height: auto; min-height: 0; max-height: none; align-self: stretch;", styles)
-        self.assertIn('/chat-worker.js?v=20260817-live-activity', conversation_js)
+        self.assertIn('/chat-worker.js?v=20260817-detailed-activity', conversation_js)
         self.assertIn('data-live="true" open', conversation_js)
         self.assertIn("activity-event.current::after", styles)
+        self.assertIn("function renderActivityEvent", conversation_js)
+        self.assertIn('class="activity-command"', conversation_js)
+        self.assertIn('class="activity-transcript"', conversation_js)
+        self.assertIn("native.aggregatedOutput", worker_js)
         self.assertIn('uiLabel("earlierActivity"', conversation_js)
         self.assertIn("inactiveTrashReason", (static / "settings.js").read_text(encoding="utf-8"))
         self.assertIn("scroll-behavior: auto", styles)

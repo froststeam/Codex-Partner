@@ -822,22 +822,32 @@ def compact_activity_detail(value: Any, limit: int = 260) -> str:
     return text if len(text) <= limit else f"{text[:limit - 1]}…"
 
 
+def activity_transcript(value: Any, limit: int = 6000) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"(?i)(bearer\s+)[^\s'\"]+", r"\1***", text)
+    text = re.sub(r"(?i)((?:api[_-]?key|token|password)\s*[:=]\s*)[^\s,;]+", r"\1***", text)
+    return text if len(text) <= limit else f"{text[:limit]}\n… output truncated"
+
+
+def decoded_tool_arguments(payload: dict) -> dict[str, Any]:
+    arguments = payload.get("arguments")
+    if isinstance(arguments, dict):
+        return arguments
+    if isinstance(arguments, str):
+        try:
+            decoded = json.loads(arguments)
+            return decoded if isinstance(decoded, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
 def rollout_tool_activity(payload: dict) -> tuple[str, str]:
     """Return a browser activity type and a useful, secret-safe summary."""
     name = str(payload.get("name") or "tool")
     lowered_name = name.lower()
     raw_input = str(payload.get("input") or "")
-    arguments = payload.get("arguments")
-    parsed_arguments: dict[str, Any] = {}
-    if isinstance(arguments, str):
-        try:
-            decoded = json.loads(arguments)
-            if isinstance(decoded, dict):
-                parsed_arguments = decoded
-        except json.JSONDecodeError:
-            pass
-    elif isinstance(arguments, dict):
-        parsed_arguments = arguments
+    parsed_arguments = decoded_tool_arguments(payload)
 
     command = parsed_arguments.get("cmd") or parsed_arguments.get("command")
     if not command and raw_input:
@@ -889,11 +899,44 @@ def rollout_browser_payload(record: dict) -> Optional[dict]:
             return {"type": "reasoning", "text": "正在分析与规划", "item_id": payload.get("id", ""), "turn_id": turn_id}
         if lowered in {"custom_tool_call", "function_call"}:
             event_type, detail = rollout_tool_activity(payload)
+            arguments = decoded_tool_arguments(payload)
+            raw_input = str(payload.get("input") or "")
+            command = arguments.get("cmd") or arguments.get("command")
+            if not command and event_type == "commandExecution" and raw_input:
+                match = re.search(r'tools\.exec_command\s*\(\s*\{\s*cmd\s*:\s*("(?:\\.|[^"\\])*")', raw_input, re.DOTALL)
+                if match:
+                    try:
+                        command = json.loads(match.group(1))
+                    except json.JSONDecodeError:
+                        command = ""
             return {
                 "type": event_type,
                 "text": detail,
                 "item_id": payload.get("id", ""),
                 "status": payload.get("status", "started"),
+                "turn_id": turn_id,
+                "command": activity_transcript(command),
+                "cwd": activity_transcript(arguments.get("workdir"), 1000),
+                "tool": compact_activity_detail(payload.get("name") or "tool", 160),
+            }
+        if lowered in {"custom_tool_call_output", "function_call_output"}:
+            raw_output = payload.get("output")
+            parsed_output: Any = raw_output
+            if isinstance(raw_output, str):
+                try:
+                    parsed_output = json.loads(raw_output)
+                except json.JSONDecodeError:
+                    parsed_output = raw_output
+            output = parsed_output.get("output", parsed_output) if isinstance(parsed_output, dict) else parsed_output
+            metadata = parsed_output.get("metadata") or {} if isinstance(parsed_output, dict) else {}
+            exit_code = metadata.get("exit_code") if isinstance(metadata, dict) else None
+            return {
+                "type": "toolOutput",
+                "text": "工具执行完成",
+                "item_id": payload.get("call_id") or payload.get("id", ""),
+                "status": "failed" if exit_code not in {None, 0} else "completed",
+                "output": activity_transcript(output),
+                "exit_code": exit_code,
                 "turn_id": turn_id,
             }
         return None
@@ -1367,10 +1410,29 @@ async def process_native_rollout_record(task_id: str, thread_id: str, record: di
     if not browser_payload:
         return
     browser_payload["thread_id"] = thread_id
-    if duplicate_live_event(task_id, browser_payload):
-        return
     turn_id = str(browser_payload.get("turn_id") or active.get("turn_id") or "")
     session_id = active.get("session_id") or f"external:{thread_id}:{turn_id}"
+    if browser_payload.get("type") == "toolOutput" and browser_payload.get("item_id"):
+        previous = db.one(
+            "SELECT payload FROM events WHERE session_id=? AND json_extract(payload, '$.item_id')=? "
+            "ORDER BY id DESC LIMIT 1",
+            (session_id, browser_payload["item_id"]),
+        )
+        if previous:
+            try:
+                started = json.loads(previous["payload"])
+            except (TypeError, json.JSONDecodeError):
+                started = {}
+            browser_payload = {
+                **started,
+                **{key: value for key, value in browser_payload.items() if value not in {None, ""}},
+                "type": started.get("type") or "toolCall",
+                "text": started.get("text") or "工具执行完成",
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+            }
+    if duplicate_live_event(task_id, browser_payload):
+        return
     stamp = rollout_stamp(record)
     db.execute("INSERT INTO events (session_id,ts,stream,payload) VALUES (?,?,?,?)", (session_id, stamp, "rollout", json.dumps(browser_payload, ensure_ascii=False)))
     await broadcast_task(
@@ -2259,7 +2321,7 @@ async def native_history_events(task: dict) -> list[dict]:
                         ) or f"file changes: {item.get('status', 'unknown')}"
                     elif item_type == "commandExecution":
                         command = item.get("command") or ""
-                        text = f"{command}\n{item.get('aggregatedOutput') or ''}".strip()
+                        text = command
                     elif item_type == "contextCompaction":
                         text = "Context compacted"
                     else:
@@ -2276,6 +2338,13 @@ async def native_history_events(task: dict) -> list[dict]:
                         "client_message_id": item.get("clientId"),
                         "turn_id": turn.get("id"),
                         "status": turn.get("status"),
+                        "command": activity_transcript(item.get("command")),
+                        "output": activity_transcript(item.get("aggregatedOutput") or item.get("output")),
+                        "cwd": activity_transcript(item.get("cwd"), 1000),
+                        "tool": compact_activity_detail(item.get("tool") or item.get("name"), 160),
+                        "arguments": activity_transcript(item.get("arguments"), 3000),
+                        "changes": item.get("changes") or [],
+                        "exit_code": item.get("exitCode"),
                     }, ensure_ascii=False),
                 })
         native_history_cache[task["id"]] = {
