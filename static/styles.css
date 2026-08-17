@@ -302,6 +302,8 @@ body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56p
 .goal-text.empty { color: #7e9186; font-style: italic; }
 .goal-bar-controls { display: flex; align-items: center; flex: 0 0 auto; gap: 3px; }
 .goal-button { display: inline-flex; align-items: center; justify-content: center; gap: 3px; min-width: 27px; height: 27px; border: 1px solid #405248; border-radius: 4px; padding: 4px 6px; background: #202d26; color: #c7d7ca; font-size: 11px; white-space: nowrap; }
+#goal-run-toggle { min-width: 55px; }
+#goal-run-label { font-size: 10px; }
 .goal-button:hover, .goal-button.active { border-color: #8aa968; background: #2a3b2e; color: #d8f0b1; }
 .goal-button.subtle { border-color: transparent; background: transparent; color: #8fa197; }
 .goal-button.subtle:hover { border-color: #405248; }
