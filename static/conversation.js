@@ -66,7 +66,7 @@ async function selectSession(id, openSocket = true) {
   const wasEmpty = $("#conversation-view").hidden;
   if (state.selectedId !== id) {
     resetWorkspaceBrowser(); state.titleExpanded = false; state.historyCursor = ""; state.historyHasMore = false;
-    state.historyLoading = false; state.chatBlocks = []; state.chatVirtualStart = null; state.activityVisibleCounts = {}; state.pendingApprovals = [];
+    state.historyLoading = false; state.chatBlocks = []; state.chatVirtualStart = null; state.activityVisibleCounts = {}; state.activityOutputOpen = {}; state.pendingApprovals = [];
     state.selectedEvents = []; state.selectedMessages = []; state.composerHistory = []; state.historyIndex = -1;
     state.runtimeMetrics = { taskId: "", ttftMs: null, tpotMs: null, estimated: true, outputTokens: 0 };
   }
@@ -482,7 +482,7 @@ function copyChatBlock(blockIndex, itemIndex = -1) {
   return String(block.text || "").trim();
 }
 
-function renderActivityEvent(item, active = false, blockIndex = -1, itemIndex = -1) {
+function renderActivityEvent(item, active = false, blockIndex = -1, itemIndex = -1, outputKey = "") {
   const status = String(item.status || "").toLowerCase();
   const statusText = status === "failed" ? "失败" : active ? "执行中" : "";
   const statusClass = status === "failed" ? " failed" : status === "completed" || status === "succeeded" ? " completed" : "";
@@ -512,7 +512,9 @@ function renderActivityEvent(item, active = false, blockIndex = -1, itemIndex = 
     } else {
       const hidden = outputLines.length - 7;
       const preview = [...outputLines.slice(0, 5), `… +${hidden} lines`, ...outputLines.slice(-2)].join("\n");
-      outputBlock = `<details class="activity-output activity-output-long"${status === "failed" ? " open" : ""}><summary><code>${esc(preview)}</code><small>${status === "failed" ? "错误输出" : "查看完整 transcript"}${meta ? ` · ${esc(meta)}` : ""}</small></summary><code class="activity-output-full">${esc(output)}</code></details>`;
+      const remembered = Object.prototype.hasOwnProperty.call(state.activityOutputOpen, outputKey) ? state.activityOutputOpen[outputKey] : null;
+      const outputOpen = remembered === null ? status === "failed" : remembered;
+      outputBlock = `<details class="activity-output activity-output-long" data-activity-output-key="${esc(outputKey)}"${outputOpen ? " open" : ""}><summary><code>${esc(preview)}</code><small>${status === "failed" ? "错误输出" : "查看完整 transcript"}${meta ? ` · ${esc(meta)}` : ""}</small></summary><code class="activity-output-full">${esc(output)}</code></details>`;
     }
   } else if (!active && (status === "completed" || status === "succeeded") && command) {
     outputBlock = `<div class="activity-output empty"><code>(no output)</code></div>`;
@@ -532,7 +534,7 @@ function renderChatBlock(block, blockIndex, liveActivity = false) {
     const current = liveActivity ? `<span class="activity-current">${esc(latest.text || uiLabel("activityWorking"))}</span>` : "";
     const hiddenCount = block.items.length - items.length;
     const older = hiddenCount ? `<button type="button" class="activity-load-older" data-activity-key="${esc(activityKey)}">${uiLabel("loadEarlierActivity", { count: hiddenCount })}</button>` : "";
-    return `<details class="activity-group${liveActivity ? " live" : ""}"${blockAttribute}${liveActivity ? ' data-live="true" open' : ""}><summary><span class="activity-pulse" aria-hidden="true"><i></i></span><strong>${uiLabel("activity")}</strong>${current}<small>${block.items.length}</small></summary><div class="activity-events">${older}${items.map((item, index) => renderActivityEvent(item, liveActivity && index === items.length - 1, blockIndex, itemOffset + index)).join("")}</div></details>`;
+    return `<details class="activity-group${liveActivity ? " live" : ""}"${blockAttribute}${liveActivity ? ' data-live="true" open' : ""}><summary><span class="activity-pulse" aria-hidden="true"><i></i></span><strong>${uiLabel("activity")}</strong>${current}<small>${block.items.length}</small></summary><div class="activity-events">${older}${items.map((item, index) => { const itemIndex = itemOffset + index; const outputKey = `activity-output:${activityKey}:${item.itemId || itemIndex}`; return renderActivityEvent(item, liveActivity && index === items.length - 1, blockIndex, itemIndex, outputKey); }).join("")}</div></details>`;
   }
   const deliveryLabels = { sending: uiLabel("sending"), steering: uiLabel("steering"), steered: uiLabel("steering"), queued: uiLabel("queued"), running: `${statusLabel("running")} · Codex`, failed: uiLabel("failedSend") };
   const label = block.role === "user" ? (block.commandBlock ? uiLabel("commandLabel") : "") : (block.commandBlock ? uiLabel("commandResult") : uiLabel("codexPartner"));
@@ -572,6 +574,9 @@ function paintVirtualChat(stickToBottom = false) {
   }
   $(".chat-load-older", stream)?.addEventListener("click", loadOlderTimeline);
   $$(".activity-load-older", stream).forEach(button => button.addEventListener("click", () => loadEarlierActivity(button.dataset.activityKey || "")));
+  $$(".activity-output-long[data-activity-output-key]", stream).forEach(output => output.addEventListener("toggle", () => {
+    state.activityOutputOpen[output.dataset.activityOutputKey] = output.open;
+  }));
   hydrateChatFiles();
   if (!stream.dataset.virtualScroll) {
     stream.dataset.virtualScroll = "1";

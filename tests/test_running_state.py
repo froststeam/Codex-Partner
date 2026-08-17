@@ -1065,6 +1065,18 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn("loadEarlierActivity", core)
         self.assertIn(".activity-load-older", styles)
 
+    def test_full_activity_transcript_stays_open_across_chat_repaints(self):
+        static = Path(__file__).resolve().parents[1] / "static"
+        core = (static / "core.js").read_text(encoding="utf-8")
+        conversation = (static / "conversation.js").read_text(encoding="utf-8")
+        html = (static / "index.html").read_text(encoding="utf-8")
+        self.assertIn("activityOutputOpen: {}", core)
+        self.assertIn("state.activityOutputOpen = {}", conversation)
+        self.assertIn('data-activity-output-key="${esc(outputKey)}"', conversation)
+        self.assertIn("Object.prototype.hasOwnProperty.call(state.activityOutputOpen, outputKey)", conversation)
+        self.assertIn("state.activityOutputOpen[output.dataset.activityOutputKey] = output.open", conversation)
+        self.assertIn('/conversation.js?v=20260817-transcript-state', html)
+
     def test_message_history_skips_activity_only_pages(self):
         static = Path(__file__).resolve().parents[1] / "static"
         pagination = static / "history-pagination.js"
@@ -1119,7 +1131,7 @@ const cursors = [];
         self.assertIn("HistoryPagination.fetchEarlierTimelinePages", conversation)
         self.assertIn("messageTarget: 12, maxPages: 8", conversation)
         self.assertIn('/history-pagination.js?v=20260817-message-history', html)
-        self.assertIn('/conversation.js?v=20260817-message-metrics', html)
+        self.assertIn('/conversation.js?v=20260817-transcript-state', html)
 
     def test_sent_browser_messages_follow_the_loaded_timeline_boundary(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -2390,7 +2402,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('/core.js?v=20260817-activity-history', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260817-message-metrics', html)
+        self.assertIn('/conversation.js?v=20260817-transcript-state', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -2619,7 +2631,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260817-message-metrics', html)
+        self.assertIn('/conversation.js?v=20260817-transcript-state', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260817-queue-races', html)
