@@ -60,16 +60,24 @@ function timestamp(event) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function stripCodexHiddenContext(text) {
+  return String(text || "")
+    .replace(/<(environment_context|codex_internal_context|skills_instructions|plugins_instructions|system_reminder|memory_context|turn_context|oai-mem-citation)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, "")
+    .replace(/<permissions(?:\s+instructions)?\b[^>]*>[\s\S]*?<\/permissions(?:\s+instructions)?\s*>/gi, "")
+    .replace(/<(environment_context|codex_internal_context|skills_instructions|plugins_instructions|system_reminder|memory_context|turn_context|oai-mem-citation)\b[^>]*\/?\s*>/gi, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 function eventText(raw, labels) {
   const payload = valueOf(raw);
   if (typeof payload === "string") return payload;
   if (!payload || typeof payload !== "object") return String(payload ?? "");
   if (["userMessage", "browserMessage"].includes(payload.type)) {
     const text = payload.text || (payload.content || []).map(item => item.text || "").join("\n");
-    if (/^\s*<codex_internal_context\b[^>]*\bsource=["']goal["']/i.test(text)) return "";
-    return text;
+    return stripCodexHiddenContext(text);
   }
-  if (payload.type === "agentMessage") return payload.text || "";
+  if (payload.type === "agentMessage") return stripCodexHiddenContext(payload.text || "");
   if (payload.type === "agentMessageStarted") return "";
   if (payload.type === "agent_delta") return payload.delta || "";
   if (payload.type === "reasoning") return payload.text || payload.summary || "";
@@ -147,7 +155,7 @@ function activityItem(raw, labels, event) {
 }
 
 function userDedupeBody(text) {
-  return String(text || "")
+  return stripCodexHiddenContext(text)
     .replace(/<image\b[^>]*>[\s\S]*?<\/image>/gi, "")
     .replace(/<audio\b[^>]*>[\s\S]*?<\/audio>/gi, "")
     .replace(/<video\b[^>]*>[\s\S]*?<\/video>/gi, "")
@@ -296,8 +304,13 @@ function buildBlocks(events, rawActivity, labels) {
     }
     current.text += `${current.text ? "\n" : ""}${text}`;
   }
-  for (const block of blocks) if (block.role !== "activities") block.html = markdown(block.text);
-  return blocks;
+  return blocks.filter(block => {
+    if (block.role === "activities") return true;
+    block.text = stripCodexHiddenContext(block.text);
+    if (!block.text) return false;
+    block.html = markdown(block.text);
+    return true;
+  });
 }
 
 self.onmessage = event => {

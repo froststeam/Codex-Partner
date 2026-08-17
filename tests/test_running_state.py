@@ -899,6 +899,33 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
             self.app.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
+    def test_worker_hides_codex_environment_context_from_user_messages(self):
+        worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
+        script = f"""
+const fs = require("fs");
+const vm = require("vm");
+const context = {{ self: {{ postMessage() {{}} }} }};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync({json.dumps(str(worker))}, "utf8"), context);
+const blocks = context.buildBlocks([
+  {{ id: "only-hidden", stream: "rollout", payload: JSON.stringify({{ type: "userMessage", text: {json.dumps("<environment_context>\n<current_date>2026-08-18</current_date>\n</environment_context>")} }}) }},
+  {{ id: "mixed", stream: "rollout", payload: JSON.stringify({{ type: "userMessage", text: {json.dumps("keep this request\n<environment_context>\n<timezone>Asia/Shanghai</timezone>\n</environment_context>")} }}) }},
+  {{ id: "internal", stream: "rollout", payload: JSON.stringify({{ type: "userMessage", text: {json.dumps('<codex_internal_context source="system">secret</codex_internal_context>')} }}) }},
+  {{ id: "permissions", stream: "rollout", payload: JSON.stringify({{ type: "userMessage", text: {json.dumps('<permissions instructions>hidden</permissions instructions>')} }}) }},
+  {{ id: "answer", stream: "rollout", payload: JSON.stringify({{ type: "agentMessage", text: {json.dumps('visible answer\n<oai-mem-citation><rollout_ids>hidden</rollout_ids></oai-mem-citation>')} }}) }},
+  {{ id: "delta-1", stream: "rollout", payload: JSON.stringify({{ type: "agent_delta", item_id: "split", delta: {json.dumps('after\n<environment_context><current_date>')} }}) }},
+  {{ id: "delta-2", stream: "rollout", payload: JSON.stringify({{ type: "agent_delta", item_id: "split", delta: {json.dumps('hidden</current_date></environment_context>')} }}) }},
+], false, {{}});
+process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
+"""
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+        self.assertEqual(["keep this request", "visible answer\nafter"], json.loads(result.stdout))
+
+        conversation = (worker.parent / "conversation.js").read_text(encoding="utf-8")
+        html = (worker.parent / "index.html").read_text(encoding="utf-8")
+        self.assertIn('/chat-worker.js?v=20260818-hidden-context', conversation)
+        self.assertIn('/conversation.js?v=20260818-hidden-context', html)
+
     def test_worker_hides_native_media_tags(self):
         script = f"""
 const fs = require("fs");
@@ -1091,7 +1118,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn('data-activity-output-key="${esc(outputKey)}"', conversation)
         self.assertIn("Object.prototype.hasOwnProperty.call(state.activityOutputOpen, outputKey)", conversation)
         self.assertIn("state.activityOutputOpen[output.dataset.activityOutputKey] = output.open", conversation)
-        self.assertIn('/conversation.js?v=20260817-session-navigation', html)
+        self.assertIn('/conversation.js?v=20260818-hidden-context', html)
 
     def test_message_history_skips_activity_only_pages(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -1147,7 +1174,7 @@ const cursors = [];
         self.assertIn("HistoryPagination.fetchEarlierTimelinePages", conversation)
         self.assertIn("messageTarget: 12, maxPages: 8", conversation)
         self.assertIn('/history-pagination.js?v=20260817-message-history', html)
-        self.assertIn('/conversation.js?v=20260817-session-navigation', html)
+        self.assertIn('/conversation.js?v=20260818-hidden-context', html)
 
     def test_sent_browser_messages_follow_the_loaded_timeline_boundary(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -1180,7 +1207,7 @@ process.stdout.write(JSON.stringify({{ recent: bodies(recentEvents), older: bodi
         self.assertEqual(["currently running message", "old sent message", "current sent message"], payload["older"])
 
         conversation = (worker.parent / "conversation.js").read_text(encoding="utf-8")
-        self.assertIn('/chat-worker.js?v=20260817-message-metrics', conversation)
+        self.assertIn('/chat-worker.js?v=20260818-hidden-context', conversation)
 
     def test_metrics_user_event_does_not_hide_its_browser_message(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -2431,7 +2458,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('/core.js?v=20260818-default-avatar', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260817-session-navigation', html)
+        self.assertIn('/conversation.js?v=20260818-hidden-context', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -2660,7 +2687,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260817-session-navigation', html)
+        self.assertIn('/conversation.js?v=20260818-hidden-context', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260817-queue-races', html)
@@ -2672,7 +2699,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn(".session-card.selected::before", styles)
         self.assertNotIn("renderSessionList(); renderConversation(); await loadWorkspace(\"\")", conversation_js)
         self.assertIn(".queued-messages { width: auto; height: auto; min-height: 0; max-height: none; align-self: stretch;", styles)
-        self.assertIn('/chat-worker.js?v=20260817-message-metrics', conversation_js)
+        self.assertIn('/chat-worker.js?v=20260818-hidden-context', conversation_js)
         self.assertIn('data-live="true" open', conversation_js)
         self.assertIn("activity-event.current::after", styles)
         self.assertIn("function renderActivityEvent", conversation_js)
@@ -2721,7 +2748,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         clear_start = conversation.index("clearChatSelectionForSessionSwitch()", select_start)
         self.assertLess(clear_start, request_start)
         self.assertIn("if (state.selectedId !== id)", conversation[select_start:request_start])
-        self.assertIn('/conversation.js?v=20260817-session-navigation', html)
+        self.assertIn('/conversation.js?v=20260818-hidden-context', html)
 
     def test_optimistic_queue_messages_survive_authoritative_refresh(self):
         static = Path(__file__).resolve().parents[1] / "static"
