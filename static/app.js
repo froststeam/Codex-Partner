@@ -217,7 +217,10 @@ async function submitMessage(mode = "codex") {
   }
   if (mode === "codex" && message.startsWith("/") && !pendingAttachments.length) {
     input.value = ""; input.style.height = ""; $("#command-palette").hidden = true;
-    try { await submitSlashCommand(message); } catch (error) { input.value = message; renderCommandPalette(); toast(error.message); }
+    try {
+      const result = await submitSlashCommand(message);
+      if (!result?.ok) { input.value = message; resizeComposerInput(input); renderCommandPalette(); }
+    } catch (error) { input.value = message; resizeComposerInput(input); renderCommandPalette(); toast(error.message); }
     return;
   }
   if (pendingAttachments.length) {

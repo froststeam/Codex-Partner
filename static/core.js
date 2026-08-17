@@ -1019,6 +1019,11 @@ async function refreshSelectedConversation(id) {
   try {
     const [task, timeline, messages] = await Promise.all([api(`/tasks/${id}`), api(`/tasks/${id}/timeline?limit=160`), api(`/tasks/${id}/messages`)]);
     if (state.selectedId !== id) return;
+    if (task.id && task.id !== id) {
+      state.selectedId = task.id;
+      localStorage.setItem("codex-dashboard-session", task.id);
+      if (!socketPaused) connectSocket(task.id, true);
+    }
     mergeTask(task);
     state.selectedTask = task;
     state.selectedEvents = [...(timeline.items || []), ...(timeline.metrics || [])];

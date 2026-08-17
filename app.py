@@ -286,6 +286,13 @@ def create_session_workspace(task_id: str) -> Path:
     return workspace
 
 
+def safe_thread_id(value: str) -> str:
+    thread_id = str(value or "").strip()
+    if not thread_id or "/" in thread_id or "\\" in thread_id or thread_id in {".", ".."}:
+        return ""
+    return thread_id
+
+
 def align_session_workspace(task_id: str, thread_id: str) -> Optional[Path]:
     """Rename an untouched session workspace to the Codex thread ID.
 
@@ -294,7 +301,8 @@ def align_session_workspace(task_id: str, thread_id: str) -> Optional[Path]:
     workspace, browser session, and Codex thread unambiguous. Explicitly
     selected workspaces and remote SSH paths are intentionally left alone.
     """
-    if not thread_id or "/" in thread_id or "\\" in thread_id:
+    thread_id = safe_thread_id(thread_id)
+    if not thread_id:
         return None
     task = db.one("SELECT id,workspace,ssh_host FROM tasks WHERE id=?", (task_id,))
     if not task or task.get("ssh_host"):
@@ -324,6 +332,69 @@ def align_session_workspace(task_id: str, thread_id: str) -> Optional[Path]:
         target.mkdir(mode=0o700)
     db.execute("UPDATE tasks SET workspace=?,updated_at=? WHERE id=?", (str(target), now(), task_id))
     return target
+
+
+def canonicalize_task_thread_id(task_id: str, thread_id: str) -> str:
+    """Use the Codex thread id as the dashboard task id when it is safe.
+
+    This keeps browser task ids, Codex thread ids, and default workspace
+    folders aligned for ordinary local sessions. If the target id already
+    exists, keep the current task id rather than merging unrelated state.
+    """
+    thread_id = safe_thread_id(thread_id)
+    if not thread_id or task_id == thread_id:
+        return task_id
+    task = db.one("SELECT id,ssh_host FROM tasks WHERE id=?", (task_id,))
+    if not task or task.get("ssh_host"):
+        return task_id
+    if db.one("SELECT id FROM tasks WHERE id=?", (thread_id,)):
+        return task_id
+    task_id_aliases[task_id] = thread_id
+    db.execute("UPDATE tasks SET id=?,updated_at=? WHERE id=?", (thread_id, now(), task_id))
+    db.execute("UPDATE sessions SET task_id=? WHERE task_id=?", (thread_id, task_id))
+    db.execute("UPDATE events SET task_id=? WHERE task_id=?", (thread_id, task_id))
+    db.execute("UPDATE task_messages SET task_id=? WHERE task_id=?", (thread_id, task_id))
+    if task_id in running:
+        running[thread_id] = running.pop(task_id)
+    if task_id in task_workers:
+        task_workers[thread_id] = task_workers.pop(task_id)
+    if task_id in external_turns:
+        external_turns[thread_id] = external_turns.pop(task_id)
+    if task_id in external_turn_sets:
+        external_turn_sets[thread_id] = external_turn_sets.pop(task_id)
+    if task_id in app_thread_bindings:
+        app_thread_bindings[thread_id] = app_thread_bindings.pop(task_id)
+    if task_id in appserver_turn_tasks:
+        appserver_turn_tasks[thread_id] = appserver_turn_tasks.pop(task_id)
+    if task_id in appserver_turn_ids:
+        appserver_turn_ids[thread_id] = appserver_turn_ids.pop(task_id)
+    if task_id in native_history_cache:
+        native_history_cache[thread_id] = native_history_cache.pop(task_id)
+    if task_id in native_history_locks:
+        native_history_locks[thread_id] = native_history_locks.pop(task_id)
+    if task_id in task_clients:
+        task_clients[thread_id] = task_clients.pop(task_id)
+    return thread_id
+
+
+def canonicalize_session_thread_id(task_id: str, session_id: str, thread_id: str) -> str:
+    thread_id = safe_thread_id(thread_id)
+    if not thread_id or not session_id or session_id == thread_id:
+        return session_id
+    session = db.one("SELECT id,attempt FROM sessions WHERE id=? AND task_id=?", (session_id, task_id))
+    if not session or int(session.get("attempt", 0)) > 1:
+        return session_id
+    if db.one("SELECT id FROM sessions WHERE id=?", (thread_id,)):
+        return session_id
+    db.execute("UPDATE sessions SET id=? WHERE id=?", (thread_id, session_id))
+    db.execute("UPDATE events SET session_id=? WHERE session_id=?", (thread_id, session_id))
+    db.execute("UPDATE task_messages SET session_id=? WHERE session_id=?", (thread_id, session_id))
+    db.execute("UPDATE tasks SET active_session_id=? WHERE active_session_id=?", (thread_id, session_id))
+    if task_id in app_thread_bindings:
+        key, bound_thread_id, bound_session_id = app_thread_bindings[task_id]
+        if bound_session_id == session_id:
+            app_thread_bindings[task_id] = (key, bound_thread_id, thread_id)
+    return thread_id
 
 
 def now() -> str:
@@ -392,6 +463,7 @@ auth_sessions: dict[str, dict[str, Any]] = {}
 login_throttle = LoginThrottle()
 running: dict[str, asyncio.subprocess.Process] = {}
 running_lock = asyncio.Lock()
+task_id_aliases: dict[str, str] = {}
 task_clients: dict[str, set[WebSocket]] = {}
 overview_clients: set[WebSocket] = set()
 overview_client_users: dict[WebSocket, str] = {}
@@ -555,6 +627,26 @@ def native_thread_settings() -> dict[str, dict]:
     except sqlite3.Error:
         return {}
     return {row[0]: dict(zip(selected[1:], row[1:])) for row in rows}
+
+
+def persist_native_thread_model(thread_id: str, model: str) -> None:
+    thread_id = safe_thread_id(thread_id)
+    if not thread_id:
+        return
+    path = CODEX_HOME / "state_5.sqlite"
+    if not path.is_file():
+        return
+    try:
+        conn = sqlite3.connect(str(path))
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(threads)")}
+        if "id" not in columns or "model" not in columns:
+            conn.close()
+            return
+        conn.execute("UPDATE threads SET model=? WHERE id=?", (model or "", thread_id))
+        conn.commit()
+        conn.close()
+    except sqlite3.Error:
+        return
 
 
 def native_rollout_rows() -> list[dict[str, str]]:
@@ -1878,8 +1970,13 @@ async def sync_native_threads() -> dict:
             archived = bool(thread.get("archived") or native_settings.get("archived"))
             memory_mode = str(native_settings.get("memory_mode") or "enabled")
             provider_id = providers.get(model_provider)
-            existing = db.one("SELECT id,status,retry_forever,retry_explicit FROM tasks WHERE codex_session_id=?", (thread_id,))
+            existing = db.one("SELECT id,status,retry_forever,retry_explicit,provider_id,model FROM tasks WHERE codex_session_id=?", (thread_id,))
             if existing:
+                # Imported native threads may be edited from the dashboard. Do
+                # not let the periodic native index sync erase those dashboard
+                # choices before the next turn can use them.
+                provider_id = existing.get("provider_id")
+                model = existing.get("model", "")
                 aligned_workspace = align_session_workspace(existing["id"], thread_id)
                 if aligned_workspace:
                     workspace = str(aligned_workspace)
@@ -1892,21 +1989,25 @@ async def sync_native_threads() -> dict:
                     (title[:160], prompt, objective, workspace, model, provider_id, goal_status, int(goal.get("tokensUsed", 0) or 0),
                      retry_forever, int(yolo), int(archived), memory_mode, status, updated_at, existing["id"]),
                 )
+                persist_native_thread_model(thread_id, model)
                 task_id = existing["id"]
+                task_id = canonicalize_task_thread_id(task_id, thread_id)
                 updated += 1
             else:
-                task_id = f"native-{thread_id}"
+                task_id = thread_id
                 if db.one("SELECT id FROM tasks WHERE id=?", (task_id,)):
                     task_id = str(uuid.uuid4())
                 db.execute(
                     "INSERT INTO tasks (id,name,prompt,goal,workspace,status,yolo,max_retries,retry_forever,provider_id,model,context,codex_session_id,goal_status,created_at,updated_at,native,archived,memory_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (task_id, title[:160], prompt, objective, workspace, "archived" if archived else "available", int(yolo), 3, int(bool(objective)), provider_id, model, "", thread_id, goal_status, created, updated_at, 1, int(archived), memory_mode),
                 )
+                persist_native_thread_model(thread_id, model)
                 imported += 1
             if not db.one("SELECT id FROM sessions WHERE task_id=? AND codex_session_id=?", (task_id, thread_id)):
+                session_id = thread_id if not db.one("SELECT id FROM sessions WHERE id=?", (thread_id,)) else str(uuid.uuid4())
                 db.execute(
                     "INSERT INTO sessions (id,task_id,status,attempt,provider_id,command,started_at,finished_at,exit_code,summary,codex_session_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                    (str(uuid.uuid4()), task_id, "imported", 0, model_provider or None, shlex.join([CODEX_BIN, "app-server", "thread/resume", thread_id]), created, updated_at, 0, "Imported from local Codex", thread_id),
+                    (session_id, task_id, "imported", 0, model_provider or None, shlex.join([CODEX_BIN, "app-server", "thread/resume", thread_id]), created, updated_at, 0, "Imported from local Codex", thread_id),
                 )
         return {"imported": imported, "updated": updated, "available": True, "threads": len(threads), "providers": provider_result}
 
@@ -1995,6 +2096,8 @@ async def handle_appserver_notification(server_key: str, message: dict) -> None:
         item_type = item.get("type", "item")
         item_id = item.get("id", "")
         if item_type == "userMessage":
+            if method == "item/started":
+                return
             text = item.get("text", "") or "\n".join(
                 part.get("text", "")
                 for part in item.get("content", [])
@@ -2224,6 +2327,13 @@ async def supervise_appserver_turn(
         aligned_workspace = align_session_workspace(task["id"], thread_id)
         if aligned_workspace:
             task["workspace"] = str(aligned_workspace)
+        canonical_task_id = canonicalize_task_thread_id(task["id"], thread_id)
+        if canonical_task_id != task["id"]:
+            task["id"] = canonical_task_id
+            if message_id:
+                await broadcast_task(task["id"], {"type": "message", "message_id": message_id, "status": "queued", "session_id": session_id})
+        session_id = canonicalize_session_thread_id(task["id"], session_id, thread_id)
+        persist_native_thread_model(thread_id, task.get("model") or "")
         # Bind the persisted session before goal/turn notifications can arrive.
         app_thread_bindings[task["id"]] = (key, thread_id, session_id)
         db.execute("UPDATE tasks SET codex_session_id=?,updated_at=? WHERE id=?", (thread_id, now(), task["id"]))
@@ -2580,7 +2690,8 @@ async def auth(request: Request):
 
 
 def task_or_404(task_id: str) -> dict:
-    task = db.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    canonical_id = task_id_aliases.get(task_id, task_id)
+    task = db.one("SELECT * FROM tasks WHERE id=?", (canonical_id,))
     if not task:
         raise HTTPException(404, "Task not found")
     task["yolo"] = bool(task["yolo"])
@@ -3810,7 +3921,10 @@ async def native_sync(_: Any = Depends(auth)):
 
 @app.post("/api/tasks")
 async def create_task(payload: TaskCreate, _: Any = Depends(auth)):
-    task_id, stamp = str(uuid.uuid4()), now()
+    requested_thread_id = safe_thread_id(payload.codex_session_id)
+    task_id, stamp = requested_thread_id or str(uuid.uuid4()), now()
+    if requested_thread_id and db.one("SELECT id FROM tasks WHERE id=?", (requested_thread_id,)):
+        task_id = str(uuid.uuid4())
     goal_status = "active" if payload.goal.strip() else "none"
     ssh_host = validate_ssh_host(payload.ssh_host) if payload.ssh_host.strip() else ""
     if ssh_host:
@@ -3821,7 +3935,7 @@ async def create_task(payload: TaskCreate, _: Any = Depends(auth)):
     db.execute(
         "INSERT INTO tasks (id,name,prompt,goal,workspace,status,yolo,max_retries,retry_forever,provider_id,model,context,codex_session_id,goal_status,created_at,updated_at,native,reasoning_effort,service_tier,personality,collaboration_mode,permission_profile,ssh_host) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (task_id, payload.name, payload.prompt, payload.goal, workspace, "queued", int(payload.yolo), payload.max_retries, int(payload.retry_forever or bool(payload.goal.strip())), payload.provider_id, payload.model, payload.context, payload.codex_session_id.strip(), goal_status, stamp, stamp, 0, payload.reasoning_effort, payload.service_tier, payload.personality, payload.collaboration_mode, payload.permission_profile, ssh_host),
+        (task_id, payload.name, payload.prompt, payload.goal, workspace, "queued", int(payload.yolo), payload.max_retries, int(payload.retry_forever or bool(payload.goal.strip())), payload.provider_id, payload.model, payload.context, requested_thread_id, goal_status, stamp, stamp, 0, payload.reasoning_effort, payload.service_tier, payload.personality, payload.collaboration_mode, payload.permission_profile, ssh_host),
     )
     result = task_or_404(task_id)
     await broadcast_overview(task_id, {"type": "created"})
@@ -3851,6 +3965,7 @@ async def create_quick_task(payload: QuickTaskCreate = QuickTaskCreate(), _: Any
 @app.get("/api/tasks/{task_id}")
 async def get_task(task_id: str, _: Any = Depends(auth)):
     task = task_or_404(task_id)
+    task_id = task["id"]
     task["sessions"] = db.all("SELECT * FROM sessions WHERE task_id=? ORDER BY attempt DESC LIMIT 40", (task_id,))
     task["session_count"] = db.one("SELECT COUNT(*) count FROM sessions WHERE task_id=?", (task_id,))["count"]
     return task
@@ -3972,6 +4087,8 @@ async def patch_task(task_id: str, payload: TaskPatch, _: Any = Depends(auth)):
     sets.append("updated_at=?"); args.append(now()); args.append(task_id)
     db.execute(f"UPDATE tasks SET {','.join(sets)} WHERE id=?", tuple(args))
     result = task_or_404(task_id)
+    if "model" in values:
+        persist_native_thread_model(result.get("codex_session_id") or task_id, str(values.get("model") or ""))
     await broadcast_overview(task_id, {"type": "updated"})
     return result
 
@@ -4173,6 +4290,7 @@ async def native_timeline_events(task: dict) -> tuple[list[dict], list[dict]]:
 async def task_timeline(task_id: str, before: str = "", limit: int = 160, _: Any = Depends(auth)):
     """Return one newest-first cursor page, rendered oldest-to-newest by clients."""
     task = task_or_404(task_id)
+    task_id = task["id"]
     limit = max(25, min(limit, 500))
     cursor = decode_history_cursor(before)
     if task.get("native"):
@@ -4703,6 +4821,12 @@ async def supervise(task: dict, session_id: str, providers: list[Optional[dict]]
                         if aligned_workspace:
                             task["workspace"] = str(aligned_workspace)
                         db.execute("UPDATE sessions SET codex_session_id=? WHERE id=?", (str(candidate), session_id))
+                        canonical_task_id = canonicalize_task_thread_id(task_id, str(candidate))
+                        if canonical_task_id != task_id:
+                            task_id = canonical_task_id
+                            task["id"] = canonical_task_id
+                        session_id = canonicalize_session_thread_id(task_id, session_id, str(candidate))
+                        persist_native_thread_model(str(candidate), task.get("model") or "")
                 db.execute("INSERT INTO events (session_id,ts,stream,payload) VALUES (?,?,?,?)", (session_id, now(), "stdout", json.dumps(parsed, ensure_ascii=False)))
                 await broadcast_task(task_id, {"type": "event", "session_id": session_id, "stream": "stdout", "payload": parsed, "ts": now()})
             code = await process.wait()
@@ -4806,7 +4930,8 @@ async def resume_task(task_id: str, _: Any = Depends(auth)):
 
 @app.get("/api/tasks/{task_id}/messages")
 async def list_task_messages(task_id: str, _: Any = Depends(auth)):
-    task_or_404(task_id)
+    task = task_or_404(task_id)
+    task_id = task["id"]
     return db.all("SELECT * FROM task_messages WHERE task_id=? ORDER BY created_at, id", (task_id,))
 
 
@@ -5288,6 +5413,13 @@ def result_message(command: str, message: str, **extra: Any) -> dict:
     return {"ok": True, "command": command, "message": message, **extra}
 
 
+def normalize_model_command_value(value: str) -> str:
+    text = str(value or "").strip()
+    if text.lower() in {"", "default", "provider-default", "provider_default", "__provider_default__"}:
+        return ""
+    return text
+
+
 async def execute_slash_command(task: dict, command: str, arg_text: str, args: list[str], confirmed: bool = False) -> dict:
     """Execute one browser slash command without creating a model turn."""
     if command == "help":
@@ -5376,16 +5508,40 @@ async def execute_slash_command(task: dict, command: str, arg_text: str, args: l
             rows = [f"- `{item.get('id') or item.get('model')}` {item.get('displayName', '')} · 默认 effort `{item.get('defaultReasoningEffort', '')}`" for item in models]
             return result_message(command, "**可用模型**\n" + ("\n".join(rows) or "Codex 没有返回可用模型。"), models=models)
         effort_values = {"minimal", "low", "medium", "high", "xhigh", "ultra"}
-        effort = next((value for value in args[1:] if value in effort_values), None)
-        model = args[0] if args[0] not in effort_values else ""
-        updates = {"model": model}
-        if effort:
-            updates["reasoning_effort"] = effort
-        elif args[0] in effort_values:
-            updates = {"reasoning_effort": args[0]}
+        default_values = {"", "default", "provider-default", "provider_default", "__provider_default__"}
+        named: dict[str, str] = {}
+        positional: list[str] = []
+        for arg in args:
+            key, sep, value = arg.partition("=")
+            if sep and key.lower() in {"model", "effort", "reasoning_effort"}:
+                named["model" if key.lower() == "model" else "effort"] = value
+            else:
+                positional.append(arg)
+        model_value = named.get("model")
+        effort_value = named.get("effort")
+        if model_value is None and positional:
+            first = positional[0].strip()
+            if first.lower() not in effort_values:
+                model_value = first
+            else:
+                effort_value = effort_value or first.lower()
+        if effort_value is None:
+            effort_value = next((value.lower() for value in positional[1:] if value.lower() in effort_values), None)
+        updates: dict[str, str] = {}
+        if model_value is not None:
+            updates["model"] = normalize_model_command_value(model_value)
+        if effort_value is not None:
+            updates["reasoning_effort"] = "" if effort_value.lower() in default_values else effort_value.lower()
+        if not updates:
+            raise HTTPException(400, "用法：/model [model=<id>|default] [effort=<minimal|low|medium|high|xhigh|ultra>|default]")
         sets = ",".join(f"{key}=?" for key in updates)
         db.execute(f"UPDATE tasks SET {sets},updated_at=? WHERE id=?", tuple(updates.values()) + (now(), task["id"]))
-        return result_message(command, f"下一条 turn 使用模型 `{model or '默认'}`{f'，effort `{effort}`' if effort else ''}。", task=task_or_404(task["id"]))
+        if "model" in updates:
+            persist_native_thread_model(task.get("codex_session_id") or task["id"], str(updates.get("model") or ""))
+        updated_task = task_or_404(task["id"])
+        model_text = updated_task.get("model") or "默认"
+        effort_text = updated_task.get("reasoning_effort") or "默认"
+        return result_message(command, f"下一条 turn 使用模型 `{model_text}`，effort `{effort_text}`。", task=updated_task)
 
     if command == "fast":
         enabled = not bool(task.get("service_tier")) if not args else args[0].lower() in {"on", "true", "1", "fast", "priority"}

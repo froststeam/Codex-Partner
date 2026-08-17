@@ -39,8 +39,6 @@ codex-partner
 ```bash
 git clone https://github.com/froststeam/Codex-Partner.git
 cd Codex-Partner
-python3 -m venv .venv
-. .venv/bin/activate
 pip install .
 cp .env.example .env
 codex-partner

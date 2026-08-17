@@ -131,6 +131,29 @@ function normalizeModelItems(raw) {
   }).filter(item => item.id);
   return [...new Map(items.map(item => [item.id, item])).values()];
 }
+function encodeModelCommandValue(value) {
+  const text = String(value || "").trim();
+  if (!text) return "default";
+  return text;
+}
+async function applyModelCommand(task, updates) {
+  const parts = [];
+  if (Object.prototype.hasOwnProperty.call(updates, "model")) parts.push(`model=${encodeModelCommandValue(updates.model)}`);
+  if (Object.prototype.hasOwnProperty.call(updates, "reasoning_effort")) parts.push(`effort=${encodeModelCommandValue(updates.reasoning_effort)}`);
+  if (!parts.length) throw new Error("没有可执行的模型更新");
+  const clientMessageId = crypto.randomUUID ? crypto.randomUUID() : String(Date.now());
+  const result = await api(`/tasks/${encodeURIComponent(task.id)}/commands`, {
+    method: "POST",
+    body: JSON.stringify({ command: `/model ${parts.join(" ")}`, client_message_id: clientMessageId }),
+  });
+  if (!result?.ok) throw new Error(result?.message || "模型切换失败");
+  if (result.task) {
+    state.selectedTask = { ...state.selectedTask, ...result.task };
+    mergeTask(result.task);
+    renderConversation();
+  }
+  return result;
+}
 function selectedModelInputModalities() {
   const task = state.selectedTask;
   if (!task) return ["text", "image"];
@@ -174,8 +197,7 @@ function renderComposerModelSelect(task, models = []) {
       if (model === previous) return;
       select.disabled = true;
       try {
-        const updated = await api(`/tasks/${encodeURIComponent(activeTask.id)}`, { method: "PATCH", body: JSON.stringify({ model }) });
-        state.selectedTask = { ...state.selectedTask, ...updated }; mergeTask(updated); renderConversation();
+        await applyModelCommand(activeTask, { model });
         toast(model ? `已切换模型：${model}` : "已恢复 Provider 默认模型");
       } catch (error) { select.value = previous; toast(`模型切换失败：${error.message}`); }
       finally { select.disabled = false; }
@@ -201,8 +223,7 @@ function renderComposerEffortSelect(task, value = "") {
     if (reasoning_effort === current) return;
     select.disabled = true;
     try {
-      const updated = await api(`/tasks/${encodeURIComponent(task.id)}`, { method: "PATCH", body: JSON.stringify({ reasoning_effort }) });
-      state.selectedTask = { ...state.selectedTask, ...updated }; mergeTask(updated); renderConversation();
+      await applyModelCommand(task, { reasoning_effort });
       toast(reasoning_effort ? `思考程度：${select.options[select.selectedIndex]?.text || reasoning_effort}` : "已恢复 Provider 默认思考程度");
     } catch (error) { select.value = current; toast(`思考程度切换失败：${error.message}`); }
     finally { select.disabled = false; }
@@ -810,7 +831,7 @@ async function submitSlashCommand(raw) {
   if (result.requires_confirmation && await appConfirm(uiLabel("destructiveCommandConfirm", { command: raw.split(/\s+/)[0] }), { danger: true })) result = await api(`/tasks/${state.selectedId}/commands`, { method: "POST", body: JSON.stringify({ command: raw, confirmed: true, client_message_id: `${clientMessageId}-confirmed` }) });
   if (!result.ok) toast(result.message || "命令执行失败");
   await applyCommandAction(result);
-  if (result.ok && !["new_conversation", "select_task", "clear_selection", "disconnect", "open_panel", "open_inspector", "attach_text", "focus_composer"].includes(result.ui_action)) await refresh(false);
+  if (state.selectedId) await refreshSelectedConversation(state.selectedId);
   return result;
 }
 function connectOverviewSocket() {

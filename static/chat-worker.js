@@ -45,37 +45,28 @@ function isAssistant(event) {
 
 function mergeEvents(events, messages) {
   const visible = (messages || []).filter(message => ["running", "steering", "steered", "sent"].includes(message.status));
-  const deliveryCounts = new Map();
-  for (const message of visible) {
-    const body = String(message.body || "").trim();
-    if (body) deliveryCounts.set(body, (deliveryCounts.get(body) || 0) + 1);
-  }
   const merged = [];
+  const seenUserKeys = new Set();
+  const seenUserBodies = new Map();
   for (const event of events || []) {
     const payload = valueOf(event.payload);
     if (payload?.type === "userMessage") {
       const body = eventText(payload, {}).trim();
-      if (deliveryCounts.has(body)) {
-        const remaining = deliveryCounts.get(body) || 0;
-        if (remaining <= 0) continue;
-        deliveryCounts.set(body, remaining - 1);
-      }
+      const key = String(payload.item_id || payload.client_message_id || body || "").trim();
+      if (key && seenUserKeys.has(key)) continue;
+      if (key) seenUserKeys.add(key);
+      if (body) seenUserBodies.set(body, (seenUserBodies.get(body) || 0) + 1);
     }
     merged.push(event);
   }
-  const nativeCounts = new Map();
-  // Native thread history often omits client_message_id, so body order is the
-  // stable fallback for suppressing a duplicated durable browser message.
-  for (const event of merged) {
-    const payload = valueOf(event.payload);
-    if (payload?.type !== "userMessage") continue;
-    const body = eventText(payload, {}).trim();
-    if (body) nativeCounts.set(body, (nativeCounts.get(body) || 0) + 1);
-  }
   for (const message of visible) {
+    const id = String(message.id || "").trim();
     const body = String(message.body || "").trim();
-    if (body && (nativeCounts.get(body) || 0) > 0) {
-      nativeCounts.set(body, nativeCounts.get(body) - 1);
+    if (id && seenUserKeys.has(id)) {
+      continue;
+    }
+    if (body && (seenUserBodies.get(body) || 0) > 0) {
+      seenUserBodies.set(body, (seenUserBodies.get(body) || 0) - 1);
       continue;
     }
     merged.push({

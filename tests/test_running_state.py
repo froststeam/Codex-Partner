@@ -5,7 +5,9 @@ import io
 import json
 import os
 import re
+import sqlite3
 import sys
+import subprocess
 import tempfile
 import time
 import unittest
@@ -103,6 +105,68 @@ class RunningStateTests(unittest.TestCase):
         self.assertEqual(1, len(lines))
         self.assertEqual(2 * 1024 * 1024, len(json.loads(lines[0])["result"]["text"]))
 
+    def test_native_sync_preserves_dashboard_model_override(self):
+        task_id = f"native-model-{time.time_ns()}"
+        thread_id = f"thread-{time.time_ns()}"
+        stamp = self.app.now()
+        workspace = self.app.create_session_workspace(task_id)
+        state_db = Path(self.app.CODEX_HOME) / "state_5.sqlite"
+        state_db.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(state_db) as conn:
+            conn.execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, approval_mode TEXT, sandbox_policy TEXT, model TEXT, model_provider TEXT, archived INTEGER, memory_mode TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO threads (id,approval_mode,sandbox_policy,model,model_provider,archived,memory_mode) VALUES (?,?,?,?,?,?,?)",
+                (thread_id, "never", "danger-full-access", "gpt-5.5", "native-provider", 0, "enabled"),
+            )
+            conn.commit()
+        self.app.db.execute(
+            "INSERT INTO tasks (id,name,prompt,workspace,status,yolo,provider_id,model,codex_session_id,created_at,updated_at,native) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (task_id, task_id, "prompt", str(workspace), "available", 1, "dashboard-provider", "gpt-5.6", thread_id, stamp, stamp, 1),
+        )
+
+        class Client:
+            async def request(self, method, params):
+                if method == "thread/list":
+                    return {
+                        "data": [{
+                            "id": thread_id,
+                            "name": "Native thread",
+                            "firstUserMessage": "prompt",
+                            "cwd": str(workspace),
+                            "model": "gpt-5.5",
+                            "modelProvider": "native-provider",
+                            "createdAt": stamp,
+                            "updatedAt": stamp,
+                        }],
+                        "nextCursor": None,
+                    }
+                raise AssertionError(method)
+
+        with mock.patch.object(self.app, "USE_APP_SERVER", True), \
+             mock.patch.object(self.app, "sync_native_providers", return_value={"available": True}), \
+             mock.patch.object(self.app, "appserver_for", new=mock.AsyncMock(return_value=Client())), \
+             mock.patch.object(self.app, "native_goal_rows", return_value={}), \
+             mock.patch.object(self.app, "native_thread_settings", return_value={}):
+            asyncio.run(self.app.sync_native_threads())
+
+        task = self.app.task_or_404(thread_id)
+        self.assertFalse(self.app.db.one("SELECT id FROM tasks WHERE id=?", (task_id,)))
+        self.assertEqual(thread_id, task["id"])
+        self.assertEqual(thread_id, task["codex_session_id"])
+        self.assertEqual(thread_id, Path(task["workspace"]).name)
+        self.assertEqual("gpt-5.6", task["model"])
+        self.assertEqual("dashboard-provider", task["provider_id"])
+        with sqlite3.connect(state_db) as conn:
+            row = conn.execute("SELECT model FROM threads WHERE id=?", (thread_id,)).fetchone()
+        self.assertEqual("gpt-5.6", row[0])
+        session = self.app.db.one("SELECT id,task_id,codex_session_id FROM sessions WHERE task_id=?", (thread_id,))
+        self.assertEqual(thread_id, session["id"])
+        self.assertEqual(thread_id, session["task_id"])
+        self.assertEqual(thread_id, session["codex_session_id"])
+
     def test_appserver_turn_inputs_preserve_native_modalities_and_workspace_boundary(self):
         workspace = Path(self.temp.name) / "input-workspace"
         workspace.mkdir(exist_ok=True)
@@ -139,6 +203,13 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn("inputModalities", conversation)
         self.assertIn("localImage|localAudio|mention", worker)
         self.assertIn('mediaKind === "audio"', conversation)
+
+    def test_slash_commands_refresh_selected_conversation(self):
+        conversation = (Path(__file__).resolve().parents[1] / "static" / "conversation.js").read_text(encoding="utf-8")
+        core = (Path(__file__).resolve().parents[1] / "static" / "core.js").read_text(encoding="utf-8")
+        self.assertIn("if (state.selectedId) await refreshSelectedConversation(state.selectedId);", conversation)
+        self.assertIn("if (task.id && task.id !== id)", core)
+        self.assertIn("localStorage.setItem(\"codex-dashboard-session\", task.id)", core)
 
     def test_controlled_appserver_approval_waits_for_browser_choice(self):
         task_id, thread_id, server_key = "controlled-approval", "approval-thread", "approval-server"
@@ -451,6 +522,118 @@ class RunningStateTests(unittest.TestCase):
         payload = {"type": "agentMessage", "text": "same reply", "item_id": "agent-1"}
         self.assertFalse(self.app.duplicate_live_event(task_id, payload))
         self.assertTrue(self.app.duplicate_live_event(task_id, payload))
+
+    def test_user_message_started_event_is_ignored_and_worker_collapses_duplicates(self):
+        task_id = "image-dedupe-thread"
+        thread_id = "thread-image-dedupe"
+        session_id = "session-image-dedupe"
+        server_key = "server-image-dedupe"
+        turn_id = "turn-image-dedupe"
+        message_id = "message-image-dedupe"
+        self.make_task(task_id)
+        self.app.db.execute(
+            "INSERT INTO sessions (id,task_id,status,attempt,command,started_at) VALUES (?,?,?,?,?,?)",
+            (session_id, task_id, "running", 1, "codex app-server", self.app.now()),
+        )
+        self.app.app_thread_bindings[task_id] = (server_key, thread_id, session_id)
+
+        async def capture(_task_id, _payload):
+            return None
+
+        started = {
+            "method": "item/started",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "item": {
+                    "type": "userMessage",
+                    "id": "item-user-1",
+                    "clientId": message_id,
+                    "content": [{"type": "text", "text": "look at this"}],
+                },
+            },
+        }
+        completed = {
+            "method": "item/completed",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "item": {
+                    "type": "userMessage",
+                    "id": "item-user-1",
+                    "clientId": message_id,
+                    "content": [{"type": "text", "text": "look at this"}],
+                },
+            },
+        }
+
+        try:
+            with mock.patch.object(self.app, "duplicate_live_event", return_value=False), \
+                 mock.patch.object(self.app, "broadcast_task", new=mock.AsyncMock(side_effect=capture)):
+                asyncio.run(self.app.handle_appserver_notification(server_key, started))
+                asyncio.run(self.app.handle_appserver_notification(server_key, completed))
+            rows = self.app.db.all("SELECT payload FROM events WHERE session_id=? ORDER BY id", (session_id,))
+            self.assertEqual(1, len(rows))
+            self.assertEqual("userMessage", json.loads(rows[0]["payload"])["type"])
+
+            script = f"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync({json.dumps(str(Path(__file__).resolve().parents[1] / "static/chat-worker.js"))}, "utf8");
+const context = {{ self: {{ postMessage() {{}} }} }};
+vm.createContext(context);
+vm.runInContext(source, context);
+const mergeEvents = context.mergeEvents || context.self.mergeEvents;
+if (!mergeEvents) throw new Error("mergeEvents missing");
+const merged = mergeEvents(
+  [
+    {{ id: "event-1", stream: "app-server", payload: JSON.stringify({{ type: "userMessage", text: "look at this", item_id: "item-user-1", client_message_id: "{message_id}" }}) }},
+    {{ id: "event-2", stream: "app-server", payload: JSON.stringify({{ type: "userMessage", text: "look at this", item_id: "item-user-1", client_message_id: "{message_id}" }}) }}
+  ],
+  [
+    {{ id: "{message_id}", body: "look at this", status: "sent", created_at: "2026-08-17T00:00:00Z" }}
+  ]
+);
+process.stdout.write(JSON.stringify(merged.map(item => JSON.parse(item.payload).type)));
+"""
+            result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+            self.assertEqual(["userMessage"], json.loads(result.stdout))
+        finally:
+            self.app.app_thread_bindings.pop(task_id, None)
+            self.app.db.execute("DELETE FROM events WHERE session_id=?", (session_id,))
+            self.app.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_model_slash_command_supports_named_updates_and_defaults(self):
+        task_id = "model-command-thread"
+        self.make_task(task_id)
+        self.app.db.execute("UPDATE tasks SET model='gpt-5.5', reasoning_effort='low' WHERE id=?", (task_id,))
+
+        class Client:
+            async def request(self, method, params):
+                raise AssertionError(method)
+
+        async def run(command):
+            with mock.patch.object(self.app, "appserver_for_task", new=mock.AsyncMock(return_value=(Client(), None))):
+                return await self.app.execute_slash_command(self.app.task_or_404(task_id), "model", "", command, False)
+
+        result = asyncio.run(run(["model=gpt-5.6", "effort=high"]))
+        self.assertTrue(result["ok"])
+        task = self.app.task_or_404(task_id)
+        self.assertEqual("gpt-5.6", task["model"])
+        self.assertEqual("high", task["reasoning_effort"])
+
+        result = asyncio.run(run(["effort=default"]))
+        self.assertTrue(result["ok"])
+        task = self.app.task_or_404(task_id)
+        self.assertEqual("gpt-5.6", task["model"])
+        self.assertEqual("", task["reasoning_effort"])
+
+        result = asyncio.run(run(["model=default"]))
+        self.assertTrue(result["ok"])
+        task = self.app.task_or_404(task_id)
+        self.assertEqual("", task["model"])
+        self.assertEqual("", task["reasoning_effort"])
 
     def test_streaming_deltas_are_never_collapsed(self):
         task_id = "delta-thread"
@@ -1254,9 +1437,9 @@ class RunningStateTests(unittest.TestCase):
         worker_js = (static / "chat-worker.js").read_text(encoding="utf-8")
         self.assertIn("numeric < 1e12 ? numeric * 1000 : numeric", worker_js)
         self.assertIn("timestamp(a.event) - timestamp(b.event) || a.index - b.index", worker_js)
-        self.assertIn("Native thread history often omits client_message_id", worker_js)
-        self.assertIn("nativeCounts.get(body)", worker_js)
-        self.assertIn("duplicated durable browser message", worker_js)
+        self.assertIn("payload.item_id || payload.client_message_id", worker_js)
+        self.assertIn("seenUserKeys.has(id)", worker_js)
+        self.assertIn("seenUserBodies.get(body)", worker_js)
         self.assertNotIn('id="turn-progress-title"', html)
         self.assertNotIn('id="turn-progress-detail"', html)
         self.assertNotIn('id="turn-progress-elapsed"', html)
@@ -1335,6 +1518,9 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn('id="composer-context-usage"', html)
         self.assertIn("calculateContextUsage", (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('payload.method !== "thread/tokenUsage/updated"', (static / "core.js").read_text(encoding="utf-8"))
+        self.assertIn('/tasks/${encodeURIComponent(task.id)}/commands', conversation_js)
+        self.assertIn('command: `/model ${parts.join(" ")}`', conversation_js)
+        self.assertIn('result?.ok', conversation_js)
         self.assertIn('class="composer-meta-tools"', html)
         self.assertIn('id="attach-button"', html)
         self.assertIn('new TextDecoder("utf-8", { fatal: true })', app_js)
