@@ -1825,7 +1825,7 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
         self.assertIn("new File([file]", app_js)
         self.assertIn('uiLabel("binaryAttachment"', app_js)
         self.assertIn('/app.js?v=20260817-queue-dispatch', html)
-        self.assertIn('/core.js?v=20260817-session-switch', html)
+        self.assertIn('/core.js?v=20260817-session-sort', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
         self.assertIn("/timeline?limit=160", conversation_js)
@@ -2012,6 +2012,11 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
         self.assertNotIn('if (mode === "codex" && activeTurn)', app_js)
         self.assertIn("data-queue-dispatch", conversation_js)
         self.assertIn("queued-error", conversation_js)
+        core_js = (static / "core.js").read_text(encoding="utf-8")
+        self.assertIn("function taskIsRunningGroup", core_js)
+        self.assertIn('["running", "retrying", "queued"].includes', core_js)
+        self.assertIn("taskSortName(a).localeCompare", core_js)
+        self.assertIn("taskSortTime(b).localeCompare(taskSortTime(a))", core_js)
 
     def test_topbar_documents_non_conflicting_session_shortcuts(self):
         static = Path(__file__).resolve().parents[1] / "static"

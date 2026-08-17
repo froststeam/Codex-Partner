@@ -950,7 +950,19 @@ async function reconcileSelectedTaskStatus() {
 function isUserEvent(event) { const payload = eventValue(event.payload); return payload?.type === "userMessage" || payload?.type === "browserMessage" || payload?.type === "slashCommand" || event.stream === "user"; }
 function isAssistantEvent(event) { const payload = eventValue(event.payload); return payload?.type === "agentMessage" || payload?.type === "agent_delta" || payload?.type === "commandResult" || event.stream === "assistant"; }
 function taskMatches(task) { if (state.filter === "running" && !["running", "retrying", "queued"].includes(task.status)) return false; if (state.filter !== "all" && state.filter !== "running" && task.status !== state.filter) return false; if (!state.query) return true; const haystack = `${task.name} ${task.prompt} ${task.goal} ${task.workspace}`.toLowerCase(); return haystack.includes(state.query.toLowerCase()); }
-function sortTasks(tasks) { return [...tasks].sort((a, b) => String(b.updated_at || b.created_at || "").localeCompare(String(a.updated_at || a.created_at || "")) || String(b.id || "").localeCompare(String(a.id || ""))); }
+function taskIsRunningGroup(task) { return ["running", "retrying", "queued"].includes(task?.status); }
+function taskSortName(task) { return String(task?.name || task?.prompt || task?.id || "").trim().toLocaleLowerCase() || String(task?.id || ""); }
+function taskSortTime(task) { return String(task?.updated_at || task?.created_at || ""); }
+function sortTasks(tasks) {
+  return [...tasks].sort((a, b) => {
+    const activeDelta = Number(taskIsRunningGroup(b)) - Number(taskIsRunningGroup(a));
+    if (activeDelta) return activeDelta;
+    if (taskIsRunningGroup(a) && taskIsRunningGroup(b)) {
+      return taskSortName(a).localeCompare(taskSortName(b), undefined, { numeric: true, sensitivity: "base" }) || String(a.id || "").localeCompare(String(b.id || ""));
+    }
+    return taskSortTime(b).localeCompare(taskSortTime(a)) || String(b.id || "").localeCompare(String(a.id || ""));
+  });
+}
 function mergeTask(task) {
   const index = state.tasks.findIndex(item => item.id === task.id);
   if (index < 0) state.tasks = [task, ...state.tasks];
