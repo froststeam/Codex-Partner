@@ -557,6 +557,50 @@ class RunningStateTests(unittest.TestCase):
             self.app.running.pop(task_id, None)
             self.app.appserver_turn_ids.pop(task_id, None)
 
+    def test_persisted_dashboard_turn_is_not_listed_as_external_session(self):
+        task_id = "persisted-dashboard-thread"
+        dashboard_session = "persisted-dashboard-session"
+        stale_session = "persisted-dashboard-stale-session"
+        external_session = f"external:{task_id}:turn-dashboard-persisted"
+        turn_id = "turn-dashboard-persisted"
+        stamp = self.app.now()
+        self.make_task(task_id, "running")
+        try:
+            self.app.db.execute(
+                "INSERT INTO sessions (id,task_id,status,attempt,command,started_at,codex_session_id) VALUES (?,?,?,?,?,?,?)",
+                (dashboard_session, task_id, "succeeded", 2, "codex app-server", stamp, task_id),
+            )
+            self.app.db.execute(
+                "INSERT INTO sessions (id,task_id,status,attempt,command,started_at,codex_session_id,summary) VALUES (?,?,?,?,?,?,?,?)",
+                (stale_session, task_id, "interrupted", 1, "codex app-server", stamp, task_id, "Dashboard is restarting"),
+            )
+            self.app.db.execute(
+                "INSERT INTO events (session_id,task_id,ts,stream,payload) VALUES (?,?,?,?,?)",
+                (dashboard_session, task_id, stamp, "app-server", json.dumps({"type": "userMessage", "turn_id": turn_id, "text": "hello"})),
+            )
+            record = {
+                "timestamp": stamp,
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": turn_id},
+            }
+            with mock.patch.object(self.app, "native_rollout_writer_pids", return_value=set()):
+                asyncio.run(self.app.apply_external_turn_boundary(task_id, task_id, record, path="/tmp/dashboard-persisted-rollout"))
+            self.assertIsNone(self.app.db.one("SELECT id FROM sessions WHERE id=?", (external_session,)))
+            self.assertTrue(self.app.has_persisted_dashboard_turn(task_id, turn_id))
+            self.app.db.execute(
+                "INSERT INTO sessions (id,task_id,status,attempt,command,started_at,codex_session_id) VALUES (?,?,?,?,?,?,?)",
+                (external_session, task_id, "running", 0, "codex resume", stamp, task_id),
+            )
+            session_ids = {row["id"] for row in asyncio.run(self.app.list_sessions())}
+            self.assertIn(dashboard_session, session_ids)
+            self.assertNotIn(stale_session, session_ids)
+            self.assertNotIn(external_session, session_ids)
+        finally:
+            self.app.clear_external_turns(task_id)
+            self.app.db.execute("DELETE FROM events WHERE task_id=?", (task_id,))
+            self.app.db.execute("DELETE FROM sessions WHERE task_id=?", (task_id,))
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
     def test_duplicate_message_from_two_transports_is_collapsed(self):
         task_id = "dedupe-thread"
         payload = {"type": "agentMessage", "text": "same reply", "item_id": "agent-1"}
@@ -628,7 +672,8 @@ if (!mergeEvents) throw new Error("mergeEvents missing");
 const merged = mergeEvents(
   [
     {{ id: "event-1", stream: "app-server", payload: JSON.stringify({{ type: "userMessage", text: "look at this", item_id: "item-user-1", client_message_id: "{message_id}" }}) }},
-    {{ id: "event-2", stream: "app-server", payload: JSON.stringify({{ type: "userMessage", text: "look at this", item_id: "item-user-1", client_message_id: "{message_id}" }}) }}
+    {{ id: "event-2", stream: "app-server", payload: JSON.stringify({{ type: "userMessage", text: "look at this", item_id: "item-user-2", client_message_id: "{message_id}" }}) }},
+    {{ id: "event-3", stream: "rollout", payload: JSON.stringify({{ type: "userMessage", text: "look at this\\n<image name=[Image #1] path=\\"/tmp/image.png\\">\\n</image>", item_id: "item-user-3" }}) }}
   ],
   [
     {{ id: "{message_id}", body: "look at this", status: "sent", created_at: "2026-08-17T00:00:00Z" }}
@@ -1483,6 +1528,7 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
         self.make_task(task_id, "available")
         stamp = self.app.now()
         message_ids = []
+        delivered_id = "restart-running-delivered"
         try:
             for status in ("running", "dispatching", "steering"):
                 message_id = f"restart-{status}"
@@ -1491,6 +1537,25 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
                     "INSERT INTO task_messages (id,task_id,body,status,created_at,started_at,session_id,error) VALUES (?,?,?,?,?,?,?,?)",
                     (message_id, task_id, status, status, stamp, stamp, f"session-{status}", "old error"),
                 )
+            message_ids.append(delivered_id)
+            self.app.db.execute(
+                "INSERT INTO sessions (id,task_id,status,attempt,command,started_at) VALUES (?,?,?,?,?,?)",
+                ("restart-delivered-session", task_id, "running", 1, "codex app-server", stamp),
+            )
+            self.app.db.execute(
+                "INSERT INTO task_messages (id,task_id,body,status,created_at,started_at,session_id,error) VALUES (?,?,?,?,?,?,?,?)",
+                (delivered_id, task_id, "delivered", "running", stamp, stamp, "restart-delivered-session", "old error"),
+            )
+            self.app.db.execute(
+                "INSERT INTO events (session_id,task_id,ts,stream,payload) VALUES (?,?,?,?,?)",
+                (
+                    "restart-delivered-session",
+                    task_id,
+                    stamp,
+                    "app-server",
+                    json.dumps({"type": "userMessage", "text": "delivered", "client_message_id": delivered_id}),
+                ),
+            )
             with self.app.db.lock, self.app.db.connect() as connection:
                 self.app.db._recover_interrupted_work(connection)
                 connection.commit()
@@ -1498,14 +1563,51 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
                 f"SELECT id,status,started_at,finished_at,session_id,error FROM task_messages WHERE id IN ({','.join('?' for _ in message_ids)})",
                 tuple(message_ids),
             )
-            self.assertEqual({"queued"}, {row["status"] for row in rows})
-            self.assertEqual({None}, {row["started_at"] for row in rows})
-            self.assertEqual({None}, {row["finished_at"] for row in rows})
-            self.assertEqual({None}, {row["session_id"] for row in rows})
-            self.assertEqual({"Dashboard restarted before delivery"}, {row["error"] for row in rows})
+            by_id = {row["id"]: row for row in rows}
+            self.assertEqual("sent", by_id[delivered_id]["status"])
+            self.assertEqual("", by_id[delivered_id]["error"])
+            self.assertIsNotNone(by_id[delivered_id]["finished_at"])
+            queued = [row for row in rows if row["id"] != delivered_id]
+            self.assertEqual({"queued"}, {row["status"] for row in queued})
+            self.assertEqual({None}, {row["started_at"] for row in queued})
+            self.assertEqual({None}, {row["finished_at"] for row in queued})
+            self.assertEqual({None}, {row["session_id"] for row in queued})
+            self.assertEqual({"Dashboard restarted before delivery"}, {row["error"] for row in queued})
         finally:
             for message_id in message_ids:
                 self.app.db.execute("DELETE FROM task_messages WHERE id=?", (message_id,))
+            self.app.db.execute("DELETE FROM events WHERE session_id='restart-delivered-session'")
+            self.app.db.execute("DELETE FROM sessions WHERE id='restart-delivered-session'")
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_startup_reconcile_marks_delivered_messages_sent(self):
+        task_id = "startup-delivered-message"
+        session_id = "startup-delivered-session"
+        message_id = "startup-delivered-id"
+        stamp = self.app.now()
+        self.make_task(task_id, "available")
+        try:
+            self.app.db.execute(
+                "INSERT INTO sessions (id,task_id,status,attempt,command,started_at) VALUES (?,?,?,?,?,?)",
+                (session_id, task_id, "interrupted", 1, "codex app-server", stamp),
+            )
+            self.app.db.execute(
+                "INSERT INTO task_messages (id,task_id,body,status,created_at,error) VALUES (?,?,?,?,?,?)",
+                (message_id, task_id, "already sent", "queued", stamp, "Dashboard restarted before delivery"),
+            )
+            self.app.db.execute(
+                "INSERT INTO events (session_id,task_id,ts,stream,payload) VALUES (?,?,?,?,?)",
+                (session_id, task_id, stamp, "app-server", json.dumps({"type": "userMessage", "client_message_id": message_id, "text": "already sent"})),
+            )
+            self.app.reconcile_delivered_task_messages()
+            row = self.app.db.one("SELECT status,error,finished_at FROM task_messages WHERE id=?", (message_id,))
+            self.assertEqual("sent", row["status"])
+            self.assertEqual("", row["error"])
+            self.assertIsNotNone(row["finished_at"])
+        finally:
+            self.app.db.execute("DELETE FROM task_messages WHERE id=?", (message_id,))
+            self.app.db.execute("DELETE FROM events WHERE session_id=?", (session_id,))
+            self.app.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
     def test_port_configuration_rejects_invalid_values(self):
@@ -1563,7 +1665,7 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
         worker_js = (static / "chat-worker.js").read_text(encoding="utf-8")
         self.assertIn("numeric < 1e12 ? numeric * 1000 : numeric", worker_js)
         self.assertIn("timestamp(a.event) - timestamp(b.event) || a.index - b.index", worker_js)
-        self.assertIn("payload.item_id || payload.client_message_id", worker_js)
+        self.assertIn("payload.client_message_id || body || payload.item_id", worker_js)
         self.assertIn("seenUserKeys.has(id)", worker_js)
         self.assertIn("seenUserBodies.get(body)", worker_js)
         self.assertNotIn('id="turn-progress-title"', html)
@@ -1876,7 +1978,7 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
         self.assertIn(".session-card.selected::before", styles)
         self.assertNotIn("renderSessionList(); renderConversation(); await loadWorkspace(\"\")", conversation_js)
         self.assertIn(".queued-messages { width: auto; height: auto; min-height: 0; max-height: none; align-self: stretch;", styles)
-        self.assertIn('/chat-worker.js?v=20260816-structured-inputs', conversation_js)
+        self.assertIn('/chat-worker.js?v=20260817-message-dedupe', conversation_js)
         self.assertIn("scroll-behavior: auto", styles)
         self.assertIn("grid-template-columns: auto minmax(0, 1fr) auto", styles)
         self.assertIn(".shortcut-hints { position: absolute; left: 50%", styles)

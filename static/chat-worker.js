@@ -48,6 +48,16 @@ function isAssistant(event) {
   return ["agentMessage", "agent_delta", "commandResult"].includes(payload?.type) || event.stream === "assistant";
 }
 
+function userDedupeBody(text) {
+  return String(text || "")
+    .replace(/<image\b[^>]*>[\s\S]*?<\/image>/gi, "")
+    .replace(/<audio\b[^>]*>[\s\S]*?<\/audio>/gi, "")
+    .replace(/<video\b[^>]*>[\s\S]*?<\/video>/gi, "")
+    .replace(/\[\[codex-input:[^\]]+\]\]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function mergeEvents(events, messages) {
   const visible = (messages || []).filter(message => ["running", "steering", "steered", "sent"].includes(message.status));
   const merged = [];
@@ -56,8 +66,9 @@ function mergeEvents(events, messages) {
   for (const event of events || []) {
     const payload = valueOf(event.payload);
     if (payload?.type === "userMessage") {
-      const body = eventText(payload, {}).trim();
-      const key = String(payload.item_id || payload.client_message_id || body || "").trim();
+      const body = userDedupeBody(eventText(payload, {}));
+      if (body && (seenUserBodies.get(body) || 0) > 0) continue;
+      const key = String(payload.client_message_id || body || payload.item_id || "").trim();
       if (key && seenUserKeys.has(key)) continue;
       if (key) seenUserKeys.add(key);
       if (body) seenUserBodies.set(body, (seenUserBodies.get(body) || 0) + 1);
@@ -66,7 +77,7 @@ function mergeEvents(events, messages) {
   }
   for (const message of visible) {
     const id = String(message.id || "").trim();
-    const body = String(message.body || "").trim();
+    const body = userDedupeBody(message.body || "");
     if (id && seenUserKeys.has(id)) {
       continue;
     }
@@ -129,7 +140,7 @@ function buildBlocks(events, rawActivity, labels) {
       group.items.push(text); current = null; continue;
     }
     const commandBlock = ["slashCommand", "commandResult"].includes(payload?.type);
-    const itemId = payload?.item_id || "";
+    const itemId = role === "user" ? (payload?.client_message_id || payload?.item_id || "") : (payload?.item_id || "");
     const itemMap = role === "assistant" ? assistantItems : userItems;
     if (itemId && itemMap.has(itemId)) {
       current = itemMap.get(itemId);

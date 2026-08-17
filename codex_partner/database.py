@@ -178,6 +178,16 @@ class Database:
             (stamp,),
         )
         connection.execute(
+            "UPDATE task_messages SET status=CASE WHEN status='steering' THEN 'steered' ELSE 'sent' END, "
+            "finished_at=COALESCE(finished_at, ?), error='' "
+            "WHERE status IN ('running','dispatching','steering') AND EXISTS ("
+            "SELECT 1 FROM events e WHERE e.task_id=task_messages.task_id "
+            "AND json_extract(e.payload, '$.client_message_id')=task_messages.id "
+            "AND json_extract(e.payload, '$.type') IN ('userMessage','browserMessage','slashCommand')"
+            ")",
+            (stamp,),
+        )
+        connection.execute(
             "UPDATE task_messages SET status='queued', started_at=NULL, session_id=NULL, "
             "finished_at=NULL, error='Dashboard restarted before delivery' "
             "WHERE status IN ('running','dispatching','steering')"

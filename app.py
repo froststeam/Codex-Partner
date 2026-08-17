@@ -441,6 +441,20 @@ def reconcile_task_session_ids() -> None:
         canonicalize_task_thread_id(task_id, thread_id)
 
 
+def reconcile_delivered_task_messages() -> None:
+    stamp = now()
+    db.execute(
+        "UPDATE task_messages SET status=CASE WHEN status='steering' THEN 'steered' ELSE 'sent' END, "
+        "finished_at=COALESCE(finished_at, ?), error='' "
+        "WHERE status IN ('queued','running','dispatching','steering') AND EXISTS ("
+        "SELECT 1 FROM events e WHERE e.task_id=task_messages.task_id "
+        "AND json_extract(e.payload, '$.client_message_id')=task_messages.id "
+        "AND json_extract(e.payload, '$.type') IN ('userMessage','browserMessage','slashCommand')"
+        ")",
+        (stamp,),
+    )
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global app_shutting_down
@@ -455,6 +469,7 @@ async def lifespan(_: FastAPI):
         pass
     try:
         await refresh_native_rollouts()
+        reconcile_delivered_task_messages()
         observer_task = asyncio.create_task(native_rollout_watch_loop())
     except Exception:
         # Rollout observation augments native Codex sessions. A malformed or
@@ -957,6 +972,23 @@ def dashboard_owns_task(task_id: str) -> bool:
     return task_id in running or bool(turn_task and not turn_task.done())
 
 
+def has_persisted_dashboard_turn(task_id: str, turn_id: str) -> bool:
+    if not turn_id:
+        return False
+    row = db.one(
+        "SELECT 1 FROM events WHERE task_id=? AND stream='app-server' "
+        "AND json_extract(payload, '$.turn_id')=? LIMIT 1",
+        (task_id, turn_id),
+    )
+    return bool(row)
+
+
+def external_session_turn_id(session_id: str) -> str:
+    if not session_id.startswith("external:"):
+        return ""
+    return session_id.rsplit(":", 1)[-1]
+
+
 def rollout_stamp(record: dict, field: str = "") -> str:
     payload = record.get("payload") or {}
     if field and payload.get(field) is not None:
@@ -1073,6 +1105,7 @@ async def apply_external_turn_boundary(
         task = task_or_404(task_id)
         dashboard_turn_id = str(appserver_turn_ids.get(task_id) or "")
         persisted_dashboard_turn = task.get("execution_source") == "dashboard" and str(task.get("execution_turn_id") or "") == turn_id
+        persisted_dashboard_turn = persisted_dashboard_turn or has_persisted_dashboard_turn(task_id, turn_id)
         # A terminal and the dashboard can legitimately write the same Codex
         # turn when they attach to one thread. Only suppress a dashboard-only
         # boundary; a non-dashboard writer proves the terminal surface is live.
@@ -4710,7 +4743,46 @@ async def thumbnail_workspace_file(task_id: str, path: str, size: int = 640, _: 
 @app.get("/api/sessions")
 async def list_sessions(limit: int = 100, _: Any = Depends(auth)):
     limit = max(1, min(limit, 500))
-    return db.all("SELECT s.*, t.name task_name, t.workspace FROM sessions s JOIN tasks t ON t.id=s.task_id ORDER BY s.started_at DESC LIMIT ?", (limit,))
+    rows = db.all(
+        "SELECT s.*, t.name task_name, t.workspace FROM sessions s JOIN tasks t ON t.id=s.task_id "
+        "ORDER BY s.started_at DESC LIMIT ?",
+        (limit,),
+    )
+    task_ids = sorted({str(row.get("task_id") or "") for row in rows if row.get("task_id")})
+    dashboard_turns: set[tuple[str, str]] = set()
+    if task_ids:
+        placeholders = ",".join("?" for _ in task_ids)
+        dashboard_turns = {
+            (str(row["task_id"]), str(row["turn_id"]))
+            for row in db.all(
+                "SELECT task_id,json_extract(payload, '$.turn_id') turn_id FROM events "
+                f"WHERE task_id IN ({placeholders}) AND stream='app-server' "
+                "AND COALESCE(json_extract(payload, '$.turn_id'),'')!='' GROUP BY task_id,turn_id",
+                tuple(task_ids),
+            )
+        }
+    superseded_dashboard_threads = {
+        (str(row.get("task_id") or ""), str(row.get("codex_session_id") or ""))
+        for row in rows
+        if not str(row.get("id") or "").startswith("external:")
+        and str(row.get("codex_session_id") or "")
+        and row.get("status") != "interrupted"
+    }
+    filtered = []
+    for row in rows:
+        stale_restart_session = (
+            not str(row.get("id") or "").startswith("external:")
+            and row.get("status") == "interrupted"
+            and (str(row.get("task_id") or ""), str(row.get("codex_session_id") or "")) in superseded_dashboard_threads
+            and str(row.get("summary") or "") in {"Dashboard is restarting", "Dashboard restarted while session was running"}
+        )
+        if stale_restart_session:
+            continue
+        turn_id = external_session_turn_id(str(row.get("id") or ""))
+        if turn_id and (str(row.get("task_id") or ""), turn_id) in dashboard_turns:
+            continue
+        filtered.append(row)
+    return filtered
 
 
 @app.get("/api/memories")
