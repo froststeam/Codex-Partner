@@ -18,11 +18,16 @@ function eventText(raw, labels) {
   const payload = valueOf(raw);
   if (typeof payload === "string") return payload;
   if (!payload || typeof payload !== "object") return String(payload ?? "");
-  if (["userMessage", "browserMessage"].includes(payload.type)) return payload.text || (payload.content || []).map(item => item.text || "").join("\n");
+  if (["userMessage", "browserMessage"].includes(payload.type)) {
+    const text = payload.text || (payload.content || []).map(item => item.text || "").join("\n");
+    if (/^\s*<codex_internal_context\b[^>]*\bsource=["']goal["']/i.test(text)) return "";
+    return text;
+  }
   if (payload.type === "agentMessage") return payload.text || "";
   if (payload.type === "agentMessageStarted") return "";
   if (payload.type === "agent_delta") return payload.delta || "";
   if (payload.type === "reasoning") return payload.text || payload.summary || "";
+  if (payload.type === "goal_updated") return "";
   if (payload.type === "fileChange") return payload.text || labels.fileChanged;
   if (payload.type === "contextCompaction") return labels.contextCompressed;
   if (payload.type === "externalTurnStarted") return labels.terminalTurnStarted;

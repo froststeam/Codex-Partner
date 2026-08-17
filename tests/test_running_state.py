@@ -604,6 +604,62 @@ process.stdout.write(JSON.stringify(merged.map(item => JSON.parse(item.payload).
             self.app.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
+    def test_goal_updated_syncs_objective_and_worker_hides_internal_goal_context(self):
+        task_id = "goal-objective-sync-thread"
+        thread_id = "thread-goal-objective-sync"
+        session_id = "session-goal-objective-sync"
+        server_key = "server-goal-objective-sync"
+        self.make_task(task_id)
+        self.app.db.execute("UPDATE tasks SET goal='old objective', goal_status='active' WHERE id=?", (task_id,))
+        self.app.db.execute(
+            "INSERT INTO sessions (id,task_id,status,attempt,command,started_at) VALUES (?,?,?,?,?,?)",
+            (session_id, task_id, "running", 1, "codex app-server", self.app.now()),
+        )
+        self.app.app_thread_bindings[task_id] = (server_key, thread_id, session_id)
+        notification = {
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": thread_id,
+                "goal": {
+                    "objective": "new objective",
+                    "status": "active",
+                    "tokensUsed": 42,
+                },
+            },
+        }
+        try:
+            with mock.patch.object(self.app, "duplicate_live_event", return_value=False), \
+                 mock.patch.object(self.app, "broadcast_task", new=mock.AsyncMock()):
+                asyncio.run(self.app.handle_appserver_notification(server_key, notification))
+            task = self.app.task_or_404(task_id)
+            self.assertEqual("new objective", task["goal"])
+            self.assertEqual("active", task["goal_status"])
+            self.assertEqual(42, task["goal_tokens_used"])
+
+            script = f"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync({json.dumps(str(Path(__file__).resolve().parents[1] / "static/chat-worker.js"))}, "utf8");
+const context = {{ self: {{ postMessage() {{}} }} }};
+vm.createContext(context);
+vm.runInContext(source, context);
+const buildBlocks = context.buildBlocks || context.self.buildBlocks;
+if (!buildBlocks) throw new Error("buildBlocks missing");
+const blocks = buildBlocks([
+  {{ id: "goal-context", stream: "rollout", payload: JSON.stringify({{ type: "userMessage", text: "<codex_internal_context source=\\"goal\\">\\n<objective>old objective</objective>\\n</codex_internal_context>" }}) }},
+  {{ id: "goal-update", stream: "app-server", payload: JSON.stringify({{ type: "goal_updated", goal: {{ objective: "old objective" }} }}) }},
+  {{ id: "real-user", stream: "app-server", payload: JSON.stringify({{ type: "userMessage", text: "visible user message" }}) }}
+], false, {{}});
+process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
+"""
+            result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+            self.assertEqual(["visible user message"], json.loads(result.stdout))
+        finally:
+            self.app.app_thread_bindings.pop(task_id, None)
+            self.app.db.execute("DELETE FROM events WHERE session_id=?", (session_id,))
+            self.app.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
     def test_model_slash_command_supports_named_updates_and_defaults(self):
         task_id = "model-command-thread"
         self.make_task(task_id)

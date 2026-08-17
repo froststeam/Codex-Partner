@@ -2133,9 +2133,16 @@ async def handle_appserver_notification(server_key: str, message: dict) -> None:
     elif method == "thread/goal/updated":
         goal = params.get("goal") or {}
         payload = {"type": "goal_updated", "goal": goal, "thread_id": thread_id}
+        objective = goal.get("objective")
+        fields = ["goal_status=?", "goal_tokens_used=?", "updated_at=?"]
+        values: list[Any] = [goal.get("status", "active"), goal.get("tokensUsed", 0), now()]
+        if objective is not None:
+            fields.insert(0, "goal=?")
+            values.insert(0, str(objective or ""))
+        values.append(task_id)
         db.execute(
-            "UPDATE tasks SET goal_status=?, goal_tokens_used=?, updated_at=? WHERE id=?",
-            (goal.get("status", "active"), goal.get("tokensUsed", 0), now(), task_id),
+            f"UPDATE tasks SET {','.join(fields)} WHERE id=?",
+            tuple(values),
         )
     elif method == "turn/completed":
         turn = params.get("turn") or {}
