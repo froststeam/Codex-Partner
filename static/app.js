@@ -528,7 +528,13 @@ document.addEventListener("keydown", event => {
   mascotDanceIndex = 0;
   triggerMascotDance();
 });
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") { connectOverviewSocket(); if (state.selectedId && !socketPaused && (!socket || socket.readyState === WebSocket.CLOSED)) connectSocket(state.selectedId, true); if (terminalTaskId && terminalShouldReconnect && !terminalSocket) connectTerminal(terminalTaskId, true); reconcileSelectedTaskStatus(); } });
+function syncPageVisibility() {
+  const hidden = document.visibilityState === "hidden";
+  document.documentElement.classList.toggle("page-hidden", hidden);
+  if (!hidden) { connectOverviewSocket(); if (state.selectedId && !socketPaused && (!socket || socket.readyState === WebSocket.CLOSED)) connectSocket(state.selectedId, true); if (terminalTaskId && terminalShouldReconnect && !terminalSocket) connectTerminal(terminalTaskId, true); reconcileSelectedTaskStatus(); }
+}
+document.addEventListener("visibilitychange", syncPageVisibility);
+syncPageVisibility();
 window.addEventListener("offline", renderConnectionStatus);
 window.addEventListener("online", () => {
   setRealtimeChannel("overview", "reconnecting");

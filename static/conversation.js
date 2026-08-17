@@ -4,6 +4,8 @@ const chatThumbnailObjectUrls = new Map();
 const chatThumbnailLoads = new Map();
 const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260818-hidden-context") : null;
 let chatBuildRequestId = 0;
+let chatBuildInFlight = false;
+let chatBuildQueued = false;
 let chatHistoryLoadPromise = null;
 let mediaViewerMarkdown = null;
 function renderSidebarStats() {
@@ -37,11 +39,13 @@ async function syncQueuedMessages() {
   const taskId = state.selectedId;
   queueSyncInFlight = true;
   try {
+    const previous = JSON.stringify(state.selectedMessages.map(message => [message.id, message.status, message.body, message.error, message.session_id]));
     const messages = await api(`/tasks/${taskId}/messages`);
     if (state.selectedId !== taskId) return;
     replaceTaskMessages(messages);
     renderQueuedMessages();
-    scheduleRenderChat();
+    const current = JSON.stringify(state.selectedMessages.map(message => [message.id, message.status, message.body, message.error, message.session_id]));
+    if (current !== previous) scheduleRenderChat();
   } catch (_) {
     // The websocket remains the primary channel; the next interval retries.
   } finally {
@@ -120,7 +124,7 @@ async function selectSession(id, openSocket = true) {
   if (openSocket) connectSocket(id); if (window.innerWidth <= 860) setSessionSidebarOpen(false);
   loadWorkspace("").catch(() => {});
 }
-function renderConversation() {
+function renderConversation(renderMessages = true) {
   const task = state.selectedTask; if (!task) return;
   const title = String(task.name || t("sessions"));
   const titleNode = $("#conversation-name");
@@ -141,15 +145,16 @@ function renderConversation() {
   loadComposerModels(task);
   $("#permission-toggle").classList.toggle("active", task.yolo);
   $("#permission-toggle span").textContent = task.yolo ? "YOLO" : "受控";
-  state.runtimeMetrics = calculateRuntimeMetrics(task, state.selectedEvents);
+  if (renderMessages) state.runtimeMetrics = calculateRuntimeMetrics(task, state.selectedEvents);
   renderConnectionStatus();
-  renderContextUsage();
+  if (renderMessages) renderContextUsage();
   renderTurnProgress();
   renderGoalBar();
   renderApprovalCenter();
   refreshComposerHistory();
   renderQueuedMessages();
-  renderChat(); renderInspector();
+  if (renderMessages) renderChat();
+  renderInspector();
 }
 const composerModelCache = new Map();
 const composerModelLoads = new Map();
@@ -405,7 +410,14 @@ function renderChat() {
     stream.innerHTML = `<div class="chat-empty"><p>${uiLabel("workerUnavailable") || "Chat Worker unavailable"}</p></div>`;
     return;
   }
+  if (chatBuildInFlight) {
+    chatBuildQueued = true;
+    return;
+  }
+  chatBuildInFlight = true;
+  chatBuildQueued = false;
   const requestId = ++chatBuildRequestId;
+  const taskId = state.selectedId;
   chatWorker.postMessage({
     requestId,
     events: state.selectedEvents,
@@ -423,19 +435,37 @@ function renderChat() {
     },
   });
   chatWorker.onmessage = event => {
-    if (event.data.requestId !== chatBuildRequestId || event.data.error) return;
-    const blocks = event.data.blocks || [];
-    if (state.chatSelectionActive) {
-      state.deferredChatBlocks = blocks;
-      state.chatRenderDeferred = true;
-      state.chatDeferredStickToBottom ||= state.chatSnapToBottom || chatIsNearBottom(stream);
-      return;
+    if (event.data.requestId !== requestId) return;
+    chatBuildInFlight = false;
+    const stale = state.selectedId !== taskId;
+    if (!event.data.error && !stale) {
+      const blocks = event.data.blocks || [];
+      if (state.chatSelectionActive) {
+        state.deferredChatBlocks = blocks;
+        state.chatRenderDeferred = true;
+        state.chatDeferredStickToBottom ||= state.chatSnapToBottom || chatIsNearBottom(stream);
+      } else {
+        state.chatBlocks = blocks;
+        // Decide at paint time. Tool/file events may finish in the worker after the
+        // user has already scrolled away from the bottom.
+        paintVirtualChat(state.chatSnapToBottom || chatIsNearBottom(stream));
+      }
     }
-    state.chatBlocks = blocks;
-    // Decide at paint time. Tool/file events may finish in the worker after the
-    // user has already scrolled away from the bottom.
-    paintVirtualChat(state.chatSnapToBottom || chatIsNearBottom(stream));
+    const rebuild = chatBuildQueued || stale;
+    chatBuildQueued = false;
+    if (rebuild) scheduleRenderChat();
   };
+}
+
+function isTokenUsageProtocol(payload) {
+  return payload?.type === "codex" && payload?.method === "thread/tokenUsage/updated";
+}
+
+function isHiddenProtocolNoise(payload) {
+  const type = String(payload?.type || "").toLowerCase();
+  if (type === "codex" && payload?.method) return !isTokenUsageProtocol(payload);
+  const compact = type.replace(/[^a-z0-9]/g, "");
+  return ["updated", "update", "diff", "output", "delta", "itemupdated", "itemdelta", "turnupdated", "turndiff"].includes(compact);
 }
 
 function chatIsNearBottom(stream = $("#chat-log")) {
@@ -1262,7 +1292,7 @@ function connectSocket(id, reconnect = false) {
       const patch = data.type === "task_patch" ? (data.patch || {}) : (data.task || {});
       state.selectedTask = { ...state.selectedTask, ...patch };
       mergeTask({ id, ...patch });
-      renderConversation(); renderSessionList(); renderSidebarStats();
+      renderConversation(false); renderSessionList(); renderSidebarStats();
       return;
     }
     if (data.type === "workspace_changed" && state.selectedId === id) {
@@ -1270,14 +1300,15 @@ function connectSocket(id, reconnect = false) {
       return;
     }
     if (data.type === "event" && state.selectedId === id) {
-      state.selectedEvents.push({ session_id: data.session_id, ts: data.ts, stream: data.stream, payload: JSON.stringify(data.payload) });
-      state.runtimeMetrics = calculateRuntimeMetrics(state.selectedTask, state.selectedEvents);
-      renderConnectionStatus();
-      renderContextUsage();
-      const phase = activityPhase(data.payload);
+      const protocolNoise = isHiddenProtocolNoise(data.payload);
+      const tokenUsage = isTokenUsageProtocol(data.payload);
+      if (!protocolNoise || tokenUsage) state.selectedEvents.push({ session_id: data.session_id, ts: data.ts, stream: data.stream, payload: JSON.stringify(data.payload) });
+      if (tokenUsage) renderContextUsage();
+      if (!protocolNoise) scheduleRuntimeMetricsRefresh();
+      const phase = protocolNoise ? "" : activityPhase(data.payload);
       if (phase) { livePhases.set(id, phase); renderTurnProgress(); }
-      if (String(data.payload?.type || "").toLowerCase() !== "agent_delta" || !appendStreamingDelta(data.payload)) scheduleRenderChat();
-      if (!isAssistantEvent({ stream: data.stream, payload: data.payload }) && !isUserEvent({ stream: data.stream, payload: data.payload })) showActivity(data.payload);
+      if (!protocolNoise && (String(data.payload?.type || "").toLowerCase() !== "agent_delta" || !appendStreamingDelta(data.payload))) scheduleRenderChat();
+      if (!protocolNoise && !isAssistantEvent({ stream: data.stream, payload: data.payload }) && !isUserEvent({ stream: data.stream, payload: data.payload })) showActivity(data.payload);
     }
     if (data.type === "message" && state.selectedId === id) { upsertTaskMessage(data); renderQueuedMessages(); scheduleRenderChat(); }
     if (data.type === "message_removed" && state.selectedId === id) { removeTaskMessage(data.message_id); if (state.editingQueuedId === data.message_id) { state.editingQueuedId = null; $("#message-input").value = ""; } renderQueuedMessages(); scheduleRenderChat(); }

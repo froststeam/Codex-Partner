@@ -498,6 +498,8 @@ let socketPaused = false;
 let overviewSocket = null;
 let overviewReconnectTimer = null;
 let chatRenderFrame = null;
+let chatLastRenderAt = 0;
+let runtimeMetricsTimer = null;
 let pendingAttachments = [];
 let terminalSocket = null;
 let terminalTaskId = null;
@@ -1030,7 +1032,20 @@ function refreshComposerHistory() {
 function scheduleRenderChat() {
   if (state.chatSelectionActive) { state.chatRenderDeferred = true; return; }
   if (chatRenderFrame) return;
-  chatRenderFrame = requestAnimationFrame(() => { chatRenderFrame = null; renderChat(); });
+  const delay = Math.max(0, 100 - (Date.now() - chatLastRenderAt));
+  chatRenderFrame = setTimeout(() => {
+    chatRenderFrame = null;
+    chatLastRenderAt = Date.now();
+    renderChat();
+  }, delay);
+}
+function scheduleRuntimeMetricsRefresh() {
+  if (runtimeMetricsTimer) return;
+  runtimeMetricsTimer = setTimeout(() => {
+    runtimeMetricsTimer = null;
+    state.runtimeMetrics = calculateRuntimeMetrics(state.selectedTask, state.selectedEvents);
+    renderConnectionStatus();
+  }, 250);
 }
 
 async function refresh(keepSelection = true) {
