@@ -110,9 +110,9 @@ body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56p
 .live-dot { display: inline-block; width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: var(--lime); box-shadow: 0 0 0 0 #d6f77f66; animation: live-pulse 1.7s infinite; }
 @keyframes live-pulse { 0%, 100% { box-shadow: 0 0 0 0 #d6f77f55; } 50% { box-shadow: 0 0 0 4px #d6f77f00; } }
 .session-list { min-height: 0; flex: 1; overflow: auto; padding: 0 8px 12px; }
-.session-card { width: 100%; height: 36px; min-height: 36px; display: flex; align-items: center; gap: 7px; padding: 4px 7px; margin: 2px 0; text-align: left; border: 1px solid #354046; border-radius: 5px; color: var(--text); background: #151d21; }
+.session-card { position: relative; width: 100%; height: 36px; min-height: 36px; display: flex; align-items: center; gap: 7px; padding: 4px 7px 4px 17px; margin: 2px 0; text-align: left; border: 1px solid #354046; border-radius: 5px; color: var(--text); background: #151d21; }
 .session-card.running { border-color: #587541; background: #17231b; }.session-card.paused { border-color: #3a454a; }
-.session-card:hover { background: #202b2d; border-color: #768d64; }.session-card.selected { background: #202b2d; }.session-card.selected.running { border-color: #9abd6b; }.session-card.selected.paused { border-color: #68757a; }
+.session-card:hover { background: #202b2d; border-color: #768d64; }.session-card.selected { border-color: #d6f77f; background: #26362a; box-shadow: inset 3px 0 #d6f77f, 0 0 0 1px #d6f77f33; }.session-card.selected::before { content: ""; position: absolute; left: 6px; top: 50%; width: 0; height: 0; border-top: 5px solid transparent; border-bottom: 5px solid transparent; border-left: 7px solid var(--lime); transform: translateY(-50%); filter: drop-shadow(0 0 5px #d6f77f66); }.session-card.selected.running { border-color: #d6f77f; background: #263b25; }.session-card.selected.paused { border-color: #d6f77f; }
 .session-card-icon { display: grid; place-items: center; flex: 0 0 auto; width: 23px; height: 23px; border-radius: 5px; background: #293237; color: #c8d2d5; font-size: 11px; font-weight: 800; }
 .session-card-icon .mascot-inline { box-shadow: none; }
 .session-card.selected .session-card-icon { background: var(--lime); color: #172018; }

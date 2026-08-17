@@ -73,6 +73,12 @@ async function selectSession(id, openSocket = true) {
   // Reflect keyboard navigation immediately, then replace the row with the full task after loading.
   renderSessionList();
   scrollSessionIntoView(id);
+  if (task) {
+    $("#empty-conversation").hidden = true; $("#conversation-view").hidden = false;
+    if (wasEmpty && window.innerWidth >= 861) state.inspectorClosed = false;
+    setInspectorOpen(window.innerWidth >= 861 && !state.inspectorClosed);
+    renderConversation();
+  }
   let fullTask, timeline, messages;
   try {
     [fullTask, timeline, messages] = await Promise.all([
@@ -97,8 +103,9 @@ async function selectSession(id, openSocket = true) {
   $("#empty-conversation").hidden = true; $("#conversation-view").hidden = false;
   if (wasEmpty && window.innerWidth >= 861) state.inspectorClosed = false;
   setInspectorOpen(window.innerWidth >= 861 && !state.inspectorClosed);
-  renderSessionList(); renderConversation(); await loadWorkspace("");
+  renderSessionList(); renderConversation();
   if (openSocket) connectSocket(id); if (window.innerWidth <= 860) setSessionSidebarOpen(false);
+  loadWorkspace("").catch(() => {});
 }
 function renderConversation() {
   const task = state.selectedTask; if (!task) return;
