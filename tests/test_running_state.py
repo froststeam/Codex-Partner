@@ -1118,6 +1118,29 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
 
         asyncio.run(exercise())
 
+    def test_legacy_staging_attachment_is_restored_to_session_workspace(self):
+        task_id = "legacy-attachment-thread"
+        self.make_task(task_id, "available")
+        with tempfile.TemporaryDirectory(dir=self.temp.name) as directory:
+            root = Path(directory) / "codex_partner"
+            session = root / task_id
+            session.mkdir(parents=True)
+            legacy = root / "notes.txt"
+            legacy.write_text("old upload", encoding="utf-8")
+            other_session = root / "other-session"
+            other_session.mkdir()
+            (other_session / "secret.txt").write_text("nope", encoding="utf-8")
+            self.app.db.execute("UPDATE tasks SET workspace=? WHERE id=?", (str(session), task_id))
+            with mock.patch.object(self.app, "SESSION_WORKSPACE_ROOT", root):
+                result = asyncio.run(self.app.task_workspace(task_id, "notes.txt"))
+                self.assertEqual("old upload", result["content"])
+                self.assertEqual("notes.txt", result["entry"]["path"])
+                self.assertEqual("old upload", (session / "notes.txt").read_text(encoding="utf-8"))
+                with self.assertRaises(self.app.HTTPException) as raised:
+                    asyncio.run(self.app.task_workspace(task_id, "other-session/secret.txt"))
+                self.assertEqual(404, raised.exception.status_code)
+        self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
     def test_ssh_config_discovery_follows_includes_and_ignores_patterns(self):
         with tempfile.TemporaryDirectory(dir=self.temp.name) as directory:
             root = Path(directory)

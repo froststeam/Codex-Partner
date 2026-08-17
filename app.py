@@ -1360,6 +1360,42 @@ def workspace_path(task: dict, relative: str = "") -> tuple[Path, Path]:
     return root, candidate
 
 
+def legacy_staging_workspace_file(task: dict, relative: str) -> Optional[Path]:
+    """Resolve files uploaded before a local session workspace was aligned.
+
+    Older browser sessions used SESSION_WORKSPACE_ROOT itself as the staging
+    workspace until Codex returned the real thread id. Files uploaded in that
+    window stayed at the root after the task moved to root/<thread-id>. Keep
+    this fallback intentionally narrow: basename-only files beside the session
+    directories, never paths inside another session workspace.
+    """
+    if not relative or Path(relative).is_absolute() or Path(relative).name != relative:
+        return None
+    session_root = SESSION_WORKSPACE_ROOT.resolve()
+    try:
+        current = Path(task["workspace"]).expanduser().resolve()
+    except OSError:
+        return None
+    if current.parent != session_root:
+        return None
+    candidate = (session_root / relative).resolve()
+    if candidate.parent != session_root or not candidate.is_file():
+        return None
+    return candidate
+
+
+def existing_workspace_file(task: dict, relative: str, missing_message: str) -> tuple[Path, Path]:
+    root, candidate = workspace_path(task, relative)
+    if candidate.exists():
+        return root, candidate
+    legacy = legacy_staging_workspace_file(task, relative)
+    if legacy:
+        candidate.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        shutil.copy2(legacy, candidate)
+        return root, candidate
+    raise HTTPException(404, missing_message)
+
+
 def workspace_picker_roots(task: dict) -> tuple[Path, ...]:
     roots = list(WORKSPACE_ROOTS)
     try:
@@ -4457,9 +4493,12 @@ async def task_workspace(task_id: str, path: str = "", _: Any = Depends(auth)):
     task = task_or_404(task_id)
     if task.get("ssh_host"):
         return await remote_fs_json(task, "browse", path)
-    root, candidate = workspace_path(task, path)
-    if not candidate.exists():
-        raise HTTPException(404, "Workspace path not found")
+    if path:
+        root, candidate = existing_workspace_file(task, path, "Workspace path not found")
+    else:
+        root, candidate = workspace_path(task, path)
+        if not candidate.exists():
+            raise HTTPException(404, "Workspace path not found")
     if candidate.is_file():
         if workspace_hidden(candidate):
             raise HTTPException(403, "Sensitive workspace files are not available in browser preview")
@@ -4667,9 +4706,7 @@ async def download_workspace_file(task_id: str, path: str, _: Any = Depends(auth
         mode = "inline" if media_type.startswith(("image/", "audio/", "video/")) or media_type == "application/pdf" else "attachment"
         disposition = f"{mode}; filename*=UTF-8''{urllib.parse.quote(filename)}"
         return StreamingResponse(stream_remote_file(), media_type=media_type, headers={"Content-Disposition": disposition})
-    _root, candidate = workspace_path(task, path)
-    if not candidate.exists():
-        raise HTTPException(404, "Workspace file not found")
+    _root, candidate = existing_workspace_file(task, path, "Workspace file not found")
     if not candidate.is_file():
         raise HTTPException(400, "Only files can be downloaded")
     if workspace_hidden(candidate):
@@ -4724,7 +4761,7 @@ async def thumbnail_workspace_file(task_id: str, path: str, size: int = 640, _: 
             cache_dir.mkdir(parents=True, exist_ok=True)
             cache_file.write_bytes(image_thumbnail(data, size))
     else:
-        _root, candidate = workspace_path(task, path)
+        _root, candidate = existing_workspace_file(task, path, "Workspace image not found")
         if not candidate.is_file():
             raise HTTPException(404, "Workspace image not found")
         if workspace_hidden(candidate):

@@ -641,8 +641,20 @@ document.addEventListener("keydown", event => {
   }
 });
 async function renderTextFileViewer(taskId, path) {
-  const response = await api(`/tasks/${encodeURIComponent(taskId)}/workspace?path=${encodeURIComponent(path)}`);
-  const content = response.content ?? "";
+  const previewResponse = await workspaceFetch(`/tasks/${encodeURIComponent(taskId)}/workspace?path=${encodeURIComponent(path)}`);
+  let content = "";
+  if (previewResponse.ok) {
+    const response = await previewResponse.json();
+    content = response.content ?? "";
+  } else if (previewResponse.status === 413) {
+    const downloadResponse = await workspaceFetch(`/tasks/${encodeURIComponent(taskId)}/workspace/download?path=${encodeURIComponent(path)}`);
+    if (!downloadResponse.ok) throw await workspaceResponseError(downloadResponse);
+    const blob = await downloadResponse.blob();
+    if (blob.size > 2_000_000) throw new Error("文本文件过大，请下载后查看");
+    content = await blob.text();
+  } else {
+    throw await workspaceResponseError(previewResponse);
+  }
   const body = $("#media-viewer-body");
   const ext = chatFileExtension(path);
   if (["md", "markdown"].includes(ext) && window.toastui?.Editor) {
