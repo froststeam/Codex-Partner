@@ -475,7 +475,7 @@ function renderActivityEvent(item, active = false) {
   const changesBlock = changes.length ? `<div class="activity-changes">${changes.slice(0, 8).map(change => `<span>${esc(change.kind || "update")} · ${esc(change.path || change)}</span>`).join("")}</div>` : "";
   const planBlock = plan.length ? `<ol class="activity-plan">${plan.map(step => { const state = String(step.status || "pending"); const mark = state === "completed" ? "✓" : state === "in_progress" ? "›" : "·"; return `<li class="${esc(state)}"><span>${mark}</span><span>${esc(step.step || step.text)}</span></li>`; }).join("")}</ol>` : "";
   let outputBlock = "";
-  if (output && !isWait) {
+  if (output && !isWait && !plan.length) {
     const outputLines = output.split(/\r?\n/);
     const meta = item.exitCode != null ? `exit ${item.exitCode}` : "";
     if (outputLines.length <= 9) {
