@@ -14,7 +14,7 @@ RUN python -m pip wheel --no-cache-dir --wheel-dir /wheels .
 FROM python:3.12-slim AS runtime
 
 ARG CODEX_VERSION=latest
-ARG APP_VERSION=0.0.2
+ARG APP_VERSION=0.0.3
 
 LABEL org.opencontainers.image.title="Codex Partner" \
       org.opencontainers.image.description="Self-hosted management for persistent Codex tasks" \
