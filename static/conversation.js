@@ -5,6 +5,7 @@ const chatThumbnailLoads = new Map();
 const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260817-message-dedupe") : null;
 let chatBuildRequestId = 0;
 let chatHistoryLoadPromise = null;
+let mediaViewerMarkdown = null;
 function renderSidebarStats() {
   const running = sortTasks(state.tasks.filter(task => ["running", "retrying"].includes(task.status)));
   const queued = sortTasks(state.tasks.filter(task => task.status === "queued"));
@@ -526,6 +527,20 @@ async function hydrateChatFiles() {
       const mediaKind = node.dataset.chatMedia || "";
       const isImage = node.dataset.chatKind === "localImage" || imageByName;
       const preview = node.querySelector(".chat-file-preview");
+      const resolvedKind = chatViewerKind(path, isImage ? "image" : mediaKind);
+      node.tabIndex = 0;
+      node.setAttribute("role", "button");
+      node.setAttribute("aria-label", `预览 ${path.split("/").pop() || path}`);
+      node.onclick = event => {
+        if (event.target instanceof Element && event.target.closest("audio, video")) return;
+        event.preventDefault();
+        openChatFileViewer({ taskId, path, kind: resolvedKind });
+      };
+      node.onkeydown = event => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        openChatFileViewer({ taskId, path, kind: resolvedKind });
+      };
       if (isImage && preview) {
         let url = chatThumbnailObjectUrls.get(cacheKey) || "";
         if (!url) {
@@ -545,21 +560,6 @@ async function hydrateChatFiles() {
         }
         preview.hidden = false;
         preview.innerHTML = `<a class="chat-image-link" href="#" aria-label="${esc(path.split("/").pop() || path)}"><img src="${url}" alt="${esc(path.split("/").pop() || path)}" /></a>`;
-        $(".chat-image-link", preview).onclick = async event => {
-          event.preventDefault();
-          const tab = window.open("", "_blank");
-          try {
-            let original = chatFileObjectUrls.get(cacheKey) || "";
-            if (!original) {
-              const response = await workspaceFetch(`/tasks/${encodeURIComponent(taskId)}/workspace/download?path=${encodeURIComponent(path)}`);
-              if (!response.ok) throw new Error("download failed");
-              let blob = await response.blob();
-              if (imageMime && !blob.type.startsWith("image/")) blob = new Blob([blob], { type: imageMime });
-              original = URL.createObjectURL(blob); chatFileObjectUrls.set(cacheKey, original);
-            }
-            if (tab) tab.location.href = original; else window.open(original, "_blank", "noopener");
-          } catch (error) { if (tab) tab.close(); toast(error.message); }
-        };
       } else if (["audio", "video"].includes(mediaKind) && preview) {
         let url = chatFileObjectUrls.get(cacheKey) || "";
         if (!url) {
@@ -574,19 +574,120 @@ async function hydrateChatFiles() {
           ? `<audio controls preload="metadata" src="${url}"></audio>`
           : `<video controls preload="metadata" src="${url}"></video>`;
       } else {
-        node.classList.add("file-only"); node.tabIndex = 0; node.setAttribute("role", "link");
-        node.onclick = async () => {
-          const tab = window.open("", "_blank");
-          try {
-            const response = await workspaceFetch(`/tasks/${encodeURIComponent(taskId)}/workspace/download?path=${encodeURIComponent(path)}`);
-            if (!response.ok) throw new Error("download failed");
-            const url = URL.createObjectURL(await response.blob());
-            if (tab) tab.location.href = url; else window.open(url, "_blank", "noopener");
-            setTimeout(() => URL.revokeObjectURL(url), 60_000);
-          } catch (error) { if (tab) tab.close(); toast(error.message); }
-        };
+        node.classList.add("file-only");
       }
     } catch (_) { node.classList.add("unavailable"); }
+  }
+}
+
+function chatFileExtension(path) {
+  const name = String(path || "").split("?")[0].split("#")[0].toLowerCase();
+  const match = name.match(/\.([a-z0-9]+)$/i);
+  return match ? match[1] : "";
+}
+function chatViewerKind(path, hint = "") {
+  if (["image", "audio", "video", "pdf", "text"].includes(hint)) return hint;
+  const ext = chatFileExtension(path);
+  if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif"].includes(ext)) return "image";
+  if (["mp3", "wav", "ogg", "oga", "m4a", "aac", "flac", "opus", "weba"].includes(ext)) return "audio";
+  if (["mp4", "webm", "mov", "m4v", "ogv", "mkv"].includes(ext)) return "video";
+  if (ext === "pdf") return "pdf";
+  if (["txt", "md", "markdown", "json", "jsonl", "yaml", "yml", "toml", "ini", "csv", "tsv", "log", "py", "js", "ts", "tsx", "jsx", "css", "html", "xml", "sh", "rs", "go", "java", "c", "cc", "cpp", "h", "hpp", "sql"].includes(ext)) return "text";
+  return "file";
+}
+function chatViewerLabel(kind) {
+  return ({ image: "IMAGE", audio: "AUDIO", video: "VIDEO", pdf: "PDF", text: "TEXT" })[kind] || "FILE";
+}
+function chatDownloadUrl(taskId, path) {
+  return `/api/tasks/${encodeURIComponent(taskId)}/workspace/download?path=${encodeURIComponent(path)}`;
+}
+async function chatFileObjectUrl(taskId, path, kind = "") {
+  const cacheKey = `${taskId}:${path}`;
+  let url = chatFileObjectUrls.get(cacheKey) || "";
+  if (url) return url;
+  const response = await workspaceFetch(`/tasks/${encodeURIComponent(taskId)}/workspace/download?path=${encodeURIComponent(path)}`);
+  if (!response.ok) throw await workspaceResponseError(response);
+  let blob = await response.blob();
+  const ext = chatFileExtension(path);
+  const fallbackType = kind === "pdf" ? "application/pdf" : kind === "image" && ext === "svg" ? "image/svg+xml" : "";
+  if (fallbackType && !blob.type) blob = new Blob([blob], { type: fallbackType });
+  url = URL.createObjectURL(blob);
+  chatFileObjectUrls.set(cacheKey, url);
+  return url;
+}
+function clearMediaViewerBody() {
+  if (mediaViewerMarkdown) {
+    try { mediaViewerMarkdown.destroy(); } catch (_) {}
+    mediaViewerMarkdown = null;
+  }
+  const body = $("#media-viewer-body");
+  if (body) body.innerHTML = "";
+}
+function closeChatFileViewer() {
+  const viewer = $("#media-viewer");
+  if (!viewer) return;
+  clearMediaViewerBody();
+  viewer.classList.remove("open");
+  viewer.setAttribute("aria-hidden", "true");
+}
+$("#media-viewer-close")?.addEventListener("click", closeChatFileViewer);
+$("#media-viewer")?.addEventListener("click", event => {
+  if (event.target === event.currentTarget) closeChatFileViewer();
+});
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && $("#media-viewer")?.classList.contains("open")) {
+    event.preventDefault();
+    closeChatFileViewer();
+  }
+});
+async function renderTextFileViewer(taskId, path) {
+  const response = await api(`/tasks/${encodeURIComponent(taskId)}/workspace?path=${encodeURIComponent(path)}`);
+  const content = response.content ?? "";
+  const body = $("#media-viewer-body");
+  const ext = chatFileExtension(path);
+  if (["md", "markdown"].includes(ext) && window.toastui?.Editor) {
+    body.innerHTML = `<div id="media-viewer-markdown" class="media-viewer-markdown"></div>`;
+    mediaViewerMarkdown = toastui.Editor.factory({
+      el: $("#media-viewer-markdown"),
+      viewer: true,
+      initialValue: content,
+      usageStatistics: false,
+      ...(typeof markdownOptions === "function" ? markdownOptions() : {}),
+    });
+    return;
+  }
+  body.innerHTML = `<pre class="media-viewer-text"></pre>`;
+  $(".media-viewer-text", body).textContent = content;
+}
+async function openChatFileViewer({ taskId, path, kind }) {
+  const viewer = $("#media-viewer");
+  const body = $("#media-viewer-body");
+  if (!viewer || !body || !taskId || !path) return;
+  const filename = path.split("/").filter(Boolean).pop() || path;
+  clearMediaViewerBody();
+  $("#media-viewer-title").textContent = filename;
+  $("#media-viewer-path").textContent = path;
+  $("#media-viewer-kind").textContent = chatViewerLabel(kind);
+  const download = $("#media-viewer-download");
+  download.href = chatDownloadUrl(taskId, path);
+  download.download = filename;
+  viewer.classList.add("open");
+  viewer.setAttribute("aria-hidden", "false");
+  body.innerHTML = `<div class="media-viewer-loading">正在加载预览…</div>`;
+  try {
+    if (kind === "text") {
+      await renderTextFileViewer(taskId, path);
+    } else if (["image", "audio", "video", "pdf"].includes(kind)) {
+      const url = await chatFileObjectUrl(taskId, path, kind);
+      if (kind === "image") body.innerHTML = `<img class="media-viewer-image" src="${url}" alt="${esc(filename)}" />`;
+      else if (kind === "audio") body.innerHTML = `<audio class="media-viewer-audio" controls autoplay preload="metadata" src="${url}"></audio>`;
+      else if (kind === "video") body.innerHTML = `<video class="media-viewer-video" controls autoplay preload="metadata" src="${url}"></video>`;
+      else body.innerHTML = `<iframe class="media-viewer-frame" title="${esc(filename)}" src="${url}#view=FitH"></iframe>`;
+    } else {
+      body.innerHTML = `<div class="media-viewer-empty"><strong>无法内嵌预览此文件</strong><span>可以直接下载后查看。</span></div>`;
+    }
+  } catch (error) {
+    body.innerHTML = `<div class="media-viewer-error">${esc(error.message || "预览加载失败")}</div>`;
   }
 }
 function localizeInspectorText(root) {
