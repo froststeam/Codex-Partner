@@ -860,6 +860,52 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
 
         asyncio.run(exercise())
 
+    def test_manual_dispatch_uses_persisted_mixed_turn_id(self):
+        task_id = "manual-steer-mixed-thread"
+        message_id = "manual-steer-mixed-message"
+        self.make_task(task_id)
+        stamp = self.app.now()
+        self.app.db.execute(
+            "UPDATE tasks SET execution_source='mixed',execution_turn_id='turn-current' WHERE id=?",
+            (task_id,),
+        )
+        self.app.db.execute(
+            "INSERT INTO task_messages (id,task_id,body,status,created_at) VALUES (?,?,?,?,?)",
+            (message_id, task_id, "send now", "queued", stamp),
+        )
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            async def request(self, method, params):
+                self.calls.append((method, params))
+                return {}
+
+        async def exercise():
+            client = FakeClient()
+            blocker = asyncio.create_task(asyncio.Event().wait())
+            self.app.app_servers["test-mixed"] = client
+            self.app.app_thread_bindings[task_id] = ("test-mixed", "thread-1", "session-1")
+            self.app.appserver_turn_ids[task_id] = "turn-stale"
+            self.app.appserver_turn_tasks[task_id] = blocker
+            try:
+                result = await self.app.dispatch_task_message(task_id, message_id, None)
+                self.assertEqual("steered", result["status"])
+                self.assertEqual("turn-current", client.calls[0][1]["expectedTurnId"])
+                self.assertEqual("turn-current", self.app.appserver_turn_ids[task_id])
+            finally:
+                blocker.cancel()
+                await asyncio.gather(blocker, return_exceptions=True)
+                self.app.app_servers.pop("test-mixed", None)
+                self.app.app_thread_bindings.pop(task_id, None)
+                self.app.appserver_turn_ids.pop(task_id, None)
+                self.app.appserver_turn_tasks.pop(task_id, None)
+                self.app.db.execute("DELETE FROM task_messages WHERE task_id=?", (task_id,))
+                self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+        asyncio.run(exercise())
+
     def test_manual_dispatch_reports_steer_error_when_message_remains_queued(self):
         task_id = "manual-steer-error-thread"
         message_id = "manual-steer-error-message"

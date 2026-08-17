@@ -3621,6 +3621,16 @@ def is_task_busy_error(exc: Exception) -> bool:
     return "already running" in text or "turn is already active" in text or "current turn" in text and "active" in text
 
 
+def steer_expected_turn_id(task_id: str, task: Optional[dict] = None) -> str:
+    """Return the freshest turn id to use for app-server steering."""
+    current = task or task_or_404(task_id)
+    persisted = str(current.get("execution_turn_id") or "")
+    if persisted and current.get("execution_source") in {"dashboard", "mixed"}:
+        appserver_turn_ids[task_id] = persisted
+        return persisted
+    return str(appserver_turn_ids.get(task_id) or persisted)
+
+
 def schedule_task_drain(task_id: str) -> None:
     worker = task_workers.get(task_id)
     if worker and not worker.done():
@@ -5188,13 +5198,13 @@ async def dispatch_task_message(task_id: str, message_id: str, _: Any = Depends(
 @app.post("/api/tasks/{task_id}/steer")
 async def steer_task_message(task_id: str, payload: TaskMessageIn, _: Any = Depends(auth)):
     """Insert text into the currently active Codex turn without starting a second turn."""
-    task_or_404(task_id)
+    task = task_or_404(task_id)
     message_id = payload.client_message_id or str(uuid.uuid4())
     existing = db.one("SELECT * FROM task_messages WHERE id=?", (message_id,))
     if existing and existing["status"] != "queued":
         return existing
     binding = app_thread_bindings.get(task_id)
-    turn_id = appserver_turn_ids.get(task_id)
+    turn_id = steer_expected_turn_id(task_id, task)
     turn_task = appserver_turn_tasks.get(task_id)
     client = app_servers.get(binding[0]) if binding else None
     thread_id = binding[1] if binding else ""
@@ -5222,7 +5232,7 @@ async def steer_task_message(task_id: str, payload: TaskMessageIn, _: Any = Depe
             {
                 "threadId": thread_id,
                 "expectedTurnId": turn_id,
-                "input": appserver_turn_inputs(task_or_404(task_id), message_body),
+                "input": appserver_turn_inputs(task, message_body),
                 "clientUserMessageId": message_id,
             },
         )
