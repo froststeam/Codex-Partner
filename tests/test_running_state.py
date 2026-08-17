@@ -1478,6 +1478,36 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
             self.app.db.execute("DELETE FROM task_messages WHERE id=?", (message_id,))
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
+    def test_restart_requeues_interrupted_message_delivery_states(self):
+        task_id = "restart-requeues-message-states"
+        self.make_task(task_id, "available")
+        stamp = self.app.now()
+        message_ids = []
+        try:
+            for status in ("running", "dispatching", "steering"):
+                message_id = f"restart-{status}"
+                message_ids.append(message_id)
+                self.app.db.execute(
+                    "INSERT INTO task_messages (id,task_id,body,status,created_at,started_at,session_id,error) VALUES (?,?,?,?,?,?,?,?)",
+                    (message_id, task_id, status, status, stamp, stamp, f"session-{status}", "old error"),
+                )
+            with self.app.db.lock, self.app.db.connect() as connection:
+                self.app.db._recover_interrupted_work(connection)
+                connection.commit()
+            rows = self.app.db.all(
+                f"SELECT id,status,started_at,finished_at,session_id,error FROM task_messages WHERE id IN ({','.join('?' for _ in message_ids)})",
+                tuple(message_ids),
+            )
+            self.assertEqual({"queued"}, {row["status"] for row in rows})
+            self.assertEqual({None}, {row["started_at"] for row in rows})
+            self.assertEqual({None}, {row["finished_at"] for row in rows})
+            self.assertEqual({None}, {row["session_id"] for row in rows})
+            self.assertEqual({"Dashboard restarted before delivery"}, {row["error"] for row in rows})
+        finally:
+            for message_id in message_ids:
+                self.app.db.execute("DELETE FROM task_messages WHERE id=?", (message_id,))
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
     def test_port_configuration_rejects_invalid_values(self):
         with mock.patch.dict(os.environ, {"TEST_DASHBOARD_PORT": "9443"}):
             self.assertEqual(9443, self.app.configured_port("TEST_DASHBOARD_PORT", 8787))

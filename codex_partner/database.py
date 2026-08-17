@@ -179,7 +179,8 @@ class Database:
         )
         connection.execute(
             "UPDATE task_messages SET status='queued', started_at=NULL, session_id=NULL, "
-            "error='Dashboard restarted before delivery' WHERE status='running'"
+            "finished_at=NULL, error='Dashboard restarted before delivery' "
+            "WHERE status IN ('running','dispatching','steering')"
         )
         connection.execute(
             "UPDATE tasks SET status='queued', last_error='Dashboard restarted; task queued for resume', updated_at=? "

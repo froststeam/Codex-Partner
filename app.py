@@ -470,6 +470,9 @@ async def lifespan(_: FastAPI):
                 await launch(row["id"], "resume" if latest_codex_session(task) else "start")
             except Exception:
                 continue
+    for row in db.all("SELECT DISTINCT task_id FROM task_messages WHERE status='queued'"):
+        if row.get("task_id"):
+            schedule_task_drain(row["task_id"])
     try:
         yield
     finally:

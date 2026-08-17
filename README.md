@@ -28,8 +28,6 @@ Requires Python 3.10+ and an authenticated [Codex CLI](https://github.com/openai
 ### PyPI
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
 pip install codex-partner
 codex-partner
 ```
