@@ -44,6 +44,29 @@ class RunningStateTests(unittest.TestCase):
         stamp = self.app.native_stamp("2026-08-16T01:27:10.093564Z", "fallback")
         self.assertEqual("2026-08-16T01:27:10.093564+00:00", stamp)
 
+    def test_rollout_tool_activity_exposes_real_command_and_redacts_secrets(self):
+        record = {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "id": "tool-command",
+                "name": "exec_command",
+                "arguments": json.dumps({"cmd": "curl -H 'Authorization: Bearer secret-value' https://example.test"}),
+            },
+        }
+        payload = self.app.rollout_browser_payload(record)
+        self.assertEqual("commandExecution", payload["type"])
+        self.assertIn("curl -H", payload["text"])
+        self.assertIn("Bearer ***", payload["text"])
+        self.assertNotIn("secret-value", payload["text"])
+
+        patch_payload = self.app.rollout_browser_payload({
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call", "name": "exec", "input": "text(await tools.apply_patch(patch));"},
+        })
+        self.assertEqual("fileChange", patch_payload["type"])
+        self.assertEqual("应用代码修改", patch_payload["text"])
+
     def test_task_or_404_falls_back_when_alias_points_to_missing_task(self):
         task_id = "task-alias-fallback"
         missing_thread_id = "missing-thread-alias"
@@ -786,6 +809,27 @@ process.stdout.write(JSON.stringify(blocks[0].html));
         self.assertNotIn("/home/ori/work", html)
         self.assertIn('data-chat-file="image-mswtyzp4.png"', html)
         self.assertIn("chat-image-attachment", html)
+
+    def test_worker_merges_live_activity_start_and_completion(self):
+        worker = Path(__file__).resolve().parents[1] / "static/chat-worker.js"
+        script = f"""
+const fs = require("fs");
+const vm = require("vm");
+const context = {{ self: {{ postMessage() {{}} }} }};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync({json.dumps(str(worker))}, "utf8"), context);
+const blocks = context.buildBlocks([
+  {{ stream: "app-server", payload: JSON.stringify({{ type: "commandExecution", text: "python3 -m unittest", item_id: "command-1", status: "started" }}) }},
+  {{ stream: "app-server", payload: JSON.stringify({{ type: "commandExecution", text: "python3 -m unittest", item_id: "command-1", status: "completed" }}) }}
+], true, {{ activityCommand: "running", activityCommandDone: "done", activityWorking: "working" }});
+process.stdout.write(JSON.stringify(blocks));
+"""
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+        blocks = json.loads(result.stdout)
+        self.assertEqual(1, len(blocks))
+        self.assertEqual(1, len(blocks[0]["items"]))
+        self.assertEqual("completed", blocks[0]["items"][0]["status"])
+        self.assertEqual("done · python3 -m unittest", blocks[0]["items"][0]["text"])
 
     def test_model_slash_command_supports_named_updates_and_defaults(self):
         task_id = "model-command-thread"
@@ -1913,10 +1957,10 @@ process.stdout.write(JSON.stringify(blocks[0].html));
         self.assertIn("new File([file]", app_js)
         self.assertIn('uiLabel("binaryAttachment"', app_js)
         self.assertIn('/app.js?v=20260817-goal-status', html)
-        self.assertIn('/core.js?v=20260817-session-sort', html)
+        self.assertIn('/core.js?v=20260817-live-activity', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260817-session-switch', html)
+        self.assertIn('/conversation.js?v=20260817-live-activity', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -2142,16 +2186,18 @@ process.stdout.write(JSON.stringify(blocks[0].html));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260817-session-switch', html)
+        self.assertIn('/conversation.js?v=20260817-live-activity', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260817-goal-status', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
-        self.assertIn('/styles.css?v=20260817-queue-dispatch', html)
+        self.assertIn('/styles.css?v=20260817-live-activity', html)
         self.assertIn(".session-card.selected::before", styles)
         self.assertNotIn("renderSessionList(); renderConversation(); await loadWorkspace(\"\")", conversation_js)
         self.assertIn(".queued-messages { width: auto; height: auto; min-height: 0; max-height: none; align-self: stretch;", styles)
-        self.assertIn('/chat-worker.js?v=20260817-hide-media-tags', conversation_js)
+        self.assertIn('/chat-worker.js?v=20260817-live-activity', conversation_js)
+        self.assertIn('data-live="true" open', conversation_js)
+        self.assertIn("activity-event.current::after", styles)
         self.assertIn("scroll-behavior: auto", styles)
         self.assertIn("grid-template-columns: auto minmax(0, 1fr) auto", styles)
         self.assertIn(".shortcut-hints { position: absolute; left: 50%", styles)

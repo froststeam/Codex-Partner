@@ -2,7 +2,7 @@
 const chatFileObjectUrls = new Map();
 const chatThumbnailObjectUrls = new Map();
 const chatThumbnailLoads = new Map();
-const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260817-hide-media-tags") : null;
+const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260817-live-activity") : null;
 let chatBuildRequestId = 0;
 let chatHistoryLoadPromise = null;
 let mediaViewerMarkdown = null;
@@ -402,6 +402,11 @@ function renderChat() {
       fileChanged: uiLabel("fileChanged"), contextCompressed: uiLabel("contextCompressed"),
       terminalTurnStarted: uiLabel("terminalTurnStarted"), terminalTurnCompleted: uiLabel("terminalTurnCompleted"),
       terminalTurnAborted: uiLabel("terminalTurnAborted"), codexActivity: uiLabel("codexActivity"),
+      activityWorking: uiLabel("activityWorking"), activityPlanning: uiLabel("activityPlanning"),
+      activityCommand: uiLabel("activityCommand"), activityCommandDone: uiLabel("activityCommandDone"),
+      activityFile: uiLabel("activityFile"), activityFileDone: uiLabel("activityFileDone"),
+      activityTool: uiLabel("activityTool"), activityToolDone: uiLabel("activityToolDone"),
+      activitySearch: uiLabel("activitySearch"),
     },
   });
   chatWorker.onmessage = event => {
@@ -431,7 +436,7 @@ function captureChatViewport(stream) {
 
 function restoreChatViewport(stream, viewport, stickToBottom) {
   for (const node of $$("details.activity-group", stream)) {
-    node.open = viewport.openActivities.has(node.dataset.chatBlockIndex);
+    node.open = node.dataset.live === "true" || viewport.openActivities.has(node.dataset.chatBlockIndex);
   }
   if (stickToBottom) {
     stream.scrollTop = stream.scrollHeight;
@@ -446,9 +451,14 @@ function restoreChatViewport(stream, viewport, stickToBottom) {
   stream.scrollTop = Math.min(viewport.scrollTop, Math.max(0, stream.scrollHeight - stream.clientHeight));
 }
 
-function renderChatBlock(block, blockIndex) {
+function renderChatBlock(block, blockIndex, liveActivity = false) {
   const blockAttribute = ` data-chat-block-index="${blockIndex}"`;
-  if (block.role === "activities") return `<details class="activity-group"${blockAttribute}><summary><span>⌁</span>${uiLabel("activity")} <small>${block.items.length}</small></summary><div class="activity-events">${block.items.slice(-10).map(item => `<div class="activity-event">${esc(item)}</div>`).join("")}${block.items.length > 10 ? `<div class="activity-event">… ${block.items.length - 10}</div>` : ""}</div></details>`;
+  if (block.role === "activities") {
+    const items = block.items.slice(-10);
+    const latest = items[items.length - 1] || {};
+    const current = liveActivity ? `<span class="activity-current">${esc(latest.text || uiLabel("activityWorking"))}</span>` : "";
+    return `<details class="activity-group${liveActivity ? " live" : ""}"${blockAttribute}${liveActivity ? ' data-live="true" open' : ""}><summary><span class="activity-pulse" aria-hidden="true"><i></i></span><strong>${uiLabel("activity")}</strong>${current}<small>${block.items.length}</small></summary><div class="activity-events">${items.map((item, index) => { const active = liveActivity && index === items.length - 1; return `<div class="activity-event${active ? " current" : ""}"><span class="activity-event-dot" aria-hidden="true"></span><span>${esc(item.text || item)}</span></div>`; }).join("")}${block.items.length > 10 ? `<div class="activity-event activity-older">… ${block.items.length - 10}</div>` : ""}</div></details>`;
+  }
   const deliveryLabels = { sending: uiLabel("sending"), steering: uiLabel("steering"), steered: uiLabel("steering"), queued: uiLabel("queued"), running: `${statusLabel("running")} · Codex`, failed: uiLabel("failedSend") };
   const label = block.role === "user" ? (block.commandBlock ? uiLabel("commandLabel") : "") : (block.commandBlock ? uiLabel("commandResult") : uiLabel("codexPartner"));
   return `<article class="message ${block.role}${block.commandBlock ? " command-message" : ""}${block.streaming ? " streaming" : ""}"${blockAttribute} data-item-id="${esc(block.itemId || "")}"><div class="message-avatar" role="img" aria-label="${block.role === "user" ? uiLabel("you") : uiLabel("codexPartner")}" title="${block.role === "user" ? uiLabel("you") : uiLabel("codexPartner")}">${block.role === "user" ? humanMarkup() : mascotMarkup("mascot-chat")}</div><div class="message-body"><div class="message-meta">${label ? `<strong>${label}</strong>` : ""}${block.origin === "terminal" ? `<span>${uiLabel("messageFromTerminal")}</span>` : ""}${block.time ? `<time datetime="${esc(block.time)}">${esc(shortDate(block.time))}</time>` : ""}</div><div class="message-content">${block.html || ""}${block.streaming ? `<span class="stream-cursor"></span>` : ""}</div>${deliveryLabels[block.delivery] ? `<div class="message-delivery ${esc(block.delivery)}" title="${esc(block.error)}">${esc(deliveryLabels[block.delivery])}</div>` : ""}</div></article>`;
@@ -464,7 +474,13 @@ function paintVirtualChat(stickToBottom = false) {
   const average = Math.max(72, state.chatAverageHeight || 112);
   const topHeight = start * average; const bottomHeight = (blocks.length - end) * average;
   const olderControl = state.historyHasMore && start === 0 ? `<button type="button" class="chat-load-older" ${state.historyLoading ? "disabled" : ""}>${uiLabel("loadEarlierMessages")}</button>` : "";
-  stream.innerHTML = `<div class="chat-virtual-spacer" style="height:${topHeight}px"></div>${olderControl}${blocks.slice(start, end).map((block, index) => renderChatBlock(block, start + index)).join("")}<div class="chat-virtual-spacer" style="height:${bottomHeight}px"></div>`;
+  let liveActivityIndex = -1;
+  if (["running", "retrying", "queued"].includes(state.selectedTask?.status)) {
+    for (let index = blocks.length - 1; index >= 0; index -= 1) {
+      if (blocks[index].role === "activities") { liveActivityIndex = index; break; }
+    }
+  }
+  stream.innerHTML = `<div class="chat-virtual-spacer" style="height:${topHeight}px"></div>${olderControl}${blocks.slice(start, end).map((block, index) => renderChatBlock(block, start + index, start + index === liveActivityIndex)).join("")}<div class="chat-virtual-spacer" style="height:${bottomHeight}px"></div>`;
   const rendered = $$(".message, .activity-group", stream);
   if (rendered.length) {
     const measured = rendered.reduce((total, node) => total + node.getBoundingClientRect().height + 24, 0) / rendered.length;
@@ -1091,9 +1107,13 @@ function connectSocket(id, reconnect = false) {
 function showActivity(payload) {
   const task = state.selectedTask;
   if (!task || !["running", "retrying", "queued"].includes(task.status)) return;
-  const text = activityPhase(payload) || eventText(payload);
-  if (!text) return;
-  livePhases.set(task.id, String(text).replace(/\s+/g, " ").trim().slice(0, 180));
+  const phase = activityPhase(payload);
+  const detail = String(eventText(payload) || "").replace(/\s+/g, " ").trim();
+  if (!phase && !detail) return;
+  const phaseText = phase ? activityPhaseLabel(phase) : "";
+  const generic = ["exec", "exec_command", "toolCall", "mcpToolCall"].includes(detail);
+  const text = detail && !generic && detail !== phaseText ? `${phaseText}${phaseText ? " · " : ""}${detail}` : (phase || detail);
+  livePhases.set(task.id, String(text).slice(0, 180));
   renderTurnProgress();
 }
 function terminalStatus(label, kind = "") { const node = $("#terminal-status"); node.textContent = label; node.className = `terminal-status ${kind}`; }

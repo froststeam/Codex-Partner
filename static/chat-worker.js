@@ -48,6 +48,28 @@ function isAssistant(event) {
   return ["agentMessage", "agent_delta", "commandResult"].includes(payload?.type) || event.stream === "assistant";
 }
 
+function activityItem(raw, labels, event) {
+  const payload = valueOf(raw);
+  const type = String(payload?.type || "activity").toLowerCase();
+  const status = String(payload?.status || "").toLowerCase();
+  const detail = eventText(payload, labels).trim();
+  let label = labels.activityWorking || "Working";
+  if (type.includes("reason") || type === "plan") label = labels.activityPlanning || label;
+  else if (type.includes("command")) label = status === "completed" ? (labels.activityCommandDone || label) : (labels.activityCommand || label);
+  else if (type.includes("file")) label = status === "completed" ? (labels.activityFileDone || label) : (labels.activityFile || label);
+  else if (type.includes("search")) label = labels.activitySearch || label;
+  else if (type.includes("tool") || type.includes("mcp")) label = status === "completed" ? (labels.activityToolDone || label) : (labels.activityTool || label);
+  else if (type === "contextcompaction") label = labels.contextCompressed || label;
+  const generic = detail === label || ["exec", "exec_command", "toolCall", "mcpToolCall"].includes(detail);
+  return {
+    text: generic || !detail ? label : `${label} · ${detail}`,
+    status: status || (type.includes("reason") ? "started" : ""),
+    type,
+    itemId: String(payload?.item_id || payload?.id || ""),
+    time: event?.ts || event?.created_at || "",
+  };
+}
+
 function userDedupeBody(text) {
   return String(text || "")
     .replace(/<image\b[^>]*>[\s\S]*?<\/image>/gi, "")
@@ -142,7 +164,7 @@ function markdown(text) {
 }
 
 function buildBlocks(events, rawActivity, labels) {
-  const blocks = []; const assistantItems = new Map(); const userItems = new Map(); let current = null;
+  const blocks = []; const assistantItems = new Map(); const userItems = new Map(); const activityItems = new Map(); let current = null;
   for (const event of events) {
     if (["metrics", "history"].includes(event.stream)) continue;
     const text = eventText(event.payload, labels).trim();
@@ -151,9 +173,15 @@ function buildBlocks(events, rawActivity, labels) {
     const payload = valueOf(event.payload);
     if (role === "activity") {
       if (!rawActivity && ["app-server", "stdout", "stderr"].includes(event.stream)) continue;
+      const item = activityItem(payload, labels, event);
+      if (item.itemId && activityItems.has(item.itemId)) {
+        Object.assign(activityItems.get(item.itemId), item);
+        current = null;
+        continue;
+      }
       let group = blocks[blocks.length - 1];
       if (!group || group.role !== "activities") { group = { role: "activities", items: [] }; blocks.push(group); }
-      group.items.push(text); current = null; continue;
+      group.items.push(item); if (item.itemId) activityItems.set(item.itemId, item); current = null; continue;
     }
     const commandBlock = ["slashCommand", "commandResult"].includes(payload?.type);
     const itemId = role === "user" ? (payload?.client_message_id || payload?.item_id || "") : (payload?.item_id || "");

@@ -746,6 +746,52 @@ def rollout_record_phase(record: dict) -> str:
     return ""
 
 
+def compact_activity_detail(value: Any, limit: int = 260) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = re.sub(r"(?i)(bearer\s+)[^\s'\"]+", r"\1***", text)
+    text = re.sub(r"(?i)((?:api[_-]?key|token|password)\s*[:=]\s*)[^\s,;]+", r"\1***", text)
+    return text if len(text) <= limit else f"{text[:limit - 1]}…"
+
+
+def rollout_tool_activity(payload: dict) -> tuple[str, str]:
+    """Return a browser activity type and a useful, secret-safe summary."""
+    name = str(payload.get("name") or "tool")
+    lowered_name = name.lower()
+    raw_input = str(payload.get("input") or "")
+    arguments = payload.get("arguments")
+    parsed_arguments: dict[str, Any] = {}
+    if isinstance(arguments, str):
+        try:
+            decoded = json.loads(arguments)
+            if isinstance(decoded, dict):
+                parsed_arguments = decoded
+        except json.JSONDecodeError:
+            pass
+    elif isinstance(arguments, dict):
+        parsed_arguments = arguments
+
+    command = parsed_arguments.get("cmd") or parsed_arguments.get("command")
+    if not command and raw_input:
+        match = re.search(r'tools\.exec_command\s*\(\s*\{\s*cmd\s*:\s*("(?:\\.|[^"\\])*")', raw_input, re.DOTALL)
+        if match:
+            try:
+                command = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+    if command:
+        return "commandExecution", compact_activity_detail(command)
+    if "tools.apply_patch" in raw_input or "apply_patch" in lowered_name:
+        return "fileChange", "应用代码修改"
+    if "web__run" in raw_input or "search" in lowered_name:
+        return "search", "检索资料"
+    if lowered_name in {"exec", "exec_command", "write_stdin", "wait"}:
+        nested = re.search(r"tools\.([A-Za-z0-9_]+)\s*\(", raw_input)
+        detail = nested.group(1).replace("__", " · ") if nested else name
+        return "commandExecution", compact_activity_detail(detail)
+    return "toolCall", compact_activity_detail(name)
+
+
 def rollout_browser_payload(record: dict) -> Optional[dict]:
     """Translate durable CLI rollout records into the browser's live event vocabulary."""
     record_type = str(record.get("type") or "")
@@ -773,16 +819,10 @@ def rollout_browser_payload(record: dict) -> Optional[dict]:
         if lowered == "reasoning":
             return {"type": "reasoning", "text": "正在分析与规划", "item_id": payload.get("id", ""), "turn_id": turn_id}
         if lowered in {"custom_tool_call", "function_call"}:
-            name = str(payload.get("name") or "tool")
-            if name.lower() in {"exec", "exec_command", "write_stdin", "wait"}:
-                event_type = "commandExecution"
-            elif "patch" in name.lower() or "file" in name.lower():
-                event_type = "fileChange"
-            else:
-                event_type = "toolCall"
+            event_type, detail = rollout_tool_activity(payload)
             return {
                 "type": event_type,
-                "text": name,
+                "text": detail,
                 "item_id": payload.get("id", ""),
                 "status": payload.get("status", "started"),
                 "turn_id": turn_id,
@@ -2223,9 +2263,18 @@ async def handle_appserver_notification(server_key: str, message: dict) -> None:
                 "thread_id": thread_id,
             }
         else:
+            text = item.get("text", "")
+            if not text and item_type == "commandExecution":
+                text = item.get("command", "")
+            if not text and item_type == "fileChange":
+                changes = item.get("changes") or []
+                names = [Path(change.get("path", "")).name for change in changes if isinstance(change, dict) and change.get("path")]
+                text = "文件变更" + (f"：{', '.join(names[:4])}" if names else "")
+            if not text and item_type in {"mcpToolCall", "toolCall"}:
+                text = item.get("tool") or item.get("name") or item_type
             payload = {
                 "type": item_type,
-                "text": item.get("text", ""),
+                "text": compact_activity_detail(text or item_type),
                 "item_id": item_id,
                 "status": "completed" if method == "item/completed" else "started",
                 "turn_id": params.get("turnId", ""),

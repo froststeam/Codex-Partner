@@ -30,7 +30,17 @@ const UI_LABELS = {
   local: { zh: "本机", en: "Local", fr: "Local", ja: "ローカル", ko: "로컬" },
   emptySession: { zh: "空会话", en: "Empty session", fr: "Session vide", ja: "空のセッション", ko: "빈 세션" },
   controlled: { zh: "受控", en: "Controlled", fr: "Contrôlé", ja: "制御", ko: "제어됨" },
-  activity: { zh: "工具与文件活动", en: "Tools and files", fr: "Outils et fichiers", ja: "ツールとファイル", ko: "도구 및 파일" },
+  activity: { zh: "工具与活动", en: "Tools and activity", fr: "Outils et activité", ja: "ツールとアクティビティ", ko: "도구 및 활동" },
+  activityCurrent: { zh: "当前正在执行", en: "Running now", fr: "En cours", ja: "実行中", ko: "현재 실행 중" },
+  activityWorking: { zh: "正在处理", en: "Working", fr: "Traitement", ja: "処理中", ko: "처리 중" },
+  activityPlanning: { zh: "正在分析并规划", en: "Analyzing and planning", fr: "Analyse et planification", ja: "分析と計画中", ko: "분석 및 계획 중" },
+  activityCommand: { zh: "正在运行命令", en: "Running command", fr: "Exécution de commande", ja: "コマンドを実行中", ko: "명령 실행 중" },
+  activityCommandDone: { zh: "命令执行完成", en: "Command completed", fr: "Commande terminée", ja: "コマンド完了", ko: "명령 완료" },
+  activityFile: { zh: "正在修改文件", en: "Updating files", fr: "Modification des fichiers", ja: "ファイルを更新中", ko: "파일 수정 중" },
+  activityFileDone: { zh: "文件修改完成", en: "Files updated", fr: "Fichiers modifiés", ja: "ファイル更新完了", ko: "파일 수정 완료" },
+  activityTool: { zh: "正在调用工具", en: "Using tool", fr: "Utilisation d’un outil", ja: "ツールを使用中", ko: "도구 사용 중" },
+  activityToolDone: { zh: "工具调用完成", en: "Tool completed", fr: "Outil terminé", ja: "ツール完了", ko: "도구 호출 완료" },
+  activitySearch: { zh: "正在检索资料", en: "Searching", fr: "Recherche", ja: "検索中", ko: "검색 중" },
   sending: { zh: "发送中", en: "Sending", fr: "Envoi", ja: "送信中", ko: "전송 중" },
   steering: { zh: "当前 turn", en: "Current turn", fr: "Tour actuel", ja: "現在のターン", ko: "현재 턴" },
   queued: { zh: "排队中", en: "Queued", fr: "En file", ja: "待機中", ko: "대기 중" },
@@ -903,10 +913,8 @@ function updateTurnElapsed() {
   const task = state.selectedTask;
   const tip = $("#turn-progress-tip");
   if (!tip || !task || !["running", "retrying", "queued"].includes(task.status)) return;
-  const keys = ["tipSteps", "tipContext", "tipEvidence", "tipSteer", "tipGoal", "tipContinue"];
-  const elapsed = Math.max(0, Math.floor((Date.now() - activeStartedAt(task)) / 1000));
-  const seed = [...String(task.id || "")].reduce((sum, char) => sum + char.charCodeAt(0), 0);
-  const next = uiLabel(keys[(Math.floor(elapsed / 9) + seed) % keys.length]);
+  activeStartedAt(task);
+  const next = activityPhaseLabel(livePhases.get(task.id) || task.external_phase || "phaseAnalyzing");
   if (tip.textContent !== next) tip.textContent = next;
 }
 function renderTurnProgress() {
