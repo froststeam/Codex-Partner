@@ -989,7 +989,7 @@ const context = {{ self: {{ postMessage() {{}} }} }};
 vm.createContext(context);
 vm.runInContext(fs.readFileSync({json.dumps(str(worker))}, "utf8"), context);
 const blocks = context.buildBlocks([
-  {{ stream: "app-server", payload: JSON.stringify({{ type: "commandExecution", text: "python3 -m unittest", item_id: "command-1", status: "started" }}) }},
+  {{ stream: "app-server", payload: JSON.stringify({{ type: "commandExecution", text: "python3 -m unittest", command: "python3 -m unittest", item_id: "command-1", status: "started" }}) }},
   {{ stream: "app-server", payload: JSON.stringify({{ type: "commandExecution", text: "python3 -m unittest", item_id: "command-1", status: "completed" }}) }}
 ], true, {{ activityCommand: "running", activityCommandDone: "done", activityWorking: "working" }});
 process.stdout.write(JSON.stringify(blocks));
@@ -1000,6 +1000,32 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertEqual(1, len(blocks[0]["items"]))
         self.assertEqual("completed", blocks[0]["items"][0]["status"])
         self.assertEqual("done · python3 -m unittest", blocks[0]["items"][0]["text"])
+
+    def test_worker_hides_raw_codex_protocol_but_keeps_normalized_command(self):
+        worker = Path(__file__).resolve().parents[1] / "static/chat-worker.js"
+        script = f"""
+const fs = require("fs");
+const vm = require("vm");
+const context = {{ self: {{ postMessage() {{}} }} }};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync({json.dumps(str(worker))}, "utf8"), context);
+const blocks = context.buildBlocks([
+  {{ stream: "app-server", payload: JSON.stringify({{ type: "codex", method: "turn/diff/updated", params: {{}} }}) }},
+  {{ stream: "app-server", payload: JSON.stringify({{ type: "commandExecution", text: "python3 -m unittest", item_id: "command-1", status: "started" }}) }},
+  {{ stream: "app-server", payload: JSON.stringify({{ type: "codex", method: "item/commandExecution/outputDelta", params: {{ itemId: "command-1", delta: "partial output" }} }}) }},
+  {{ stream: "app-server", payload: JSON.stringify({{ type: "codex", method: "thread/tokenUsage/updated", params: {{}} }}) }},
+  {{ stream: "app-server", payload: JSON.stringify({{ type: "commandExecution", text: "python3 -m unittest", command: "python3 -m unittest", item_id: "command-1", status: "completed", output: "OK" }}) }}
+], true, {{ activityCommand: "running", activityCommandDone: "done", activityWorking: "working" }});
+process.stdout.write(JSON.stringify(blocks));
+"""
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+        blocks = json.loads(result.stdout)
+        self.assertEqual(1, len(blocks))
+        self.assertEqual(1, len(blocks[0]["items"]))
+        self.assertEqual("completed", blocks[0]["items"][0]["status"])
+        self.assertEqual("python3 -m unittest", blocks[0]["items"][0]["command"])
+        self.assertEqual("OK", blocks[0]["items"][0]["output"])
+        self.assertNotIn("outputDelta", json.dumps(blocks))
 
     def test_model_slash_command_supports_named_updates_and_defaults(self):
         task_id = "model-command-thread"
@@ -2206,7 +2232,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn('/core.js?v=20260817-queue-races', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260817-markdown-math', html)
+        self.assertIn('/conversation.js?v=20260817-protocol-filter', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -2435,7 +2461,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260817-markdown-math', html)
+        self.assertIn('/conversation.js?v=20260817-protocol-filter', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260817-queue-races', html)
@@ -2447,7 +2473,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn(".session-card.selected::before", styles)
         self.assertNotIn("renderSessionList(); renderConversation(); await loadWorkspace(\"\")", conversation_js)
         self.assertIn(".queued-messages { width: auto; height: auto; min-height: 0; max-height: none; align-self: stretch;", styles)
-        self.assertIn('/chat-worker.js?v=20260817-markdown-math', conversation_js)
+        self.assertIn('/chat-worker.js?v=20260817-protocol-filter', conversation_js)
         self.assertIn('data-live="true" open', conversation_js)
         self.assertIn("activity-event.current::after", styles)
         self.assertIn("function renderActivityEvent", conversation_js)

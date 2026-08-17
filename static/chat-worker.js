@@ -116,6 +116,7 @@ function activityItem(raw, labels, event) {
   const changes = Array.isArray(payload?.changes) ? payload.changes : (Array.isArray(native.changes) ? native.changes : []);
   const plan = Array.isArray(payload?.plan) ? payload.plan : (Array.isArray(native.plan) ? native.plan : (Array.isArray(native.steps) ? native.steps : []));
   const protocolNoise = ["updated", "update", "diff", "output", "delta", "itemupdated", "itemdelta", "turnupdated", "turndiff"].includes(normalizedType);
+  const rawCodexProtocol = type === "codex" && Boolean(payload?.method);
   const reasoningText = String(payload?.text || native.summary || native.content || "").trim();
   const emptyReasoning = type.includes("reason") && (!reasoningText || ["reasoning", "正在分析与规划", "正在处理"].includes(reasoningText));
   return {
@@ -130,7 +131,7 @@ function activityItem(raw, labels, event) {
     arguments: args,
     changes,
     plan,
-    hidden: protocolNoise || emptyReasoning,
+    hidden: protocolNoise || rawCodexProtocol || emptyReasoning,
     exitCode: payload?.exit_code ?? native.exitCode ?? null,
     status: status || (type.includes("reason") ? "started" : ""),
     type,
