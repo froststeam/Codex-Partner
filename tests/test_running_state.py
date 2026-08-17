@@ -1119,7 +1119,7 @@ const cursors = [];
         self.assertIn("HistoryPagination.fetchEarlierTimelinePages", conversation)
         self.assertIn("messageTarget: 12, maxPages: 8", conversation)
         self.assertIn('/history-pagination.js?v=20260817-message-history', html)
-        self.assertIn('/conversation.js?v=20260817-message-boundary', html)
+        self.assertIn('/conversation.js?v=20260817-message-metrics', html)
 
     def test_sent_browser_messages_follow_the_loaded_timeline_boundary(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -1152,7 +1152,38 @@ process.stdout.write(JSON.stringify({{ recent: bodies(recentEvents), older: bodi
         self.assertEqual(["currently running message", "old sent message", "current sent message"], payload["older"])
 
         conversation = (worker.parent / "conversation.js").read_text(encoding="utf-8")
-        self.assertIn('/chat-worker.js?v=20260817-message-boundary', conversation)
+        self.assertIn('/chat-worker.js?v=20260817-message-metrics', conversation)
+
+    def test_metrics_user_event_does_not_hide_its_browser_message(self):
+        worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
+        script = f"""
+const fs = require("fs");
+const vm = require("vm");
+const context = {{ self: {{ postMessage() {{}} }} }};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync({json.dumps(str(worker))}, "utf8"), context);
+const messageId = "message-in-metrics";
+const merged = context.mergeEvents([
+  {{
+    id: "history-boundary",
+    ts: "2026-08-17T14:00:00Z",
+    stream: "native",
+    payload: JSON.stringify({{ type: "agentMessage", text: "recent reply" }}),
+  }},
+  {{
+    id: "metric-user",
+    ts: "2026-08-17T14:30:00Z",
+    stream: "metrics",
+    payload: JSON.stringify({{ type: "userMessage", text: "keep this message", client_message_id: messageId }}),
+  }},
+], [
+  {{ id: messageId, body: "keep this message", status: "steered", created_at: "2026-08-17T14:30:00Z" }},
+]);
+const browserMessages = merged.filter(event => event.stream === "user").map(event => event.payload.text);
+process.stdout.write(JSON.stringify(browserMessages));
+"""
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+        self.assertEqual(["keep this message"], json.loads(result.stdout))
 
     def test_model_slash_command_supports_named_updates_and_defaults(self):
         task_id = "model-command-thread"
@@ -2359,7 +2390,7 @@ process.stdout.write(JSON.stringify({{ recent: bodies(recentEvents), older: bodi
         self.assertIn('/core.js?v=20260817-activity-history', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260817-message-boundary', html)
+        self.assertIn('/conversation.js?v=20260817-message-metrics', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -2588,7 +2619,7 @@ process.stdout.write(JSON.stringify({{ recent: bodies(recentEvents), older: bodi
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260817-message-boundary', html)
+        self.assertIn('/conversation.js?v=20260817-message-metrics', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260817-queue-races', html)
@@ -2600,7 +2631,7 @@ process.stdout.write(JSON.stringify({{ recent: bodies(recentEvents), older: bodi
         self.assertIn(".session-card.selected::before", styles)
         self.assertNotIn("renderSessionList(); renderConversation(); await loadWorkspace(\"\")", conversation_js)
         self.assertIn(".queued-messages { width: auto; height: auto; min-height: 0; max-height: none; align-self: stretch;", styles)
-        self.assertIn('/chat-worker.js?v=20260817-message-boundary', conversation_js)
+        self.assertIn('/chat-worker.js?v=20260817-message-metrics', conversation_js)
         self.assertIn('data-live="true" open', conversation_js)
         self.assertIn("activity-event.current::after", styles)
         self.assertIn("function renderActivityEvent", conversation_js)

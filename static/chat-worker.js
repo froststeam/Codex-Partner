@@ -177,6 +177,10 @@ function mergeEvents(events, messages) {
   const seenUserKeys = new Set();
   const seenUserBodies = new Map();
   for (const event of events || []) {
+    if (event.stream === "metrics") {
+      merged.push(event);
+      continue;
+    }
     const payload = valueOf(event.payload);
     if (payload?.type === "userMessage") {
       const body = userDedupeBody(eventText(payload, {}));
