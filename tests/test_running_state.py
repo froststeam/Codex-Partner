@@ -78,6 +78,24 @@ class RunningStateTests(unittest.TestCase):
         self.assertEqual(1, output_payload["exit_code"])
         self.assertEqual("line one\nline two", output_payload["output"])
 
+    def test_native_tool_output_enriches_matching_rollout_activity(self):
+        rollout = [{
+            "id": 1,
+            "stream": "rollout",
+            "payload": json.dumps({"type": "commandExecution", "turn_id": "turn-1", "item_id": "call-1", "command": "pwd"}),
+        }]
+        native = [{
+            "id": "native-1",
+            "stream": "native",
+            "payload": json.dumps({"type": "commandExecution", "turn_id": "turn-1", "item_id": "call-1", "command": "pwd", "output": "/tmp", "exit_code": 0, "status": "completed"}),
+        }]
+        merged = self.app.merge_native_with_rollout(native, rollout)
+        self.assertEqual(1, len(merged))
+        payload = json.loads(merged[0]["payload"])
+        self.assertEqual("/tmp", payload["output"])
+        self.assertEqual(0, payload["exit_code"])
+        self.assertEqual("completed", payload["status"])
+
         patch_payload = self.app.rollout_browser_payload({
             "type": "response_item",
             "payload": {"type": "custom_tool_call", "name": "exec", "input": "text(await tools.apply_patch(patch));"},

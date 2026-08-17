@@ -4541,6 +4541,38 @@ def history_event_identity(event: dict) -> Optional[tuple[str, str, str]]:
     return (turn_id, event_type, item_id or str(payload.get("text") or ""))
 
 
+def merge_native_with_rollout(native_events: list[dict], persisted: list[dict]) -> list[dict]:
+    """Keep rollout ordering while filling tool details from richer native items."""
+    merged_persisted = [dict(event) for event in persisted]
+    rollout_indexes = {
+        identity: index
+        for index, event in enumerate(merged_persisted)
+        if event.get("stream") == "rollout" and (identity := history_event_identity(event))
+    }
+    remaining_native: list[dict] = []
+    for native in native_events:
+        identity = history_event_identity(native)
+        if identity not in rollout_indexes:
+            remaining_native.append(native)
+            continue
+        index = rollout_indexes[identity]
+        rollout = merged_persisted[index]
+        try:
+            native_payload = native.get("payload") if isinstance(native.get("payload"), dict) else json.loads(native.get("payload") or "{}")
+            rollout_payload = rollout.get("payload") if isinstance(rollout.get("payload"), dict) else json.loads(rollout.get("payload") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(native_payload, dict) or not isinstance(rollout_payload, dict):
+            continue
+        for key in ("command", "output", "cwd", "tool", "arguments", "changes", "exit_code"):
+            if native_payload.get(key) not in (None, "", []):
+                rollout_payload[key] = native_payload[key]
+        if native_payload.get("status") in {"completed", "failed", "succeeded"}:
+            rollout_payload["status"] = native_payload["status"]
+        rollout["payload"] = json.dumps(rollout_payload, ensure_ascii=False)
+    return remaining_native + merged_persisted
+
+
 def runtime_metric_events(events: list[dict], limit: int = 3) -> list[dict]:
     """Keep timing events for recent turns without replaying their chat content."""
     parsed: list[tuple[dict, dict, str]] = []
@@ -4654,10 +4686,7 @@ async def native_timeline_events(task: dict) -> tuple[list[dict], list[dict]]:
         )
         metrics = runtime_metric_events(metric_source)
         runtime_metric_cache[task["id"]] = (metric_version, metrics)
-    rollout_events = [event for event in persisted if event.get("stream") == "rollout"]
-    rollout_identities = {identity for event in rollout_events if (identity := history_event_identity(event))}
-    native_events = [event for event in native_events if history_event_identity(event) not in rollout_identities]
-    merged = native_events + persisted
+    merged = merge_native_with_rollout(native_events, persisted)
     merged.sort(key=history_event_key)
     return merged, metrics
 
@@ -4723,13 +4752,13 @@ async def task_events(task_id: str, session_id: Optional[str] = None, history_li
             else:
                 native_events = await native_history_events(task)
                 history_hidden = 0
-            rollout_events = [event for event in events if event.get("stream") == "rollout"]
             metric_events = runtime_metric_events(metric_source)
-            rollout_identities = {identity for event in rollout_events if (identity := history_event_identity(event))}
-            native_events = [event for event in native_events if history_event_identity(event) not in rollout_identities]
             # Native history owns chat rendering. Recent app-server deltas are
             # retained on a hidden stream solely for persisted runtime metrics.
-            events = native_events + [event for event in events if event.get("stream") in {"system", "rollout"}] + metric_events
+            events = merge_native_with_rollout(
+                native_events,
+                [event for event in events if event.get("stream") in {"system", "rollout"}],
+            ) + metric_events
             if history_hidden:
                 events.append({
                     "id": f"history-{task_id}",
