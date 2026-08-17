@@ -67,6 +67,8 @@ async function selectSession(id, openSocket = true) {
   if (state.selectedId !== id) {
     resetWorkspaceBrowser(); state.titleExpanded = false; state.historyCursor = ""; state.historyHasMore = false;
     state.historyLoading = false; state.chatBlocks = []; state.chatVirtualStart = null; state.pendingApprovals = [];
+    state.selectedEvents = []; state.selectedMessages = []; state.composerHistory = []; state.historyIndex = -1;
+    state.runtimeMetrics = { taskId: "", ttftMs: null, tpotMs: null, estimated: true, outputTokens: 0 };
   }
   state.selectedId = id; localStorage.setItem("codex-dashboard-session", id);
   const task = state.tasks.find(item => item.id === id);
