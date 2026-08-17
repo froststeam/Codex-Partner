@@ -64,6 +64,7 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn("Bearer ***", payload["command"])
         self.assertNotIn("secret-value", payload["command"])
         self.assertEqual("call-command", payload["item_id"])
+        self.assertEqual("started", payload["status"])
 
         output_payload = self.app.rollout_browser_payload({
             "type": "response_item",
