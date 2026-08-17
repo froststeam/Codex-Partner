@@ -939,6 +939,8 @@ print("ok")
 <script>alert(1)</script>
 
 [safe](https://example.com) [unsafe](javascript:alert(1))
+
+[local log](/home/ori/work/result.log)
 """
         script = f"""
 const fs = require("fs");
@@ -967,6 +969,7 @@ process.stdout.write(JSON.stringify(context.markdown({json.dumps(source)})));
         self.assertNotIn("<script>", html)
         self.assertIn('target="_blank" rel="noopener noreferrer"', html)
         self.assertNotIn('href="javascript:', html)
+        self.assertIn('href="#" data-chat-file="/home/ori/work/result.log" data-chat-kind="mention"', html)
 
         for relative in (
             "vendor/markdown-it/markdown-it.min.js",
@@ -1075,7 +1078,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn('data-activity-output-key="${esc(outputKey)}"', conversation)
         self.assertIn("Object.prototype.hasOwnProperty.call(state.activityOutputOpen, outputKey)", conversation)
         self.assertIn("state.activityOutputOpen[output.dataset.activityOutputKey] = output.open", conversation)
-        self.assertIn('/conversation.js?v=20260817-transcript-state', html)
+        self.assertIn('/conversation.js?v=20260817-link-recovery', html)
 
     def test_message_history_skips_activity_only_pages(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -1131,7 +1134,7 @@ const cursors = [];
         self.assertIn("HistoryPagination.fetchEarlierTimelinePages", conversation)
         self.assertIn("messageTarget: 12, maxPages: 8", conversation)
         self.assertIn('/history-pagination.js?v=20260817-message-history', html)
-        self.assertIn('/conversation.js?v=20260817-transcript-state', html)
+        self.assertIn('/conversation.js?v=20260817-link-recovery', html)
 
     def test_sent_browser_messages_follow_the_loaded_timeline_boundary(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -2399,10 +2402,10 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("new File([file]", app_js)
         self.assertIn('uiLabel("binaryAttachment"', app_js)
         self.assertIn('/app.js?v=20260817-queue-races', html)
-        self.assertIn('/core.js?v=20260817-activity-history', html)
+        self.assertIn('/core.js?v=20260817-link-recovery', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260817-transcript-state', html)
+        self.assertIn('/conversation.js?v=20260817-link-recovery', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -2631,7 +2634,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260817-transcript-state', html)
+        self.assertIn('/conversation.js?v=20260817-link-recovery', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260817-queue-races', html)
@@ -2670,7 +2673,9 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("function copyChatBlock", conversation_js)
         self.assertIn('data-copy-chat-block="${blockIndex}"', conversation_js)
         self.assertIn("data-copy-activity-item", conversation_js)
-        self.assertIn("chatHasTextSelection() && event.target.closest", conversation_js)
+        self.assertIn("state.chatPointerDragged && event.target.closest", conversation_js)
+        self.assertIn("Math.hypot(event.clientX - state.chatPointerStartX", conversation_js)
+        self.assertNotIn("chatHasTextSelection() && event.target.closest", conversation_js)
         self.assertIn("user-select: text", styles)
         self.assertIn(".chat-copy-button", styles)
 

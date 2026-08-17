@@ -623,12 +623,21 @@ function installChatSelectionGuard() {
   stream.addEventListener("pointerdown", event => {
     if (event.button !== 0 || event.target.closest("button, input, textarea, select, summary")) return;
     state.chatPointerSelecting = true;
+    state.chatPointerDragged = false;
+    state.chatPointerStartX = event.clientX;
+    state.chatPointerStartY = event.clientY;
     state.chatSelectionActive = true;
   });
+  stream.addEventListener("pointermove", event => {
+    if (!state.chatPointerSelecting || state.chatPointerDragged) return;
+    if (Math.hypot(event.clientX - state.chatPointerStartX, event.clientY - state.chatPointerStartY) >= 5) state.chatPointerDragged = true;
+  });
   stream.addEventListener("click", async event => {
-    if (chatHasTextSelection() && event.target.closest("a, [data-media-src]")) {
+    if (state.chatPointerDragged && event.target.closest("a, [data-media-src]")) {
+      state.chatPointerDragged = false;
       event.preventDefault(); event.stopImmediatePropagation(); return;
     }
+    state.chatPointerDragged = false;
     const button = event.target.closest("[data-copy-chat-block]");
     if (!button) return;
     event.preventDefault(); event.stopPropagation();
@@ -646,9 +655,9 @@ function installChatSelectionGuard() {
   document.addEventListener("pointerup", () => {
     if (!state.chatPointerSelecting) return;
     state.chatPointerSelecting = false;
-    setTimeout(releaseChatSelectionLock, 0);
+    setTimeout(() => { state.chatPointerDragged = false; releaseChatSelectionLock(); }, 0);
   });
-  document.addEventListener("pointercancel", () => { state.chatPointerSelecting = false; releaseChatSelectionLock(); });
+  document.addEventListener("pointercancel", () => { state.chatPointerSelecting = false; state.chatPointerDragged = false; releaseChatSelectionLock(); });
   document.addEventListener("selectionchange", () => {
     if (state.chatSelectionActive && !state.chatPointerSelecting) setTimeout(releaseChatSelectionLock, 0);
   });

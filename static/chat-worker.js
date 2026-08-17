@@ -16,6 +16,12 @@ if (typeof importScripts === "function") {
       chatMarkdownRenderer = markdownFactory({ html: false, breaks: true, linkify: true, typographer: false });
       const defaultLinkOpen = chatMarkdownRenderer.renderer.rules.link_open || ((tokens, index, options, env, renderer) => renderer.renderToken(tokens, index, options));
       chatMarkdownRenderer.renderer.rules.link_open = (tokens, index, options, env, renderer) => {
+        const href = String(tokens[index].attrGet("href") || "");
+        if (href.startsWith("/") && !href.startsWith("//")) {
+          tokens[index].attrSet("href", "#");
+          tokens[index].attrSet("data-chat-file", href);
+          tokens[index].attrSet("data-chat-kind", "mention");
+        }
         tokens[index].attrSet("target", "_blank");
         tokens[index].attrSet("rel", "noopener noreferrer");
         return defaultLinkOpen(tokens, index, options, env, renderer);
