@@ -293,15 +293,16 @@ async function toggleGoalRun() {
   const task = state.selectedTask;
   const goal = String(task?.goal || "").trim();
   if (!task || !state.selectedId || !goal) return toast("请先设置 Goal");
-  const goalRunning = goalIsRunning(task);
-  if (goalRunning) {
+  const goalActive = goalIsActive(task);
+  const turnActive = ["running", "retrying", "queued"].includes(task.status);
+  if (goalActive && turnActive) {
     const stopped = await changeSelectedRun("stop", false);
     if (!stopped || ["running", "retrying", "queued"].includes(stopped.status)) return toast("当前 Codex 未能暂停");
   }
   try {
-    const updated = await api(`/tasks/${state.selectedId}/goal`, { method: "PUT", body: JSON.stringify({ status: goalRunning ? "paused" : "active" }) });
+    const updated = await api(`/tasks/${state.selectedId}/goal`, { method: "PUT", body: JSON.stringify({ status: goalActive ? "paused" : "active" }) });
     state.selectedTask = { ...state.selectedTask, ...updated }; mergeTask(updated); renderConversation();
-    if (!goalRunning) {
+    if (!goalActive) {
       const resumed = await changeSelectedRun("resume", false);
       if (!resumed) return toast("Goal 已继续，但恢复 Codex 失败");
       toast("Goal 已继续，正在 resume");

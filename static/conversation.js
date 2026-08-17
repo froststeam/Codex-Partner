@@ -293,8 +293,8 @@ function goalStatusSummary(task, goal) {
 function goalCanAutoResume(status) {
   return !["paused", "blocked", "complete", "none"].includes(status || "none");
 }
-function goalIsRunning(task) {
-  return Boolean(task?.goal) && ["running", "retrying", "queued"].includes(task.status) && task.run_mode === "goal_resume" && goalCanAutoResume(task.goal_status || "active");
+function goalIsActive(task) {
+  return Boolean(String(task?.goal || "").trim()) && goalCanAutoResume(task.goal_status || "active");
 }
 function renderGoalBar() {
   const task = state.selectedTask;
@@ -303,17 +303,17 @@ function renderGoalBar() {
   bar.hidden = false;
   const goal = String(task.goal || "").trim();
   const activeTurn = ["running", "retrying", "queued"].includes(task.status);
-  const goalRunning = goalIsRunning(task);
+  const goalActive = goalIsActive(task);
   const inputHasContent = Boolean($("#message-input")?.value.trim() || pendingAttachments.length);
   $("#goal-text").textContent = goal;
   $("#goal-text").classList.toggle("empty", !goal);
   $("#goal-task-status").textContent = goalStatusSummary(task, goal);
-  $("#goal-run-toggle").classList.toggle("active", goalRunning);
+  $("#goal-run-toggle").classList.toggle("active", goalActive);
   $("#goal-run-toggle").disabled = !goal;
-  $("#goal-run-toggle").title = !goal ? uiLabel("setGoal") : (goalRunning ? uiLabel("goalPause") : uiLabel("goalStart"));
+  $("#goal-run-toggle").title = !goal ? uiLabel("setGoal") : (goalActive ? uiLabel("goalPause") : uiLabel("goalStart"));
   $("#goal-run-toggle").setAttribute("aria-label", $("#goal-run-toggle").title);
-  $("#goal-run-icon").textContent = goalRunning ? "Ⅱ" : "▶";
-  $("#goal-run-label").textContent = goalRunning ? uiLabel("pause") : uiLabel("start");
+  $("#goal-run-icon").textContent = goalActive ? "Ⅱ" : "▶";
+  $("#goal-run-label").textContent = goalActive ? uiLabel("pause") : uiLabel("start");
   const retryToggle = $("#goal-retry-toggle");
   retryToggle.disabled = !goal;
   retryToggle.classList.toggle("active", Boolean(goal && task.retry_forever));
