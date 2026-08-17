@@ -1,10 +1,11 @@
 // Shared state, transport, formatting, and realtime synchronization primitives.
+const DEFAULT_USER_AVATAR = "/default-user-avatar.webp?v=20260818";
 const state = {
   tasks: [], sessions: [], skills: [], providers: [], memories: [], generatedMemories: [], commands: [], sshHosts: [], sshConfig: "", activeSSHHost: localStorage.getItem("codex-dashboard-ssh-host") || "",
   selectedId: null, selectedTask: null, selectedEvents: [], selectedMessages: [], pendingApprovals: [], sessionRequestId: 0, sessionAbortController: null, workspacePath: "", workspaceFile: null, workspaceRequestId: 0, workspacePickerPath: "", workspaceUploading: false, inspectorClosed: false, filter: "all", query: "",
   historyCursor: "", historyHasMore: false, historyLoading: false, chatBlocks: [], chatVirtualStart: null, chatAverageHeight: 112, activityVisibleCounts: {}, activityOutputOpen: {},
   commandIndex: 0, rawActivity: true, composerHistory: [], historyIndex: -1, editingQueuedId: null, defaultWorkspace: "", codexAvailable: true, codexInstall: null, codexInfo: null,
-  runtimeMetrics: { taskId: "", ttftMs: null, tpotMs: null, estimated: true, outputTokens: 0 }, serverInfo: { user: "", hostname: "" }, chatSnapToBottom: false, chatSelectionActive: false, chatPointerSelecting: false, chatPointerDragged: false, chatPointerStartX: 0, chatPointerStartY: 0, userAvatar: localStorage.getItem("codex-dashboard-user-avatar") || "",
+  runtimeMetrics: { taskId: "", ttftMs: null, tpotMs: null, estimated: true, outputTokens: 0 }, serverInfo: { user: "", hostname: "" }, chatSnapToBottom: false, chatSelectionActive: false, chatPointerSelecting: false, chatPointerDragged: false, chatPointerStartX: 0, chatPointerStartY: 0, userAvatar: localStorage.getItem("codex-dashboard-user-avatar") || DEFAULT_USER_AVATAR,
 };
 const legacyUserAvatar = localStorage.getItem("codex-dashboard-user-avatar") || "";
 state.selectedId = localStorage.getItem("codex-dashboard-session") || null;
@@ -394,10 +395,10 @@ function humanMarkup(className = "") {
   return `<span class="human-avatar ${className}" aria-hidden="true"><i></i><b></b></span>`;
 }
 function applyUserProfile(profile, rerender = false) {
-  const next = profile?.avatar_url || "";
+  const next = profile?.avatar_url || DEFAULT_USER_AVATAR;
   const changed = next !== state.userAvatar;
   state.userAvatar = next;
-  if (next) localStorage.removeItem("codex-dashboard-user-avatar");
+  if (profile?.avatar_url) localStorage.removeItem("codex-dashboard-user-avatar");
   if (changed && rerender && typeof renderChat === "function") renderChat();
 }
 async function loadUserProfile() {

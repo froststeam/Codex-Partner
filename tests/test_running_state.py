@@ -207,6 +207,19 @@ class RunningStateTests(unittest.TestCase):
             self.app.overview_client_users.pop(own_device, None)
             self.app.overview_client_users.pop(other_user, None)
 
+    def test_current_profile_image_is_the_default_user_avatar(self):
+        static = Path(__file__).resolve().parents[1] / "static"
+        avatar = static / "default-user-avatar.webp"
+        core = (static / "core.js").read_text(encoding="utf-8")
+        html = (static / "index.html").read_text(encoding="utf-8")
+        self.assertTrue(avatar.is_file())
+        with self.app.Image.open(avatar) as image:
+            self.assertEqual("WEBP", image.format)
+            self.assertEqual((282, 320), image.size)
+        self.assertIn('const DEFAULT_USER_AVATAR = "/default-user-avatar.webp?v=20260818"', core)
+        self.assertIn('profile?.avatar_url || DEFAULT_USER_AVATAR', core)
+        self.assertIn('/core.js?v=20260818-default-avatar', html)
+
     def test_app_server_reads_large_json_messages_in_chunks(self):
         async def collect():
             payload = json.dumps({"id": 7, "result": {"text": "x" * (2 * 1024 * 1024)}}).encode() + b"\n"
@@ -1860,7 +1873,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn(".panel-item button.danger-text:not(:disabled)", styles)
         self.assertNotIn(".panel-item button:last-child", styles)
         self.assertIn('/styles.css?v=20260817-skill-actions', html)
-        self.assertIn('/core.js?v=20260817-skill-actions', html)
+        self.assertIn('/core.js?v=20260818-default-avatar', html)
         self.assertIn('/settings.js?v=20260817-skill-actions', html)
 
     def test_provider_probe_status_and_endpoint_refresh(self):
@@ -2415,7 +2428,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("new File([file]", app_js)
         self.assertIn('uiLabel("binaryAttachment"', app_js)
         self.assertIn('/app.js?v=20260817-queue-races', html)
-        self.assertIn('/core.js?v=20260817-skill-actions', html)
+        self.assertIn('/core.js?v=20260818-default-avatar', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
         self.assertIn('/conversation.js?v=20260817-session-navigation', html)
