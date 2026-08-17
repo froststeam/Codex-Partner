@@ -909,6 +909,77 @@ process.stdout.write(JSON.stringify(blocks[0].html));
         self.assertIn('data-chat-file="image-mswtyzp4.png"', html)
         self.assertIn("chat-image-attachment", html)
 
+    def test_chat_markdown_supports_tables_math_and_safe_rich_blocks(self):
+        static = Path(__file__).resolve().parents[1] / "static"
+        source = """# Result
+
+| Name | Value |
+|:--|--:|
+| alpha | 42 |
+
+Inline $E=mc^2$.
+
+Bracket inline \\(a^2+b^2=c^2\\).
+
+$$\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}$$
+
+\\[\\prod_{j=1}^{m} j = m!\\]
+
+> quoted text
+
+1. first
+   - nested
+
+~~removed~~
+
+```python
+print("ok")
+```
+
+<script>alert(1)</script>
+
+[safe](https://example.com) [unsafe](javascript:alert(1))
+"""
+        script = f"""
+const fs = require("fs");
+const path = require("path");
+const vm = require("vm");
+const staticRoot = {json.dumps(str(static))};
+const context = {{ console, atob, self: {{ postMessage() {{}} }} }};
+vm.createContext(context);
+context.importScripts = (...urls) => {{
+  for (const url of urls) vm.runInContext(fs.readFileSync(path.join(staticRoot, url), "utf8"), context, {{ filename: url }});
+}};
+vm.runInContext(fs.readFileSync(path.join(staticRoot, "chat-worker.js"), "utf8"), context);
+process.stdout.write(JSON.stringify(context.markdown({json.dumps(source)})));
+"""
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+        html = json.loads(result.stdout)
+        self.assertIn('<div class="markdown-table-wrap"><table>', html)
+        self.assertIn('style="text-align:right"', html)
+        self.assertEqual(4, html.count('class="katex"'))
+        self.assertIn("<blockquote>", html)
+        self.assertIn("<ol>", html)
+        self.assertIn("<ul>", html)
+        self.assertIn("<s>removed</s>", html)
+        self.assertIn('class="language-python"', html)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", html)
+        self.assertNotIn("<script>", html)
+        self.assertIn('target="_blank" rel="noopener noreferrer"', html)
+        self.assertNotIn('href="javascript:', html)
+
+        for relative in (
+            "vendor/markdown-it/markdown-it.min.js",
+            "vendor/markdown-it/LICENSE",
+            "vendor/markdown-it-texmath/texmath.js",
+            "vendor/markdown-it-texmath/LICENSE",
+            "vendor/katex/katex.min.js",
+            "vendor/katex/katex.min.css",
+            "vendor/katex/LICENSE",
+            "vendor/katex/fonts/KaTeX_Main-Regular.woff2",
+        ):
+            self.assertTrue((static / relative).is_file(), relative)
+
     def test_worker_merges_live_activity_start_and_completion(self):
         worker = Path(__file__).resolve().parents[1] / "static/chat-worker.js"
         script = f"""
@@ -2135,7 +2206,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn('/core.js?v=20260817-queue-races', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260817-queue-races', html)
+        self.assertIn('/conversation.js?v=20260817-markdown-math', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -2364,18 +2435,19 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260817-queue-races', html)
+        self.assertIn('/conversation.js?v=20260817-markdown-math', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260817-queue-races', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
-        self.assertIn('/styles.css?v=20260817-copy-friendly', html)
+        self.assertIn('/styles.css?v=20260817-markdown-math', html)
+        self.assertIn('/vendor/katex/katex.min.css', html)
         self.assertIn('<span id="goal-run-label">暂停</span>', html)
         self.assertNotIn('id="goal-run-label" class="sr-only"', html)
         self.assertIn(".session-card.selected::before", styles)
         self.assertNotIn("renderSessionList(); renderConversation(); await loadWorkspace(\"\")", conversation_js)
         self.assertIn(".queued-messages { width: auto; height: auto; min-height: 0; max-height: none; align-self: stretch;", styles)
-        self.assertIn('/chat-worker.js?v=20260817-focused-activity', conversation_js)
+        self.assertIn('/chat-worker.js?v=20260817-markdown-math', conversation_js)
         self.assertIn('data-live="true" open', conversation_js)
         self.assertIn("activity-event.current::after", styles)
         self.assertIn("function renderActivityEvent", conversation_js)

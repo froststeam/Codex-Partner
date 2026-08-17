@@ -1,6 +1,46 @@
 /* Chat history normalization stays off the UI thread; output is sanitized HTML. */
 const escapeHtml = (value = "") => String(value).replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
 
+let chatMarkdownRenderer = null;
+if (typeof importScripts === "function") {
+  try {
+    importScripts(
+      "/vendor/markdown-it/markdown-it.min.js",
+      "/vendor/katex/katex.min.js",
+      "/vendor/markdown-it-texmath/texmath.js",
+    );
+    const markdownFactory = typeof markdownit === "function" ? markdownit : self.markdownit;
+    const mathEngine = typeof katex === "object" ? katex : self.katex;
+    const mathPlugin = typeof texmath === "function" ? texmath : self.texmath;
+    if (typeof markdownFactory === "function") {
+      chatMarkdownRenderer = markdownFactory({ html: false, breaks: true, linkify: true, typographer: false });
+      const defaultLinkOpen = chatMarkdownRenderer.renderer.rules.link_open || ((tokens, index, options, env, renderer) => renderer.renderToken(tokens, index, options));
+      chatMarkdownRenderer.renderer.rules.link_open = (tokens, index, options, env, renderer) => {
+        tokens[index].attrSet("target", "_blank");
+        tokens[index].attrSet("rel", "noopener noreferrer");
+        return defaultLinkOpen(tokens, index, options, env, renderer);
+      };
+      const defaultImage = chatMarkdownRenderer.renderer.rules.image;
+      chatMarkdownRenderer.renderer.rules.image = (tokens, index, options, env, renderer) => {
+        tokens[index].attrSet("loading", "lazy");
+        tokens[index].attrSet("referrerpolicy", "no-referrer");
+        return defaultImage(tokens, index, options, env, renderer);
+      };
+      chatMarkdownRenderer.renderer.rules.table_open = () => '<div class="markdown-table-wrap"><table>';
+      chatMarkdownRenderer.renderer.rules.table_close = () => "</table></div>";
+      if (typeof mathPlugin === "function" && mathEngine) {
+        chatMarkdownRenderer.use(mathPlugin, {
+          engine: mathEngine,
+          delimiters: ["dollars", "brackets"],
+          katexOptions: { throwOnError: false, strict: "ignore", trust: false, output: "htmlAndMathml" },
+        });
+      }
+    }
+  } catch (_) {
+    chatMarkdownRenderer = null;
+  }
+}
+
 function valueOf(raw) {
   if (typeof raw !== "string") return raw;
   try { return JSON.parse(raw); } catch (_) { return raw; }
@@ -171,7 +211,7 @@ function markdown(text) {
     .replace(/(?:Uploaded to workspace|已上传到工作区)\s*[:：]\s*([^\n\r，。]+?\.[a-z0-9]{1,12})(?=\s|[，。]|$)/gi, (_, path) => { files.push({ kind: "legacy", path: path.trim() }); return ""; })
     .replace(/\[(?:Attachments?|附件)\s*[:：]\s*[^\]]+\]/gi, "")
     .trim();
-  const body = escapeHtml(clean)
+  const fallbackBody = () => escapeHtml(clean)
     .replace(/```(?:[a-zA-Z0-9_+-]+)?\n?([\s\S]*?)```/g, '<pre class="code-block">$1</pre>')
     .replace(/`([^`\n]+)`/g, '<code class="inline-code">$1</code>')
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
@@ -179,6 +219,7 @@ function markdown(text) {
     .replace(/^###\s+(.+)$/gm, "<h4>$1</h4>")
     .replace(/^[-*]\s+(.+)$/gm, '<span class="markdown-bullet">$1</span>')
     .replace(/\n/g, "<br>");
+  const body = chatMarkdownRenderer ? chatMarkdownRenderer.render(clean) : fallbackBody();
   const uniqueFiles = [...new Map(files.map(file => [file.path, file])).values()];
   return body + uniqueFiles.map(file => {
     const path = file.path;
