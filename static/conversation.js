@@ -2,7 +2,7 @@
 const chatFileObjectUrls = new Map();
 const chatThumbnailObjectUrls = new Map();
 const chatThumbnailLoads = new Map();
-const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260817-activity-history") : null;
+const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260817-message-boundary") : null;
 let chatBuildRequestId = 0;
 let chatHistoryLoadPromise = null;
 let mediaViewerMarkdown = null;

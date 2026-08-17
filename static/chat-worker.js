@@ -161,7 +161,18 @@ function attachmentPath(value) {
 }
 
 function mergeEvents(events, messages) {
-  const visible = (messages || []).filter(message => ["running", "steering", "steered", "sent"].includes(message.status));
+  const historyTimes = (events || [])
+    .filter(event => event.stream !== "metrics")
+    .map(timestamp)
+    .filter(value => Number.isFinite(value) && value > 0);
+  const oldestLoadedTime = historyTimes.length ? Math.min(...historyTimes) : null;
+  const visible = (messages || []).filter(message => {
+    if (["running", "steering"].includes(message.status)) return true;
+    if (!["steered", "sent"].includes(message.status)) return false;
+    if (oldestLoadedTime === null) return true;
+    const createdTime = Date.parse(message.created_at || "");
+    return Number.isFinite(createdTime) && createdTime >= oldestLoadedTime;
+  });
   const merged = [];
   const seenUserKeys = new Set();
   const seenUserBodies = new Map();

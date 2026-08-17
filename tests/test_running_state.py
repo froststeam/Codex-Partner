@@ -1119,7 +1119,40 @@ const cursors = [];
         self.assertIn("HistoryPagination.fetchEarlierTimelinePages", conversation)
         self.assertIn("messageTarget: 12, maxPages: 8", conversation)
         self.assertIn('/history-pagination.js?v=20260817-message-history', html)
-        self.assertIn('/conversation.js?v=20260817-message-history', html)
+        self.assertIn('/conversation.js?v=20260817-message-boundary', html)
+
+    def test_sent_browser_messages_follow_the_loaded_timeline_boundary(self):
+        worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
+        script = f"""
+const fs = require("fs");
+const vm = require("vm");
+const context = {{ self: {{ postMessage() {{}} }} }};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync({json.dumps(str(worker))}, "utf8"), context);
+const messages = [
+  {{ id: "old", body: "old sent message", status: "sent", created_at: "2026-08-17T09:00:00Z" }},
+  {{ id: "current", body: "current sent message", status: "sent", created_at: "2026-08-17T11:00:00Z" }},
+  {{ id: "running", body: "currently running message", status: "running", created_at: "2026-08-17T08:00:00Z" }},
+];
+const recentEvents = [
+  {{ id: "recent", ts: "2026-08-17T10:00:00Z", stream: "app-server", payload: JSON.stringify({{ type: "agentMessage", text: "recent reply" }}) }},
+];
+const olderEvents = [
+  {{ id: "older", ts: "2026-08-17T08:30:00Z", stream: "app-server", payload: JSON.stringify({{ type: "agentMessage", text: "older reply" }}) }},
+  ...recentEvents,
+];
+const bodies = events => context.mergeEvents(events, messages)
+  .filter(event => event.stream === "user")
+  .map(event => (typeof event.payload === "string" ? JSON.parse(event.payload) : event.payload).text);
+process.stdout.write(JSON.stringify({{ recent: bodies(recentEvents), older: bodies(olderEvents) }}));
+"""
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+        payload = json.loads(result.stdout)
+        self.assertEqual(["currently running message", "current sent message"], payload["recent"])
+        self.assertEqual(["currently running message", "old sent message", "current sent message"], payload["older"])
+
+        conversation = (worker.parent / "conversation.js").read_text(encoding="utf-8")
+        self.assertIn('/chat-worker.js?v=20260817-message-boundary', conversation)
 
     def test_model_slash_command_supports_named_updates_and_defaults(self):
         task_id = "model-command-thread"
@@ -2326,7 +2359,7 @@ const cursors = [];
         self.assertIn('/core.js?v=20260817-activity-history', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260817-message-history', html)
+        self.assertIn('/conversation.js?v=20260817-message-boundary', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -2555,7 +2588,7 @@ const cursors = [];
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260817-message-history', html)
+        self.assertIn('/conversation.js?v=20260817-message-boundary', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260817-queue-races', html)
@@ -2567,7 +2600,7 @@ const cursors = [];
         self.assertIn(".session-card.selected::before", styles)
         self.assertNotIn("renderSessionList(); renderConversation(); await loadWorkspace(\"\")", conversation_js)
         self.assertIn(".queued-messages { width: auto; height: auto; min-height: 0; max-height: none; align-self: stretch;", styles)
-        self.assertIn('/chat-worker.js?v=20260817-activity-history', conversation_js)
+        self.assertIn('/chat-worker.js?v=20260817-message-boundary', conversation_js)
         self.assertIn('data-live="true" open', conversation_js)
         self.assertIn("activity-event.current::after", styles)
         self.assertIn("function renderActivityEvent", conversation_js)
@@ -2652,7 +2685,8 @@ const cursors = [];
         self.assertIn("function syncQueuedMessages", conversation_js)
         self.assertIn("queueSyncTimer = setInterval(syncQueuedMessages, 1500)", conversation_js)
         worker_js = (Path(__file__).resolve().parents[1] / "static/chat-worker.js").read_text(encoding="utf-8")
-        self.assertIn('["running", "steering", "steered", "sent"].includes(message.status)', worker_js)
+        self.assertIn('["running", "steering"].includes(message.status)', worker_js)
+        self.assertIn('!["steered", "sent"].includes(message.status)', worker_js)
 
     def test_hiding_terminal_preserves_pty_and_xterm_history(self):
         static = Path(__file__).resolve().parents[1] / "static"
