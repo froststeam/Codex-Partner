@@ -2702,7 +2702,7 @@ async def supervise_appserver_turn(
             await broadcast_task(task["id"], {"type": "provider_failover", "from": (provider or {}).get("name"), "to": fallback.get("name"), "error": error})
             if running.get(task["id"]) is getattr(client, "process", None):
                 running.pop(task["id"], None)
-            await launch(task["id"], mode, message, message_id, tried_provider_ids)
+            asyncio.create_task(launch_after_turn_cleanup(task["id"], mode, message, message_id, tried_provider_ids))
             return
         current_task = task_or_404(task["id"])
         retries = int(current_task["retry_count"])
@@ -2754,9 +2754,9 @@ async def supervise_appserver_turn(
                 return
             db.execute("UPDATE tasks SET status='queued',execution_source='dashboard',updated_at=? WHERE id=?", (now(), task["id"]))
             if goal_continues:
-                await launch(task["id"], "resume", "", "", set())
+                asyncio.create_task(launch_after_turn_cleanup(task["id"], "resume", "", "", set()))
             else:
-                await launch(task["id"], "message" if message_id else "resume", message, message_id, set())
+                asyncio.create_task(launch_after_turn_cleanup(task["id"], "message" if message_id else "resume", message, message_id, set()))
             return
         db.execute("UPDATE sessions SET status=?, finished_at=?, exit_code=1, summary=? WHERE id=?", ("stopped" if stopped else "failed", now(), "Stopped by user" if stopped else error, session_id))
         db.execute(
@@ -3362,6 +3362,26 @@ def task_retry_allowed(task: dict, retries: int) -> bool:
             return False
     retry_forever = goal_auto_resume_enabled(task) if task.get("goal") else bool(task.get("retry_forever"))
     return retry_forever or retries <= int(task["max_retries"])
+
+
+async def launch_after_turn_cleanup(
+    task_id: str,
+    mode: str,
+    message: str = "",
+    message_id: str = "",
+    attempted_provider_ids: Optional[set[str]] = None,
+) -> None:
+    """Start the next turn only after the previous supervisor releases ownership."""
+    await asyncio.sleep(0)
+    try:
+        await launch(task_id, mode, message, message_id, attempted_provider_ids)
+    except Exception as exc:
+        if is_task_busy_error(exc):
+            return
+        current = task_or_404(task_id)
+        db.execute("UPDATE tasks SET status='failed',last_error=?,updated_at=? WHERE id=?", (str(exc), now(), task_id))
+        if goal_auto_resume_enabled(current):
+            schedule_task_drain(task_id)
 
 
 def turn_settings(task: dict, provider: Optional[dict], sandbox_policy: dict) -> dict[str, Any]:

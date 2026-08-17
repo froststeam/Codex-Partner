@@ -536,6 +536,12 @@ class RunningStateTests(unittest.TestCase):
         self.assertTrue(result["retry_forever"])
         schedule.assert_called_once_with(task_id)
 
+    def test_appserver_retry_waits_for_previous_turn_cleanup(self):
+        source = Path(self.app.__file__).read_text(encoding="utf-8")
+        self.assertIn("async def launch_after_turn_cleanup", source)
+        self.assertIn('asyncio.create_task(launch_after_turn_cleanup(task["id"], "resume"', source)
+        self.assertNotIn('await launch(task["id"], "resume", "", "", set())', source)
+
     def test_stop_clears_unowned_running_state(self):
         task_id = "orphan-thread"
         self.make_task(task_id)
@@ -2065,7 +2071,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn(".queued-messages[hidden] { display: block !important", (static / "styles.css").read_text(encoding="utf-8"))
         self.assertIn("min-height: 37px", (static / "styles.css").read_text(encoding="utf-8"))
         self.assertNotIn("未设置 Goal，点击修改后让 Codex 持续追踪目标", conversation_js)
-        self.assertIn('await launch(task["id"], "resume", "", "", set())', (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8"))
+        self.assertIn('launch_after_turn_cleanup(task["id"], "resume", "", "", set())', (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8"))
         self.assertIn("flex-wrap: nowrap", (static / "styles.css").read_text(encoding="utf-8"))
 
     def test_composer_model_picker_survives_realtime_status_renders(self):
