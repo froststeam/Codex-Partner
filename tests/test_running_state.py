@@ -51,6 +51,7 @@ class RunningStateTests(unittest.TestCase):
             "payload": {
                 "type": "function_call",
                 "id": "tool-command",
+                "call_id": "call-command",
                 "name": "exec_command",
                 "arguments": json.dumps({"cmd": "curl -H 'Authorization: Bearer secret-value' https://example.test"}),
             },
@@ -62,12 +63,13 @@ class RunningStateTests(unittest.TestCase):
         self.assertNotIn("secret-value", payload["text"])
         self.assertIn("Bearer ***", payload["command"])
         self.assertNotIn("secret-value", payload["command"])
+        self.assertEqual("call-command", payload["item_id"])
 
         output_payload = self.app.rollout_browser_payload({
             "type": "response_item",
             "payload": {
                 "type": "function_call_output",
-                "call_id": "tool-command",
+                "call_id": "call-command",
                 "output": json.dumps({"output": "line one\nline two", "metadata": {"exit_code": 1}}),
             },
         })
@@ -2090,7 +2092,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn('/core.js?v=20260817-inactive-trash', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260817-detailed-activity', html)
+        self.assertIn('/conversation.js?v=20260817-detailed-activity-v2', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -2319,7 +2321,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260817-detailed-activity', html)
+        self.assertIn('/conversation.js?v=20260817-detailed-activity-v2', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260817-goal-auto-resume', html)

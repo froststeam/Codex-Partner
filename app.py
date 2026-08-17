@@ -912,7 +912,7 @@ def rollout_browser_payload(record: dict) -> Optional[dict]:
             return {
                 "type": event_type,
                 "text": detail,
-                "item_id": payload.get("id", ""),
+                "item_id": payload.get("call_id") or payload.get("id", ""),
                 "status": payload.get("status", "started"),
                 "turn_id": turn_id,
                 "command": activity_transcript(command),

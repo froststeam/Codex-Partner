@@ -462,7 +462,7 @@ function renderActivityEvent(item, active = false) {
   const args = String(item.arguments || "").trim();
   const changes = Array.isArray(item.changes) ? item.changes : [];
   const lines = output ? output.split(/\r?\n/).length : 0;
-  const detail = item.detail && item.detail !== command ? `<code class="activity-detail">${esc(item.detail)}</code>` : "";
+  const detail = !command && item.detail ? `<code class="activity-detail">${esc(item.detail)}</code>` : "";
   const cwd = item.cwd ? `<small class="activity-cwd" title="${esc(item.cwd)}">${esc(item.cwd)}</small>` : "";
   const commandBlock = command ? `<pre class="activity-command"><code>${esc(command)}</code></pre>` : "";
   const toolBlock = !command && item.tool ? `<div class="activity-tool-name">${esc(item.tool)}</div>` : "";
