@@ -842,6 +842,46 @@ def decoded_tool_arguments(payload: dict) -> dict[str, Any]:
     return {}
 
 
+def decoded_tool_output(value: Any) -> tuple[Any, Optional[int]]:
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return value, None
+        if decoded == value:
+            return value, None
+        return decoded_tool_output(decoded)
+    if isinstance(value, list):
+        texts = [entry.get("text") for entry in value if isinstance(entry, dict) and entry.get("text")]
+        for text in reversed(texts):
+            try:
+                decoded = json.loads(text)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            output, exit_code = decoded_tool_output(decoded)
+            if output not in (None, "", {}, []):
+                return output, exit_code
+        return "\n".join(str(text) for text in texts), None
+    if isinstance(value, dict):
+        metadata = value.get("metadata") if isinstance(value.get("metadata"), dict) else {}
+        exit_code = metadata.get("exit_code")
+        if value.get("output") not in (None, ""):
+            output, nested_exit = decoded_tool_output(value["output"])
+            return output, exit_code if exit_code is not None else nested_exit
+        content = value.get("content")
+        if isinstance(content, list):
+            texts = [entry.get("text") for entry in content if isinstance(entry, dict) and entry.get("text")]
+            if texts:
+                return "\n".join(texts), exit_code
+        if value.get("text") not in (None, ""):
+            return value["text"], exit_code
+        structured = value.get("structuredContent")
+        if structured not in (None, "", {}, []):
+            return json.dumps(structured, ensure_ascii=False, indent=2), exit_code
+        return value, exit_code
+    return value, None
+
+
 def rollout_tool_activity(payload: dict) -> tuple[str, str]:
     """Return a browser activity type and a useful, secret-safe summary."""
     name = str(payload.get("name") or "tool")
@@ -920,16 +960,7 @@ def rollout_browser_payload(record: dict) -> Optional[dict]:
                 "tool": compact_activity_detail(payload.get("name") or "tool", 160),
             }
         if lowered in {"custom_tool_call_output", "function_call_output"}:
-            raw_output = payload.get("output")
-            parsed_output: Any = raw_output
-            if isinstance(raw_output, str):
-                try:
-                    parsed_output = json.loads(raw_output)
-                except json.JSONDecodeError:
-                    parsed_output = raw_output
-            output = parsed_output.get("output", parsed_output) if isinstance(parsed_output, dict) else parsed_output
-            metadata = parsed_output.get("metadata") or {} if isinstance(parsed_output, dict) else {}
-            exit_code = metadata.get("exit_code") if isinstance(metadata, dict) else None
+            output, exit_code = decoded_tool_output(payload.get("output"))
             return {
                 "type": "toolOutput",
                 "text": "工具执行完成",
@@ -2339,7 +2370,7 @@ async def native_history_events(task: dict) -> list[dict]:
                         "turn_id": turn.get("id"),
                         "status": turn.get("status"),
                         "command": activity_transcript(item.get("command")),
-                        "output": activity_transcript(item.get("aggregatedOutput") or item.get("output")),
+                        "output": activity_transcript(decoded_tool_output(item.get("aggregatedOutput") or item.get("output"))[0]),
                         "cwd": activity_transcript(item.get("cwd"), 1000),
                         "tool": compact_activity_detail(item.get("tool") or item.get("name"), 160),
                         "arguments": activity_transcript(item.get("arguments"), 3000),
@@ -2420,6 +2451,21 @@ async def handle_appserver_notification(server_key: str, message: dict) -> None:
                 "thread_id": thread_id,
                 "item": item,
             }
+            if item_type == "commandExecution":
+                output, exit_code = decoded_tool_output(item.get("aggregatedOutput") or item.get("output"))
+                payload.update({
+                    "command": activity_transcript(item.get("command")),
+                    "output": activity_transcript(output),
+                    "cwd": activity_transcript(item.get("cwd"), 1000),
+                    "exit_code": item.get("exitCode") if item.get("exitCode") is not None else exit_code,
+                })
+            elif item_type in {"mcpToolCall", "toolCall", "dynamicToolCall"}:
+                output, _ = decoded_tool_output(item.get("result") or item.get("output") or item.get("error"))
+                payload.update({
+                    "tool": compact_activity_detail(item.get("tool") or item.get("name"), 160),
+                    "arguments": activity_transcript(item.get("arguments") or item.get("input"), 3000),
+                    "output": activity_transcript(output),
+                })
     elif method == "thread/goal/updated":
         goal = params.get("goal") or {}
         payload = {"type": "goal_updated", "goal": goal, "thread_id": thread_id}

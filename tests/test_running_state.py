@@ -79,6 +79,13 @@ class RunningStateTests(unittest.TestCase):
         self.assertEqual(1, output_payload["exit_code"])
         self.assertEqual("line one\nline two", output_payload["output"])
 
+        wrapped_output, wrapped_exit = self.app.decoded_tool_output([
+            {"type": "input_text", "text": "Script completed\nOutput:\n"},
+            {"type": "input_text", "text": json.dumps({"output": "actual stdout", "metadata": {"exit_code": 0}})},
+        ])
+        self.assertEqual("actual stdout", wrapped_output)
+        self.assertEqual(0, wrapped_exit)
+
     def test_native_tool_output_enriches_matching_rollout_activity(self):
         rollout = [{
             "id": 1,
