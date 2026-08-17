@@ -1078,7 +1078,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn('data-activity-output-key="${esc(outputKey)}"', conversation)
         self.assertIn("Object.prototype.hasOwnProperty.call(state.activityOutputOpen, outputKey)", conversation)
         self.assertIn("state.activityOutputOpen[output.dataset.activityOutputKey] = output.open", conversation)
-        self.assertIn('/conversation.js?v=20260817-link-recovery', html)
+        self.assertIn('/conversation.js?v=20260817-session-navigation', html)
 
     def test_message_history_skips_activity_only_pages(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -1134,7 +1134,7 @@ const cursors = [];
         self.assertIn("HistoryPagination.fetchEarlierTimelinePages", conversation)
         self.assertIn("messageTarget: 12, maxPages: 8", conversation)
         self.assertIn('/history-pagination.js?v=20260817-message-history', html)
-        self.assertIn('/conversation.js?v=20260817-link-recovery', html)
+        self.assertIn('/conversation.js?v=20260817-session-navigation', html)
 
     def test_sent_browser_messages_follow_the_loaded_timeline_boundary(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -2405,7 +2405,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('/core.js?v=20260817-link-recovery', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260817-link-recovery', html)
+        self.assertIn('/conversation.js?v=20260817-session-navigation', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -2634,7 +2634,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260817-link-recovery', html)
+        self.assertIn('/conversation.js?v=20260817-session-navigation', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260817-queue-races', html)
@@ -2678,6 +2678,24 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertNotIn("chatHasTextSelection() && event.target.closest", conversation_js)
         self.assertIn("user-select: text", styles)
         self.assertIn(".chat-copy-button", styles)
+
+    def test_session_switch_cancels_copy_selection_before_rendering(self):
+        static = Path(__file__).resolve().parents[1] / "static"
+        conversation = (static / "conversation.js").read_text(encoding="utf-8")
+        html = (static / "index.html").read_text(encoding="utf-8")
+        function_start = conversation.index("function clearChatSelectionForSessionSwitch")
+        function_end = conversation.index("\n}\n", function_start)
+        reset = conversation[function_start:function_end]
+        self.assertIn("removeAllRanges()", reset)
+        self.assertIn("state.chatSelectionActive = false", reset)
+        self.assertIn("state.chatRenderDeferred = false", reset)
+        self.assertIn("state.deferredChatBlocks = null", reset)
+        select_start = conversation.index("async function selectSession")
+        request_start = conversation.index("const requestId", select_start)
+        clear_start = conversation.index("clearChatSelectionForSessionSwitch()", select_start)
+        self.assertLess(clear_start, request_start)
+        self.assertIn("if (state.selectedId !== id)", conversation[select_start:request_start])
+        self.assertIn('/conversation.js?v=20260817-session-navigation', html)
 
     def test_optimistic_queue_messages_survive_authoritative_refresh(self):
         static = Path(__file__).resolve().parents[1] / "static"

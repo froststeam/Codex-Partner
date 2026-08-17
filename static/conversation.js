@@ -56,7 +56,17 @@ function resetWorkspaceBrowser() {
   $("#workspace-section")?.remove();
   $(".workspace-error")?.remove();
 }
+function clearChatSelectionForSessionSwitch() {
+  window.getSelection?.()?.removeAllRanges();
+  state.chatPointerSelecting = false;
+  state.chatPointerDragged = false;
+  state.chatSelectionActive = false;
+  state.chatRenderDeferred = false;
+  state.chatDeferredStickToBottom = false;
+  state.deferredChatBlocks = null;
+}
 async function selectSession(id, openSocket = true) {
+  if (state.selectedId !== id) clearChatSelectionForSessionSwitch();
   const requestId = ++state.sessionRequestId;
   state.sessionAbortController?.abort();
   const controller = new AbortController();
