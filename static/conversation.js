@@ -622,10 +622,15 @@ function paintVirtualChat(stickToBottom = false) {
     stream.dataset.virtualScroll = "1";
     stream.addEventListener("scroll", () => {
       if (!state.chatBlocks.length) return;
+      const latestStart = Math.max(0, state.chatBlocks.length - windowSize);
+      if (chatIsNearBottom(stream)) {
+        if ((state.chatVirtualStart || 0) !== latestStart) { state.chatVirtualStart = latestStart; paintVirtualChat(true); }
+        return;
+      }
       const target = Math.max(0, Math.floor(stream.scrollTop / Math.max(72, state.chatAverageHeight)) - 12);
       const bounded = Math.min(target, Math.max(0, state.chatBlocks.length - windowSize));
       const currentStart = state.chatVirtualStart || 0;
-      if ((bounded === 0 && currentStart !== 0) || Math.abs(bounded - currentStart) >= 18) { state.chatVirtualStart = bounded; paintVirtualChat(false); stream.scrollTop = target * state.chatAverageHeight; }
+      if ((bounded === 0 && currentStart !== 0) || Math.abs(bounded - currentStart) >= 18) { state.chatVirtualStart = bounded; paintVirtualChat(false); }
     }, { passive: true });
   }
   restoreChatViewport(stream, viewport, stickToBottom);
