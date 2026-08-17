@@ -47,7 +47,7 @@ async function syncQueuedMessages() {
     queueSyncInFlight = false;
   }
 }
-function showEmptyConversation() { if (terminalTaskId) destroyTerminal(); stopQueueSync(); state.editingQueuedId = null; state.pendingApprovals = []; state.inspectorClosed = true; $("#empty-conversation").hidden = false; $("#conversation-view").hidden = true; $("#goal-bar").hidden = true; $("#queued-messages").hidden = true; $("#approval-center").hidden = true; setInspectorOpen(false); }
+function showEmptyConversation() { if (terminalTaskId) destroyTerminal(); stopQueueSync(); state.sessionAbortController?.abort(); state.sessionAbortController = null; state.editingQueuedId = null; state.pendingApprovals = []; state.inspectorClosed = true; $("#empty-conversation").hidden = false; $("#conversation-view").hidden = true; $("#goal-bar").hidden = true; $("#queued-messages").hidden = true; $("#approval-center").hidden = true; setInspectorOpen(false); }
 function resetWorkspaceBrowser() {
   state.workspacePath = "";
   state.workspaceFile = null;
@@ -57,7 +57,11 @@ function resetWorkspaceBrowser() {
 }
 async function selectSession(id, openSocket = true) {
   const requestId = ++state.sessionRequestId;
+  state.sessionAbortController?.abort();
+  const controller = new AbortController();
+  state.sessionAbortController = controller;
   if (terminalTaskId && terminalTaskId !== id) closeTerminal();
+  if (socket && socketTaskId !== id) { socket.onclose = null; socket.close(); socket = null; socketTaskId = ""; }
   const wasEmpty = $("#conversation-view").hidden;
   if (state.selectedId !== id) {
     resetWorkspaceBrowser(); state.titleExpanded = false; state.historyCursor = ""; state.historyHasMore = false;
@@ -69,8 +73,19 @@ async function selectSession(id, openSocket = true) {
   // Reflect keyboard navigation immediately, then replace the row with the full task after loading.
   renderSessionList();
   scrollSessionIntoView(id);
-  const [fullTask, timeline, messages] = await Promise.all([api(`/tasks/${id}`), api(`/tasks/${id}/timeline?limit=160`), api(`/tasks/${id}/messages`)]);
+  let fullTask, timeline, messages;
+  try {
+    [fullTask, timeline, messages] = await Promise.all([
+      api(`/tasks/${encodeURIComponent(id)}`, { signal: controller.signal }),
+      api(`/tasks/${encodeURIComponent(id)}/timeline?limit=160`, { signal: controller.signal }),
+      api(`/tasks/${encodeURIComponent(id)}/messages`, { signal: controller.signal }),
+    ]);
+  } catch (error) {
+    if (error.name === "AbortError") return;
+    throw error;
+  }
   if (requestId !== state.sessionRequestId || state.selectedId !== id) return;
+  if (state.sessionAbortController === controller) state.sessionAbortController = null;
   state.selectedTask = fullTask;
   state.selectedEvents = [...(timeline.items || []), ...(timeline.metrics || [])];
   state.historyCursor = timeline.next_cursor || ""; state.historyHasMore = Boolean(timeline.has_more);

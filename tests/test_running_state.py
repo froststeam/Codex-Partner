@@ -44,6 +44,46 @@ class RunningStateTests(unittest.TestCase):
         stamp = self.app.native_stamp("2026-08-16T01:27:10.093564Z", "fallback")
         self.assertEqual("2026-08-16T01:27:10.093564+00:00", stamp)
 
+    def test_task_or_404_falls_back_when_alias_points_to_missing_task(self):
+        task_id = "task-alias-fallback"
+        missing_thread_id = "missing-thread-alias"
+        self.make_task(task_id)
+        self.app.task_id_aliases[task_id] = missing_thread_id
+        try:
+            task = self.app.task_or_404(task_id)
+            self.assertEqual(task_id, task["id"])
+            self.assertNotIn(task_id, self.app.task_id_aliases)
+        finally:
+            self.app.task_id_aliases.pop(task_id, None)
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_reconcile_task_session_ids_migrates_existing_local_task(self):
+        task_id = "legacy-dashboard-id"
+        thread_id = "thread-session-id"
+        session_id = "legacy-session-id"
+        with tempfile.TemporaryDirectory(dir=self.temp.name) as directory:
+            root = Path(directory) / "codex_partner"
+            with mock.patch.object(self.app, "SESSION_WORKSPACE_ROOT", root):
+                self.make_task(task_id)
+                self.app.db.execute(
+                    "UPDATE tasks SET workspace=?,codex_session_id=?,active_session_id=? WHERE id=?",
+                    (str(root), thread_id, session_id, task_id),
+                )
+                self.app.db.execute(
+                    "INSERT INTO sessions (id,task_id,status,attempt,command,started_at,codex_session_id) VALUES (?,?,?,?,?,?,?)",
+                    (session_id, task_id, "running", 1, "codex app-server", self.app.now(), thread_id),
+                )
+                self.app.reconcile_task_session_ids()
+                task = self.app.task_or_404(thread_id)
+                self.assertEqual(thread_id, task["id"])
+                self.assertEqual(thread_id, task["codex_session_id"])
+                self.assertEqual(str(root / thread_id), task["workspace"])
+                self.assertTrue((root / thread_id).is_dir())
+                session = self.app.db.one("SELECT task_id FROM sessions WHERE id=?", (session_id,))
+                self.assertEqual(thread_id, session["task_id"])
+        self.app.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+        self.app.db.execute("DELETE FROM tasks WHERE id IN (?,?)", (task_id, thread_id))
+
     def test_avatar_is_persisted_per_login_and_broadcast_to_matching_devices(self):
         image = self.app.Image.new("RGB", (32, 32), "#ffd83e")
         second_frame = self.app.Image.new("RGB", (32, 32), "#2f9e73")
@@ -874,7 +914,7 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
         finally:
             child.rmdir()
 
-    def test_new_local_sessions_get_isolated_default_workspaces(self):
+    def test_new_local_sessions_wait_for_session_id_before_creating_workspace(self):
         with tempfile.TemporaryDirectory(dir=self.temp.name) as directory:
             root = Path(directory) / "codex_partner"
             with mock.patch.object(self.app, "SESSION_WORKSPACE_ROOT", root):
@@ -885,10 +925,8 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
                 command = self.app.create_command_task(quick, "", "available")
             for task in (quick, regular, command):
                 workspace = Path(task["workspace"])
-                self.assertEqual(root, workspace.parent)
-                self.assertEqual(task["id"], workspace.name)
-                self.assertTrue(workspace.is_dir())
-            self.assertEqual(3, len({task["workspace"] for task in (quick, regular, command)}))
+                self.assertEqual(root, workspace)
+                self.assertFalse((root / task["id"]).exists())
             self.app.db.execute("DELETE FROM tasks WHERE id IN (?,?,?)", (quick["id"], regular["id"], command["id"]))
 
     def test_default_workspace_aligns_to_codex_thread_id(self):
@@ -909,7 +947,9 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
             root = Path(directory) / "codex_partner"
             with mock.patch.object(self.app, "SESSION_WORKSPACE_ROOT", root):
                 task = asyncio.run(self.app.create_quick_task(self.app.QuickTaskCreate(), None))
-                current = Path(task["workspace"])
+                current = root / task["id"]
+                current.mkdir()
+                self.app.db.execute("UPDATE tasks SET workspace=? WHERE id=?", (str(current), task["id"]))
                 current.rmdir()
                 target = root / "thread-after-rename"
                 target.mkdir()
@@ -1586,7 +1626,7 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
         self.assertIn("new File([file]", app_js)
         self.assertIn('uiLabel("binaryAttachment"', app_js)
         self.assertIn('/app.js?v=20260816-structured-inputs', html)
-        self.assertIn('/core.js?v=20260816-composer-toggle', html)
+        self.assertIn('/core.js?v=20260817-session-switch', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
         self.assertIn("/timeline?limit=160", conversation_js)
@@ -1800,7 +1840,7 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260816-approval-layout', html)
+        self.assertIn('/conversation.js?v=20260817-session-switch', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
         self.assertIn('/styles.css?v=20260816-approval-layout', html)
         self.assertIn(".queued-messages { width: auto; height: auto; min-height: 0; max-height: none; align-self: stretch;", styles)

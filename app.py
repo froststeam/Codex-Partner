@@ -286,6 +286,13 @@ def create_session_workspace(task_id: str) -> Path:
     return workspace
 
 
+def initial_session_workspace() -> Path:
+    """Return the staging cwd used until Codex assigns the real session id."""
+    root = SESSION_WORKSPACE_ROOT.resolve()
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return root
+
+
 def safe_thread_id(value: str) -> str:
     thread_id = str(value or "").strip()
     if not thread_id or "/" in thread_id or "\\" in thread_id or thread_id in {".", ".."}:
@@ -309,23 +316,25 @@ def align_session_workspace(task_id: str, thread_id: str) -> Optional[Path]:
         return None
     root = SESSION_WORKSPACE_ROOT.resolve()
     current = Path(task["workspace"]).expanduser().resolve()
-    if current.parent != root:
+    if current != root and current.parent != root:
         return None
     target = (root / thread_id).resolve()
     if target == current:
         target.mkdir(mode=0o700, parents=True, exist_ok=True)
         return current
-    if current.name != task_id:
+    if current != root and current.name != task_id:
         return None
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     if target.exists():
         # A previous interrupted migration may have left the destination.
         # Keep it and remove only an empty placeholder. A missing placeholder
         # means the rename completed before the database update.
-        if current.is_dir() and not any(current.iterdir()):
+        if current != root and current.is_dir() and not any(current.iterdir()):
             current.rmdir()
         elif current.exists():
             return None
+    elif current == root:
+        target.mkdir(mode=0o700)
     elif current.exists():
         current.rename(target)
     else:
@@ -349,11 +358,16 @@ def canonicalize_task_thread_id(task_id: str, thread_id: str) -> str:
         return task_id
     if db.one("SELECT id FROM tasks WHERE id=?", (thread_id,)):
         return task_id
+    with db.lock, db.connect() as connection:
+        connection.execute("PRAGMA defer_foreign_keys=ON")
+        connection.execute("UPDATE tasks SET id=?,updated_at=? WHERE id=?", (thread_id, now(), task_id))
+        if not connection.execute("SELECT id FROM tasks WHERE id=?", (thread_id,)).fetchone():
+            return task_id
+        connection.execute("UPDATE sessions SET task_id=? WHERE task_id=?", (thread_id, task_id))
+        connection.execute("UPDATE events SET task_id=? WHERE task_id=?", (thread_id, task_id))
+        connection.execute("UPDATE task_messages SET task_id=? WHERE task_id=?", (thread_id, task_id))
+        connection.commit()
     task_id_aliases[task_id] = thread_id
-    db.execute("UPDATE tasks SET id=?,updated_at=? WHERE id=?", (thread_id, now(), task_id))
-    db.execute("UPDATE sessions SET task_id=? WHERE task_id=?", (thread_id, task_id))
-    db.execute("UPDATE events SET task_id=? WHERE task_id=?", (thread_id, task_id))
-    db.execute("UPDATE task_messages SET task_id=? WHERE task_id=?", (thread_id, task_id))
     if task_id in running:
         running[thread_id] = running.pop(task_id)
     if task_id in task_workers:
@@ -412,11 +426,27 @@ def is_provider_failure(exc: Exception) -> bool:
 db = Database(DB_PATH, now)
 
 
+def reconcile_task_session_ids() -> None:
+    """Migrate local dashboard task ids to their real Codex session ids."""
+    rows = db.all(
+        "SELECT id,codex_session_id,ssh_host FROM tasks "
+        "WHERE COALESCE(codex_session_id,'')!='' AND id!=codex_session_id"
+    )
+    for row in rows:
+        task_id = str(row["id"])
+        thread_id = safe_thread_id(row["codex_session_id"])
+        if not thread_id or row.get("ssh_host") or db.one("SELECT id FROM tasks WHERE id=?", (thread_id,)):
+            continue
+        align_session_workspace(task_id, thread_id)
+        canonicalize_task_thread_id(task_id, thread_id)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global app_shutting_down
     app_shutting_down = False
     observer_task: Optional[asyncio.Task] = None
+    reconcile_task_session_ids()
     try:
         await sync_native_threads()
     except Exception:
@@ -2334,6 +2364,7 @@ async def supervise_appserver_turn(
         aligned_workspace = align_session_workspace(task["id"], thread_id)
         if aligned_workspace:
             task["workspace"] = str(aligned_workspace)
+            sandbox_policy = {"type": "dangerFullAccess"} if task["yolo"] else {"type": "workspaceWrite", "writableRoots": [task["workspace"]]}
         canonical_task_id = canonicalize_task_thread_id(task["id"], thread_id)
         if canonical_task_id != task["id"]:
             task["id"] = canonical_task_id
@@ -2359,6 +2390,7 @@ async def supervise_appserver_turn(
         turn_waiters[thread_id] = waiter
         turn_params = {
             "threadId": thread_id,
+            "cwd": task["workspace"],
             "input": appserver_turn_inputs(task, message),
             "approvalPolicy": approval,
             "clientUserMessageId": message_id or None,
@@ -2699,6 +2731,10 @@ async def auth(request: Request):
 def task_or_404(task_id: str) -> dict:
     canonical_id = task_id_aliases.get(task_id, task_id)
     task = db.one("SELECT * FROM tasks WHERE id=?", (canonical_id,))
+    if not task and canonical_id != task_id:
+        task_id_aliases.pop(task_id, None)
+        canonical_id = task_id
+        task = db.one("SELECT * FROM tasks WHERE id=?", (canonical_id,))
     if not task:
         raise HTTPException(404, "Task not found")
     task["yolo"] = bool(task["yolo"])
@@ -3938,7 +3974,11 @@ async def create_task(payload: TaskCreate, _: Any = Depends(auth)):
         connection = await require_ssh_connection(ssh_host, codex=True)
         workspace = remote_workspace_path(payload.workspace, connection.get("remote_home", ""))
     else:
-        workspace = str(resolve_task_workspace(payload.workspace)) if payload.workspace.strip() else str(create_session_workspace(task_id))
+        workspace = (
+            str(resolve_task_workspace(payload.workspace))
+            if payload.workspace.strip()
+            else str(create_session_workspace(task_id) if requested_thread_id and task_id == requested_thread_id else initial_session_workspace())
+        )
     db.execute(
         "INSERT INTO tasks (id,name,prompt,goal,workspace,status,yolo,max_retries,retry_forever,provider_id,model,context,codex_session_id,goal_status,created_at,updated_at,native,reasoning_effort,service_tier,personality,collaboration_mode,permission_profile,ssh_host) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -3958,7 +3998,7 @@ async def create_quick_task(payload: QuickTaskCreate = QuickTaskCreate(), _: Any
         connection = await require_ssh_connection(ssh_host, codex=True)
         workspace = remote_workspace_path(payload.workspace, connection.get("remote_home", ""))
     else:
-        workspace = str(resolve_task_workspace(payload.workspace)) if payload.workspace.strip() else str(create_session_workspace(task_id))
+        workspace = str(resolve_task_workspace(payload.workspace)) if payload.workspace.strip() else str(initial_session_workspace())
     db.execute(
         "INSERT INTO tasks (id,name,prompt,goal,workspace,status,yolo,max_retries,retry_forever,provider_id,model,context,codex_session_id,goal_status,created_at,updated_at,native,reasoning_effort,service_tier,personality,collaboration_mode,permission_profile,ssh_host) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -5365,7 +5405,7 @@ def create_command_task(source: dict, prompt: str, status: str = "queued") -> di
     task_id, stamp = str(uuid.uuid4()), now()
     clean_prompt = prompt.strip() or "开始一个新的 Codex 会话"
     name = clean_prompt.splitlines()[0][:80] or "新 Codex 会话"
-    workspace = source["workspace"] if source.get("ssh_host") else str(create_session_workspace(task_id))
+    workspace = source["workspace"] if source.get("ssh_host") else str(initial_session_workspace())
     db.execute(
         "INSERT INTO tasks (id,name,prompt,goal,workspace,status,yolo,max_retries,retry_forever,provider_id,model,context,codex_session_id,goal_status,created_at,updated_at,native,reasoning_effort,service_tier,personality,collaboration_mode,permission_profile,ssh_host) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
