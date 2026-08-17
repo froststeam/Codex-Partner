@@ -461,6 +461,25 @@ class RunningStateTests(unittest.TestCase):
         launch.assert_awaited_once_with(task_id, "resume")
         self.assertEqual("queued", self.app.task_or_404(task_id)["status"])
 
+    def test_paused_or_blocked_goal_does_not_auto_resume(self):
+        for status in ("paused", "blocked"):
+            task_id = f"external-goal-{status}-{time.time_ns()}"
+            self.make_task(task_id, "available")
+            self.app.db.execute(
+                "UPDATE tasks SET goal='finish it',goal_status=?,retry_forever=1,run_mode='goal_resume' WHERE id=?",
+                (status, task_id),
+            )
+            try:
+                with mock.patch.object(self.app, "launch", new=mock.AsyncMock()) as launch:
+                    asyncio.run(self.app.drain_task_messages(task_id))
+                launch.assert_not_awaited()
+                task = self.app.task_or_404(task_id)
+                self.assertEqual("available", task["status"])
+                self.assertEqual(status, task["goal_status"])
+                self.assertFalse(self.app.goal_auto_resume_enabled(task))
+            finally:
+                self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
     def test_stop_clears_unowned_running_state(self):
         task_id = "orphan-thread"
         self.make_task(task_id)
@@ -1893,10 +1912,11 @@ process.stdout.write(JSON.stringify(blocks[0].html));
         self.assertIn("attachmentUploadName", app_js)
         self.assertIn("new File([file]", app_js)
         self.assertIn('uiLabel("binaryAttachment"', app_js)
-        self.assertIn('/app.js?v=20260817-queue-dispatch', html)
+        self.assertIn('/app.js?v=20260817-goal-status', html)
         self.assertIn('/core.js?v=20260817-session-sort', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
+        self.assertIn('/conversation.js?v=20260817-goal-status', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -1951,9 +1971,15 @@ process.stdout.write(JSON.stringify(blocks[0].html));
         database_py = (root / "codex_partner" / "database.py").read_text(encoding="utf-8")
         expected = 'task.run_mode === "goal_resume"'
         self.assertIn(expected, conversation_js)
-        self.assertIn(expected, app_js)
+        self.assertIn("goalIsRunning(task)", app_js)
         self.assertIn('active: "enabled"', conversation_js)
         self.assertIn('goalProgress.textContent = goalStatusLabel', conversation_js)
+        self.assertIn('function goalStatusSummary', conversation_js)
+        self.assertIn('function goalCanAutoResume', conversation_js)
+        self.assertIn('"paused", "blocked", "complete", "none"', conversation_js)
+        self.assertIn('${uiLabel("sessionStatusPrefix")}：${statusLabel(task.status)}', conversation_js)
+        self.assertIn('${uiLabel("goalStatusPrefix")}：${goalStatusLabel', conversation_js)
+        self.assertNotIn('statusLabel(task.status)} · ${goalStatusLabel', conversation_js)
         self.assertNotIn('active: "running"', conversation_js)
         self.assertIn("authoritative.run_mode !== state.selectedTask.run_mode", (root / "static" / "core.js").read_text(encoding="utf-8"))
         self.assertIn("run_mode TEXT DEFAULT ''", database_py)
@@ -2116,8 +2142,8 @@ process.stdout.write(JSON.stringify(blocks[0].html));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260817-queue-dispatch', html)
-        self.assertIn('/app.js?v=20260817-queue-dispatch', html)
+        self.assertIn('/conversation.js?v=20260817-goal-status', html)
+        self.assertIn('/app.js?v=20260817-goal-status', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
         self.assertIn('/styles.css?v=20260817-queue-dispatch', html)
         self.assertIn(".session-card.selected::before", styles)

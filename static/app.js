@@ -293,7 +293,7 @@ async function toggleGoalRun() {
   const task = state.selectedTask;
   const goal = String(task?.goal || "").trim();
   if (!task || !state.selectedId || !goal) return toast("请先设置 Goal");
-  const goalRunning = ["running", "retrying", "queued"].includes(task.status) && task.run_mode === "goal_resume" && task.goal_status !== "paused";
+  const goalRunning = goalIsRunning(task);
   if (goalRunning) {
     const stopped = await changeSelectedRun("stop", false);
     if (!stopped || ["running", "retrying", "queued"].includes(stopped.status)) return toast("当前 Codex 未能暂停");

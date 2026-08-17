@@ -2585,7 +2585,7 @@ async def supervise_appserver_turn(
         current_task = task_or_404(task["id"])
         retries = int(current_task["retry_count"])
         goal_continues = isinstance(exc, GoalIncompleteError)
-        should_retry = bool(current_task.get("goal") and current_task.get("retry_forever")) if goal_continues else bool(current_task.get("retry_forever") or retries <= int(current_task["max_retries"]))
+        should_retry = goal_auto_resume_enabled(current_task) if goal_continues else task_retry_allowed(current_task, retries)
         pending_message = db.one(
             "SELECT id FROM task_messages WHERE task_id=? AND status='queued' ORDER BY created_at, id LIMIT 1",
             (task["id"],),
@@ -3211,6 +3211,24 @@ def requested_run_mode(task: dict, mode: str, message_id: str = "") -> str:
     return "operation"
 
 
+GOAL_AUTO_RESUME_STOP_STATUSES = {"paused", "blocked", "complete", "none"}
+
+
+def goal_auto_resume_enabled(task: dict) -> bool:
+    """Goal auto-resume is separate from the task retry switch."""
+    if not task.get("goal") or not task.get("retry_forever"):
+        return False
+    status = task.get("goal_status") or "active"
+    return status not in GOAL_AUTO_RESUME_STOP_STATUSES
+
+
+def task_retry_allowed(task: dict, retries: int) -> bool:
+    if task.get("goal") and (task.get("goal_status") or "active") in GOAL_AUTO_RESUME_STOP_STATUSES:
+        return False
+    retry_forever = goal_auto_resume_enabled(task) if task.get("goal") else bool(task.get("retry_forever"))
+    return retry_forever or retries <= int(task["max_retries"])
+
+
 def turn_settings(task: dict, provider: Optional[dict], sandbox_policy: dict) -> dict[str, Any]:
     """Build sticky turn settings shared by regular and resumed browser turns."""
     settings: dict[str, Any] = {}
@@ -3560,9 +3578,8 @@ async def drain_task_messages(task_id: str) -> None:
         if not row:
             goal_resume = bool(
                 current.get("goal")
-                and current.get("retry_forever")
                 and current.get("run_mode") == "goal_resume"
-                and current.get("goal_status") not in {"paused", "complete", "none"}
+                and goal_auto_resume_enabled(current)
             )
             if not goal_resume:
                 return
@@ -5037,7 +5054,7 @@ async def supervise(task: dict, session_id: str, providers: list[Optional[dict]]
         running.pop(task_id, None)
     latest = task_or_404(task_id)
     retries = int(latest["retry_count"])
-    if latest.get("retry_forever") or retries <= int(latest["max_retries"]):
+    if task_retry_allowed(latest, retries):
         db.execute("UPDATE sessions SET status='retrying', finished_at=?, exit_code=?, summary=? WHERE id=?", (now(), 1, last_error, session_id))
         db.execute(
             "UPDATE tasks SET status='retrying',execution_source='dashboard',last_error=?,updated_at=? WHERE id=?",
@@ -5049,7 +5066,7 @@ async def supervise(task: dict, session_id: str, providers: list[Optional[dict]]
         await broadcast_task(task_id, {"type": "session", "session_id": session_id, "status": "retrying", "error": last_error})
         await asyncio.sleep(min(30, 2 ** min(retries, 4)))
         try:
-            await launch(task_id, "resume" if latest.get("goal") else "auto-retry")
+            await launch(task_id, "resume" if goal_auto_resume_enabled(latest) else "auto-retry")
         except Exception:
             pass
     else:

@@ -285,6 +285,17 @@ function goalStatusLabel(value) {
   const labels = { active: "enabled", paused: "statusStopped", blocked: "statusFailed", usageLimited: "statusRetrying", budgetLimited: "statusRetrying", complete: "statusSucceeded", none: "available" };
   return labels[value] ? t(labels[value]) : value || t("unknown");
 }
+function goalStatusSummary(task, goal) {
+  const session = `${uiLabel("sessionStatusPrefix")}：${statusLabel(task.status)}`;
+  const goalState = `${uiLabel("goalStatusPrefix")}：${goalStatusLabel(task.goal_status || (goal ? "active" : "none"))}`;
+  return `${session} · ${goalState}`;
+}
+function goalCanAutoResume(status) {
+  return !["paused", "blocked", "complete", "none"].includes(status || "none");
+}
+function goalIsRunning(task) {
+  return Boolean(task?.goal) && ["running", "retrying", "queued"].includes(task.status) && task.run_mode === "goal_resume" && goalCanAutoResume(task.goal_status || "active");
+}
 function renderGoalBar() {
   const task = state.selectedTask;
   const bar = $("#goal-bar");
@@ -292,11 +303,11 @@ function renderGoalBar() {
   bar.hidden = false;
   const goal = String(task.goal || "").trim();
   const activeTurn = ["running", "retrying", "queued"].includes(task.status);
-  const goalRunning = Boolean(goal) && activeTurn && task.run_mode === "goal_resume" && task.goal_status !== "paused";
+  const goalRunning = goalIsRunning(task);
   const inputHasContent = Boolean($("#message-input")?.value.trim() || pendingAttachments.length);
   $("#goal-text").textContent = goal;
   $("#goal-text").classList.toggle("empty", !goal);
-  $("#goal-task-status").textContent = `${statusLabel(task.status)} · ${goalStatusLabel(task.goal_status || (goal ? "active" : "none"))}`;
+  $("#goal-task-status").textContent = goalStatusSummary(task, goal);
   $("#goal-run-toggle").classList.toggle("active", goalRunning);
   $("#goal-run-toggle").disabled = !goal;
   $("#goal-run-toggle").title = !goal ? uiLabel("setGoal") : (goalRunning ? uiLabel("goalPause") : uiLabel("goalStart"));
