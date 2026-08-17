@@ -2,7 +2,7 @@
 const chatFileObjectUrls = new Map();
 const chatThumbnailObjectUrls = new Map();
 const chatThumbnailLoads = new Map();
-const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260817-detailed-activity") : null;
+const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260817-terminal-activity") : null;
 let chatBuildRequestId = 0;
 let chatHistoryLoadPromise = null;
 let mediaViewerMarkdown = null;
@@ -455,21 +455,35 @@ function restoreChatViewport(stream, viewport, stickToBottom) {
 
 function renderActivityEvent(item, active = false) {
   const status = String(item.status || "").toLowerCase();
-  const statusText = status === "completed" || status === "succeeded" ? "完成" : status === "failed" ? "失败" : status === "started" || active ? "执行中" : "";
-  const statusClass = status === "failed" ? " failed" : statusText === "完成" ? " completed" : "";
+  const statusText = status === "failed" ? "失败" : status === "started" || active ? "执行中" : "";
+  const statusClass = status === "failed" ? " failed" : status === "completed" || status === "succeeded" ? " completed" : "";
+  const kind = String(item.kind || "").toLowerCase();
   const command = String(item.command || "").trim();
   const output = String(item.output || "").trim();
   const args = String(item.arguments || "").trim();
   const changes = Array.isArray(item.changes) ? item.changes : [];
-  const lines = output ? output.split(/\r?\n/).length : 0;
-  const detail = !command && item.detail ? `<code class="activity-detail">${esc(item.detail)}</code>` : "";
+  const isWait = kind.includes("wait") || /(?:^|[._])wait$/.test(String(item.tool || ""));
+  const action = isWait ? "Waited" : changes.length || kind.includes("file") ? "Edited" : kind.includes("mcp") || (!command && item.tool) ? "Called" : kind.includes("search") || kind.includes("explor") ? "Explored" : kind.includes("reason") ? "Reasoned" : command ? "Ran" : item.label || uiLabel("activityWorking");
+  const inlineArgs = args ? args.replace(/\s+/g, " ") : "";
+  const subject = command || (item.tool ? `${item.tool}${inlineArgs ? `(${inlineArgs})` : ""}` : String(item.detail || ""));
   const cwd = item.cwd ? `<small class="activity-cwd" title="${esc(item.cwd)}">${esc(item.cwd)}</small>` : "";
-  const commandBlock = command ? `<pre class="activity-command"><code>${esc(command)}</code></pre>` : "";
-  const toolBlock = !command && item.tool ? `<div class="activity-tool-name">${esc(item.tool)}</div>` : "";
-  const argsBlock = args ? `<details class="activity-transcript"><summary>参数</summary><pre><code>${esc(args)}</code></pre></details>` : "";
-  const outputBlock = output ? `<details class="activity-transcript"${status === "failed" ? " open" : ""}><summary>${status === "failed" ? "错误输出" : "输出"}${lines ? ` · ${lines} 行` : ""}${item.exitCode != null ? ` · exit ${esc(item.exitCode)}` : ""}</summary><pre><code>${esc(output)}</code></pre></details>` : "";
+  const subjectBlock = subject ? `<code class="activity-inline-subject" title="${esc(subject)}">${esc(subject)}</code>` : "";
   const changesBlock = changes.length ? `<div class="activity-changes">${changes.slice(0, 8).map(change => `<span>${esc(change.kind || "update")} · ${esc(change.path || change)}</span>`).join("")}</div>` : "";
-  return `<div class="activity-event${active ? " current" : ""}${statusClass}"><span class="activity-event-dot" aria-hidden="true"></span><div class="activity-event-body"><div class="activity-event-head"><strong>${esc(item.label || uiLabel("activityWorking"))}</strong>${detail}${cwd}<span class="activity-event-status">${statusText}</span></div>${commandBlock}${toolBlock}${changesBlock}${argsBlock}${outputBlock}</div></div>`;
+  let outputBlock = "";
+  if (output) {
+    const outputLines = output.split(/\r?\n/);
+    const meta = item.exitCode != null ? `exit ${item.exitCode}` : "";
+    if (outputLines.length <= 9) {
+      outputBlock = `<div class="activity-output"><code>${esc(output)}</code>${meta ? `<small>${esc(meta)}</small>` : ""}</div>`;
+    } else {
+      const hidden = outputLines.length - 7;
+      const preview = [...outputLines.slice(0, 5), `… +${hidden} lines`, ...outputLines.slice(-2)].join("\n");
+      outputBlock = `<details class="activity-output activity-output-long"${status === "failed" ? " open" : ""}><summary><code>${esc(preview)}</code><small>${status === "failed" ? "错误输出" : "查看完整 transcript"}${meta ? ` · ${esc(meta)}` : ""}</small></summary><code class="activity-output-full">${esc(output)}</code></details>`;
+    }
+  } else if (!active && (status === "completed" || status === "succeeded") && command) {
+    outputBlock = `<div class="activity-output empty"><code>(no output)</code></div>`;
+  }
+  return `<div class="activity-event${active ? " current" : ""}${statusClass}"><span class="activity-event-dot" aria-hidden="true"></span><div class="activity-event-body"><div class="activity-event-head"><strong>${action}</strong>${subjectBlock}${cwd}<span class="activity-event-status">${statusText}</span></div>${changesBlock}${outputBlock}</div></div>`;
 }
 
 function renderChatBlock(block, blockIndex, liveActivity = false) {

@@ -75,6 +75,7 @@ function activityItem(raw, labels, event) {
   const changes = Array.isArray(payload?.changes) ? payload.changes : (Array.isArray(native.changes) ? native.changes : []);
   return {
     text: generic || !detail ? label : `${label} · ${detail}`,
+    kind: type,
     label,
     detail: generic ? "" : detail,
     command,
