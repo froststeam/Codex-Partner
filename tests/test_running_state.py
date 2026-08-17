@@ -1065,6 +1065,62 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn("loadEarlierActivity", core)
         self.assertIn(".activity-load-older", styles)
 
+    def test_message_history_skips_activity_only_pages(self):
+        static = Path(__file__).resolve().parents[1] / "static"
+        pagination = static / "history-pagination.js"
+        script = f"""
+const fs = require("fs");
+const vm = require("vm");
+const context = {{}};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync({json.dumps(str(pagination))}, "utf8"), context);
+const pages = {{
+  newest: {{
+    items: Array.from({{ length: 20 }}, (_, index) => ({{ id: `activity-${{index}}`, payload: JSON.stringify({{ type: "commandExecution" }}) }})),
+    next_cursor: "middle",
+    has_more: true,
+  }},
+  middle: {{
+    items: [
+      {{ id: "user-2", payload: JSON.stringify({{ type: "userMessage" }}) }},
+      {{ id: "agent-2", payload: JSON.stringify({{ type: "agentMessage" }}) }},
+    ],
+    next_cursor: "oldest",
+    has_more: true,
+  }},
+  oldest: {{
+    items: [
+      {{ id: "user-1", payload: {{ type: "browserMessage" }} }},
+      {{ id: "agent-1", payload: {{ type: "agentMessage" }} }},
+    ],
+    next_cursor: "done",
+    has_more: false,
+  }},
+}};
+const cursors = [];
+(async () => {{
+  const result = await context.HistoryPagination.fetchEarlierTimelinePages(async cursor => {{
+    cursors.push(cursor);
+    return pages[cursor];
+  }}, {{ cursor: "newest", messageTarget: 4, maxPages: 8 }});
+  process.stdout.write(JSON.stringify({{ result, cursors }}));
+}})().catch(error => {{ console.error(error); process.exit(1); }});
+"""
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+        payload = json.loads(result.stdout)
+        self.assertEqual(["newest", "middle", "oldest"], payload["cursors"])
+        self.assertEqual(3, payload["result"]["pages_loaded"])
+        self.assertEqual(4, payload["result"]["message_count"])
+        self.assertEqual("user-1", payload["result"]["items"][0]["id"])
+        self.assertEqual("activity-19", payload["result"]["items"][-1]["id"])
+
+        conversation = (static / "conversation.js").read_text(encoding="utf-8")
+        html = (static / "index.html").read_text(encoding="utf-8")
+        self.assertIn("HistoryPagination.fetchEarlierTimelinePages", conversation)
+        self.assertIn("messageTarget: 12, maxPages: 8", conversation)
+        self.assertIn('/history-pagination.js?v=20260817-message-history', html)
+        self.assertIn('/conversation.js?v=20260817-message-history', html)
+
     def test_model_slash_command_supports_named_updates_and_defaults(self):
         task_id = "model-command-thread"
         self.make_task(task_id)
@@ -2270,7 +2326,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn('/core.js?v=20260817-activity-history', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260817-activity-history', html)
+        self.assertIn('/conversation.js?v=20260817-message-history', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -2499,7 +2555,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260817-activity-history', html)
+        self.assertIn('/conversation.js?v=20260817-message-history', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260817-queue-races', html)

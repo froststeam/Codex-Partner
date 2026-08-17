@@ -655,7 +655,10 @@ async function loadOlderTimeline() {
   if (!state.selectedId || !state.historyHasMore || state.historyLoading) return chatHistoryLoadPromise;
   const taskId = state.selectedId; const stream = $("#chat-log"); const previousHeight = stream.scrollHeight;
   state.historyLoading = true; paintVirtualChat(false);
-  chatHistoryLoadPromise = api(`/tasks/${encodeURIComponent(taskId)}/timeline?limit=160&before=${encodeURIComponent(state.historyCursor)}`)
+  chatHistoryLoadPromise = HistoryPagination.fetchEarlierTimelinePages(
+    cursor => api(`/tasks/${encodeURIComponent(taskId)}/timeline?limit=160&before=${encodeURIComponent(cursor)}`),
+    { cursor: state.historyCursor, hasMore: state.historyHasMore, messageTarget: 12, maxPages: 8 },
+  )
     .then(page => {
       if (state.selectedId !== taskId) return;
       const existing = new Set(state.selectedEvents.map(event => `${event.stream}:${event.id}`));
