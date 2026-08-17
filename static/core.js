@@ -84,7 +84,6 @@ const UI_LABELS = {
   automatic: { zh: "自动选择", en: "Auto", fr: "Auto", ja: "自動選択", ko: "자동 선택" },
   estimated: { zh: "估算", en: "estimated", fr: "estimé", ja: "推定", ko: "추정" },
   session: { zh: "会话", en: "Session", fr: "Session", ja: "セッション", ko: "세션" },
-  sessionStatusPrefix: { zh: "会话", en: "Session", fr: "Session", ja: "セッション", ko: "세션" },
   state: { zh: "状态", en: "Status", fr: "État", ja: "状態", ko: "상태" },
   thread: { zh: "线程", en: "Thread", fr: "Thread", ja: "スレッド", ko: "스레드" },
   sshHost: { zh: "SSH 主机", en: "SSH host", fr: "Hôte SSH", ja: "SSHホスト", ko: "SSH 호스트" },

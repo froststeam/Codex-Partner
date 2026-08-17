@@ -286,9 +286,7 @@ function goalStatusLabel(value) {
   return labels[value] ? t(labels[value]) : value || t("unknown");
 }
 function goalStatusSummary(task, goal) {
-  const session = `${uiLabel("sessionStatusPrefix")}：${statusLabel(task.status)}`;
-  const goalState = `${uiLabel("goalStatusPrefix")}：${goalStatusLabel(task.goal_status || (goal ? "active" : "none"))}`;
-  return `${session} · ${goalState}`;
+  return `${uiLabel("goalStatusPrefix")}：${goalStatusLabel(task.goal_status || (goal ? "active" : "none"))}`;
 }
 function goalCanAutoResume(status) {
   return !["paused", "blocked", "complete", "none"].includes(status || "none");
