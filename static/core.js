@@ -1023,6 +1023,7 @@ function refreshComposerHistory() {
   state.historyIndex = -1;
 }
 function scheduleRenderChat() {
+  if (state.chatSelectionActive) { state.chatRenderDeferred = true; return; }
   if (chatRenderFrame) return;
   chatRenderFrame = requestAnimationFrame(() => { chatRenderFrame = null; renderChat(); });
 }

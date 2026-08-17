@@ -389,6 +389,7 @@ function approvalAnswers() {
   return answers;
 }
 function renderChat() {
+  if (state.chatSelectionActive) { state.chatRenderDeferred = true; return; }
   const stream = $("#chat-log");
   if (!chatWorker) {
     stream.innerHTML = `<div class="chat-empty"><p>${uiLabel("workerUnavailable") || "Chat Worker unavailable"}</p></div>`;
@@ -413,7 +414,14 @@ function renderChat() {
   });
   chatWorker.onmessage = event => {
     if (event.data.requestId !== chatBuildRequestId || event.data.error) return;
-    state.chatBlocks = event.data.blocks || [];
+    const blocks = event.data.blocks || [];
+    if (state.chatSelectionActive) {
+      state.deferredChatBlocks = blocks;
+      state.chatRenderDeferred = true;
+      state.chatDeferredStickToBottom ||= state.chatSnapToBottom || chatIsNearBottom(stream);
+      return;
+    }
+    state.chatBlocks = blocks;
     // Decide at paint time. Tool/file events may finish in the worker after the
     // user has already scrolled away from the bottom.
     paintVirtualChat(state.chatSnapToBottom || chatIsNearBottom(stream));
@@ -453,7 +461,28 @@ function restoreChatViewport(stream, viewport, stickToBottom) {
   stream.scrollTop = Math.min(viewport.scrollTop, Math.max(0, stream.scrollHeight - stream.clientHeight));
 }
 
-function renderActivityEvent(item, active = false) {
+function activityCopyText(item) {
+  const lines = [];
+  if (item.command) lines.push(String(item.command));
+  else if (item.tool) lines.push([item.tool, item.arguments].filter(Boolean).join("\n"));
+  else if (item.detail) lines.push(String(item.detail));
+  if (Array.isArray(item.plan)) item.plan.forEach(step => lines.push(`[${step.status || "pending"}] ${step.step || step.text || ""}`.trim()));
+  if (Array.isArray(item.changes)) item.changes.forEach(change => lines.push(`${change.kind || "update"} ${change.path || change}`));
+  if (item.output) lines.push(String(item.output));
+  if (item.cwd) lines.push(`cwd: ${item.cwd}`);
+  if (item.exitCode != null) lines.push(`exit: ${item.exitCode}`);
+  return lines.filter(Boolean).join("\n");
+}
+
+function copyChatBlock(blockIndex, itemIndex = -1) {
+  const block = (state.chatBlocks || [])[blockIndex];
+  if (!block) return "";
+  if (itemIndex >= 0 && Array.isArray(block.items)) return activityCopyText(block.items[itemIndex] || {});
+  if (block.role === "activities") return (block.items || []).map(activityCopyText).filter(Boolean).join("\n\n");
+  return String(block.text || "").trim();
+}
+
+function renderActivityEvent(item, active = false, blockIndex = -1, itemIndex = -1) {
   const status = String(item.status || "").toLowerCase();
   const statusText = status === "failed" ? "失败" : active ? "执行中" : "";
   const statusClass = status === "failed" ? " failed" : status === "completed" || status === "succeeded" ? " completed" : "";
@@ -488,7 +517,8 @@ function renderActivityEvent(item, active = false) {
   } else if (!active && (status === "completed" || status === "succeeded") && command) {
     outputBlock = `<div class="activity-output empty"><code>(no output)</code></div>`;
   }
-  return `<div class="activity-event${active ? " current" : ""}${statusClass}"><span class="activity-event-dot" aria-hidden="true"></span><div class="activity-event-body"><div class="activity-event-head"><strong>${action}</strong>${subjectBlock}${cwd}<span class="activity-event-status">${statusText}</span></div>${planBlock}${changesBlock}${outputBlock}</div></div>`;
+  const copyButton = activityCopyText(item) ? `<button type="button" class="chat-copy-button activity-copy-button" data-copy-chat-block="${blockIndex}" data-copy-activity-item="${itemIndex}" title="复制这条活动" aria-label="复制这条活动">⧉</button>` : "";
+  return `<div class="activity-event${active ? " current" : ""}${statusClass}"><span class="activity-event-dot" aria-hidden="true"></span><div class="activity-event-body"><div class="activity-event-head"><strong>${action}</strong>${subjectBlock}${cwd}<span class="activity-event-status">${statusText}</span>${copyButton}</div>${planBlock}${changesBlock}${outputBlock}</div></div>`;
 }
 
 function renderChatBlock(block, blockIndex, liveActivity = false) {
@@ -496,16 +526,18 @@ function renderChatBlock(block, blockIndex, liveActivity = false) {
   if (block.role === "activities") {
     const items = block.items.slice(-16);
     const latest = items[items.length - 1] || {};
+    const itemOffset = block.items.length - items.length;
     const current = liveActivity ? `<span class="activity-current">${esc(latest.text || uiLabel("activityWorking"))}</span>` : "";
     const older = block.items.length > items.length ? `<div class="activity-older">${uiLabel("earlierActivity", { count: block.items.length - items.length })}</div>` : "";
-    return `<details class="activity-group${liveActivity ? " live" : ""}"${blockAttribute}${liveActivity ? ' data-live="true" open' : ""}><summary><span class="activity-pulse" aria-hidden="true"><i></i></span><strong>${uiLabel("activity")}</strong>${current}<small>${block.items.length}</small></summary><div class="activity-events">${older}${items.map((item, index) => renderActivityEvent(item, liveActivity && index === items.length - 1)).join("")}</div></details>`;
+    return `<details class="activity-group${liveActivity ? " live" : ""}"${blockAttribute}${liveActivity ? ' data-live="true" open' : ""}><summary><span class="activity-pulse" aria-hidden="true"><i></i></span><strong>${uiLabel("activity")}</strong>${current}<small>${block.items.length}</small></summary><div class="activity-events">${older}${items.map((item, index) => renderActivityEvent(item, liveActivity && index === items.length - 1, blockIndex, itemOffset + index)).join("")}</div></details>`;
   }
   const deliveryLabels = { sending: uiLabel("sending"), steering: uiLabel("steering"), steered: uiLabel("steering"), queued: uiLabel("queued"), running: `${statusLabel("running")} · Codex`, failed: uiLabel("failedSend") };
   const label = block.role === "user" ? (block.commandBlock ? uiLabel("commandLabel") : "") : (block.commandBlock ? uiLabel("commandResult") : uiLabel("codexPartner"));
-  return `<article class="message ${block.role}${block.commandBlock ? " command-message" : ""}${block.streaming ? " streaming" : ""}"${blockAttribute} data-item-id="${esc(block.itemId || "")}"><div class="message-avatar" role="img" aria-label="${block.role === "user" ? uiLabel("you") : uiLabel("codexPartner")}" title="${block.role === "user" ? uiLabel("you") : uiLabel("codexPartner")}">${block.role === "user" ? humanMarkup() : mascotMarkup("mascot-chat")}</div><div class="message-body"><div class="message-meta">${label ? `<strong>${label}</strong>` : ""}${block.origin === "terminal" ? `<span>${uiLabel("messageFromTerminal")}</span>` : ""}${block.time ? `<time datetime="${esc(block.time)}">${esc(shortDate(block.time))}</time>` : ""}</div><div class="message-content">${block.html || ""}${block.streaming ? `<span class="stream-cursor"></span>` : ""}</div>${deliveryLabels[block.delivery] ? `<div class="message-delivery ${esc(block.delivery)}" title="${esc(block.error)}">${esc(deliveryLabels[block.delivery])}</div>` : ""}</div></article>`;
+  return `<article class="message ${block.role}${block.commandBlock ? " command-message" : ""}${block.streaming ? " streaming" : ""}"${blockAttribute} data-item-id="${esc(block.itemId || "")}"><div class="message-avatar" role="img" aria-label="${block.role === "user" ? uiLabel("you") : uiLabel("codexPartner")}" title="${block.role === "user" ? uiLabel("you") : uiLabel("codexPartner")}">${block.role === "user" ? humanMarkup() : mascotMarkup("mascot-chat")}</div><div class="message-body copyable-chat-block"><button type="button" class="chat-copy-button" data-copy-chat-block="${blockIndex}" title="复制消息" aria-label="复制消息">⧉</button><div class="message-meta">${label ? `<strong>${label}</strong>` : ""}${block.origin === "terminal" ? `<span>${uiLabel("messageFromTerminal")}</span>` : ""}${block.time ? `<time datetime="${esc(block.time)}">${esc(shortDate(block.time))}</time>` : ""}</div><div class="message-content">${block.html || ""}${block.streaming ? `<span class="stream-cursor"></span>` : ""}</div>${deliveryLabels[block.delivery] ? `<div class="message-delivery ${esc(block.delivery)}" title="${esc(block.error)}">${esc(deliveryLabels[block.delivery])}</div>` : ""}</div></article>`;
 }
 
 function paintVirtualChat(stickToBottom = false) {
+  if (state.chatSelectionActive) { state.chatRenderDeferred = true; state.chatDeferredStickToBottom ||= stickToBottom; return; }
   const stream = $("#chat-log"); const blocks = state.chatBlocks || []; const windowSize = 90;
   const viewport = captureChatViewport(stream);
   if (!blocks.length) { stream.innerHTML = `<div class="chat-empty">${mascotMarkup("mascot-chat")}<p>${uiLabel("firstMessage")}</p></div>`; return; }
@@ -543,6 +575,70 @@ function paintVirtualChat(stickToBottom = false) {
   state.chatSnapToBottom = false;
 }
 
+function chatHasTextSelection() {
+  const selection = window.getSelection?.();
+  const stream = $("#chat-log");
+  if (!selection || selection.isCollapsed || !selection.rangeCount || !stream) return false;
+  const range = selection.getRangeAt(0);
+  return stream.contains(range.commonAncestorContainer);
+}
+
+function releaseChatSelectionLock() {
+  if (state.chatPointerSelecting || chatHasTextSelection()) return;
+  state.chatSelectionActive = false;
+  if (!state.chatRenderDeferred) return;
+  const stickToBottom = Boolean(state.chatDeferredStickToBottom);
+  state.chatRenderDeferred = false;
+  state.chatDeferredStickToBottom = false;
+  const deferredBlocks = state.deferredChatBlocks;
+  state.deferredChatBlocks = null;
+  requestAnimationFrame(() => {
+    if (deferredBlocks) { state.chatBlocks = deferredBlocks; paintVirtualChat(stickToBottom); }
+    else renderChat();
+    if (stickToBottom) requestAnimationFrame(scrollChatToBottom);
+  });
+}
+
+function installChatSelectionGuard() {
+  const stream = $("#chat-log");
+  if (!stream || stream.dataset.selectionGuard === "1") return;
+  stream.dataset.selectionGuard = "1";
+  stream.addEventListener("pointerdown", event => {
+    if (event.button !== 0 || event.target.closest("button, input, textarea, select, summary")) return;
+    state.chatPointerSelecting = true;
+    state.chatSelectionActive = true;
+  });
+  stream.addEventListener("click", async event => {
+    if (chatHasTextSelection() && event.target.closest("a, [data-media-src]")) {
+      event.preventDefault(); event.stopImmediatePropagation(); return;
+    }
+    const button = event.target.closest("[data-copy-chat-block]");
+    if (!button) return;
+    event.preventDefault(); event.stopPropagation();
+    const blockIndex = Number(button.dataset.copyChatBlock);
+    const itemIndex = button.dataset.copyActivityItem == null ? -1 : Number(button.dataset.copyActivityItem);
+    const text = copyChatBlock(blockIndex, itemIndex);
+    if (!text) return toast("没有可复制的内容");
+    try {
+      await copyText(text);
+      button.classList.add("copied"); button.textContent = "✓";
+      setTimeout(() => { button.classList.remove("copied"); button.textContent = "⧉"; }, 1200);
+      toast("已复制");
+    } catch (error) { toast(`复制失败：${error.message}`); }
+  }, true);
+  document.addEventListener("pointerup", () => {
+    if (!state.chatPointerSelecting) return;
+    state.chatPointerSelecting = false;
+    setTimeout(releaseChatSelectionLock, 0);
+  });
+  document.addEventListener("pointercancel", () => { state.chatPointerSelecting = false; releaseChatSelectionLock(); });
+  document.addEventListener("selectionchange", () => {
+    if (state.chatSelectionActive && !state.chatPointerSelecting) setTimeout(releaseChatSelectionLock, 0);
+  });
+}
+
+installChatSelectionGuard();
+
 async function loadOlderTimeline() {
   if (!state.selectedId || !state.historyHasMore || state.historyLoading) return chatHistoryLoadPromise;
   const taskId = state.selectedId; const stream = $("#chat-log"); const previousHeight = stream.scrollHeight;
@@ -563,6 +659,7 @@ async function loadOlderTimeline() {
   return chatHistoryLoadPromise;
 }
 function appendStreamingDelta(payload) {
+  if (state.chatSelectionActive) { state.chatRenderDeferred = true; return false; }
   const delta = String(payload?.delta || "");
   const itemId = String(payload?.item_id || "");
   if (!delta || !itemId) return false;
