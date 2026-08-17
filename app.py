@@ -2193,7 +2193,7 @@ async def sync_native_threads() -> dict:
                     workspace = str(aligned_workspace)
                 existing_full = db.one("SELECT trashed FROM tasks WHERE id=?", (existing["id"],)) or {}
                 status = "trashed" if existing_full.get("trashed") else (existing["status"] if existing["status"] in {"running", "retrying", "queued", "stopped"} else ("archived" if archived else "available"))
-                retry_forever = int(existing.get("retry_forever", 0)) if existing.get("retry_explicit") else int(bool(objective))
+                retry_forever = int(existing.get("retry_forever", 0)) if existing.get("retry_explicit") else 0
                 db.execute(
                     "UPDATE tasks SET name=?,prompt=?,goal=?,workspace=?,model=?,provider_id=?,goal_status=?,goal_tokens_used=?,"
                     "retry_forever=?,yolo=?,native=1,archived=?,memory_mode=?,status=?,updated_at=?,"
@@ -2211,7 +2211,7 @@ async def sync_native_threads() -> dict:
                     task_id = str(uuid.uuid4())
                 db.execute(
                     "INSERT INTO tasks (id,name,prompt,goal,workspace,status,yolo,max_retries,retry_forever,provider_id,model,context,codex_session_id,goal_status,created_at,updated_at,last_interaction_at,native,archived,memory_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (task_id, title[:160], prompt, objective, workspace, "archived" if archived else "available", int(yolo), 3, int(bool(objective)), provider_id, model, "", thread_id, goal_status, created, updated_at, updated_at, 1, int(archived), memory_mode),
+                    (task_id, title[:160], prompt, objective, workspace, "archived" if archived else "available", int(yolo), 3, 0, provider_id, model, "", thread_id, goal_status, created, updated_at, updated_at, 1, int(archived), memory_mode),
                 )
                 persist_native_thread_model(thread_id, model)
                 imported += 1
@@ -4238,9 +4238,9 @@ async def create_task(payload: TaskCreate, _: Any = Depends(auth)):
             else str(create_session_workspace(task_id) if requested_thread_id and task_id == requested_thread_id else initial_session_workspace())
         )
     db.execute(
-        "INSERT INTO tasks (id,name,prompt,goal,workspace,status,yolo,max_retries,retry_forever,provider_id,model,context,codex_session_id,goal_status,created_at,updated_at,last_interaction_at,native,reasoning_effort,service_tier,personality,collaboration_mode,permission_profile,ssh_host) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (task_id, payload.name, payload.prompt, payload.goal, workspace, "queued", int(payload.yolo), payload.max_retries, int(payload.retry_forever or bool(payload.goal.strip())), payload.provider_id, payload.model, payload.context, requested_thread_id, goal_status, stamp, stamp, stamp, 0, payload.reasoning_effort, payload.service_tier, payload.personality, payload.collaboration_mode, payload.permission_profile, ssh_host),
+        "INSERT INTO tasks (id,name,prompt,goal,workspace,status,yolo,max_retries,retry_forever,retry_explicit,provider_id,model,context,codex_session_id,goal_status,created_at,updated_at,last_interaction_at,native,reasoning_effort,service_tier,personality,collaboration_mode,permission_profile,ssh_host) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (task_id, payload.name, payload.prompt, payload.goal, workspace, "queued", int(payload.yolo), payload.max_retries, int(payload.retry_forever), int(payload.retry_forever), payload.provider_id, payload.model, payload.context, requested_thread_id, goal_status, stamp, stamp, stamp, 0, payload.reasoning_effort, payload.service_tier, payload.personality, payload.collaboration_mode, payload.permission_profile, ssh_host),
     )
     result = task_or_404(task_id)
     await broadcast_overview(task_id, {"type": "created"})
@@ -4376,9 +4376,6 @@ async def patch_task(task_id: str, payload: TaskPatch, _: Any = Depends(auth)):
         values["ssh_host"] = target_host
     if "goal" in values and "goal_status" not in values:
         values["goal_status"] = "active" if (values["goal"] or "").strip() else "none"
-    goal_default_retry = "goal" in values and "retry_forever" not in values
-    if goal_default_retry:
-        values["retry_forever"] = bool((values["goal"] or "").strip())
     allowed = {
         "name", "prompt", "goal", "workspace", "yolo", "max_retries", "retry_forever", "provider_id", "model",
         "codex_session_id", "goal_status", "reasoning_effort", "service_tier", "personality", "collaboration_mode",
@@ -4392,7 +4389,7 @@ async def patch_task(task_id: str, payload: TaskPatch, _: Any = Depends(auth)):
         args.append(int(value) if key in {"yolo", "retry_forever"} else value)
     if "retry_forever" in values:
         sets.append("retry_explicit=?")
-        args.append(0 if goal_default_retry else 1)
+        args.append(1)
     sets.append("updated_at=?"); args.append(now()); args.append(task_id)
     db.execute(f"UPDATE tasks SET {','.join(sets)} WHERE id=?", tuple(args))
     result = task_or_404(task_id)
@@ -4441,13 +4438,10 @@ async def patch_goal(task_id: str, payload: GoalPatch, _: Any = Depends(auth)):
         updates["goal"] = payload.objective
         updates["goal_status"] = remote_goal.get("status") or payload.status or ("active" if payload.objective.strip() else "none")
         updates["goal_tokens_used"] = int(remote_goal.get("tokensUsed", 0) or 0)
-        if payload.objective.strip():
-            # A newly set Goal is durable work by default. Browser disconnects
-            # do not stop it, and transport/process failures keep resuming the
-            # same thread until Codex reports the Goal complete.
-            updates["retry_forever"] = 1
+        if payload.objective.strip() and not task.get("retry_explicit"):
+            updates["retry_forever"] = 0
             updates["retry_explicit"] = 0
-        else:
+        elif not payload.objective.strip():
             updates["retry_forever"] = 0
             updates["retry_explicit"] = 0
     elif payload.status is not None:

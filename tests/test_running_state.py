@@ -1071,17 +1071,41 @@ process.stdout.write(JSON.stringify(blocks));
 
         asyncio.run(exercise())
 
-    def test_goal_retry_defaults_on_and_manual_override_is_preserved(self):
+    def test_goal_retry_defaults_off_and_manual_override_is_preserved(self):
         task_id = "goal-retry-thread"
         self.make_task(task_id, "available")
         self.app.db.execute("UPDATE tasks SET codex_session_id='' WHERE id=?", (task_id,))
         result = asyncio.run(self.app.patch_goal(task_id, self.app.GoalPatch(objective="finish it")))
-        self.assertTrue(result["retry_forever"])
+        self.assertFalse(result["retry_forever"])
         self.assertEqual(0, result["retry_explicit"])
 
-        result = asyncio.run(self.app.patch_task(task_id, self.app.TaskPatch(retry_forever=False)))
-        self.assertFalse(result["retry_forever"])
+        result = asyncio.run(self.app.patch_task(task_id, self.app.TaskPatch(retry_forever=True)))
+        self.assertTrue(result["retry_forever"])
         self.assertEqual(1, result["retry_explicit"])
+
+        result = asyncio.run(self.app.patch_goal(task_id, self.app.GoalPatch(objective="finish it better")))
+        self.assertTrue(result["retry_forever"])
+        self.assertEqual(1, result["retry_explicit"])
+
+    def test_new_task_with_goal_keeps_auto_retry_off_by_default(self):
+        result = asyncio.run(self.app.create_task(self.app.TaskCreate(
+            name="Goal defaults off",
+            prompt="Start",
+            goal="Finish it",
+            workspace=self.temp.name,
+        ), None))
+        self.assertFalse(result["retry_forever"])
+        self.assertEqual(0, result["retry_explicit"])
+
+        explicit = asyncio.run(self.app.create_task(self.app.TaskCreate(
+            name="Goal explicit on",
+            prompt="Start",
+            goal="Finish it",
+            workspace=self.temp.name,
+            retry_forever=True,
+        ), None))
+        self.assertTrue(explicit["retry_forever"])
+        self.assertEqual(1, explicit["retry_explicit"])
 
     def test_memory_mode_can_change_while_turn_is_running(self):
         task_id = "memory-live-toggle"
