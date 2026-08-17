@@ -593,7 +593,7 @@ function releaseChatSelectionLock() {
   const deferredBlocks = state.deferredChatBlocks;
   state.deferredChatBlocks = null;
   requestAnimationFrame(() => {
-    if (deferredBlocks) { state.chatBlocks = deferredBlocks; paintVirtualChat(stickToBottom); }
+    if (deferredBlocks) { state.chatBlocks = deferredBlocks; paintVirtualChat(stickToBottom); requestAnimationFrame(scheduleRenderChat); }
     else renderChat();
     if (stickToBottom) requestAnimationFrame(scrollChatToBottom);
   });
