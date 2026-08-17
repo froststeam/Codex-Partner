@@ -455,7 +455,7 @@ function restoreChatViewport(stream, viewport, stickToBottom) {
 
 function renderActivityEvent(item, active = false) {
   const status = String(item.status || "").toLowerCase();
-  const statusText = status === "failed" ? "失败" : status === "started" || active ? "执行中" : "";
+  const statusText = status === "failed" ? "失败" : active ? "执行中" : "";
   const statusClass = status === "failed" ? " failed" : status === "completed" || status === "succeeded" ? " completed" : "";
   const kind = String(item.kind || "").toLowerCase();
   const command = String(item.command || "").trim();
@@ -463,14 +463,16 @@ function renderActivityEvent(item, active = false) {
   const args = String(item.arguments || "").trim();
   const changes = Array.isArray(item.changes) ? item.changes : [];
   const isWait = kind.includes("wait") || /(?:^|[._])wait$/.test(String(item.tool || ""));
+  const toolName = String(item.tool || "").toLowerCase();
+  if (!command && ["exec", "functions.exec"].includes(toolName)) return "";
   const action = isWait ? "Waited" : changes.length || kind.includes("file") ? "Edited" : kind.includes("mcp") || (!command && item.tool) ? "Called" : kind.includes("search") || kind.includes("explor") ? "Explored" : kind.includes("reason") ? "Reasoned" : command ? "Ran" : item.label || uiLabel("activityWorking");
   const inlineArgs = args ? args.replace(/\s+/g, " ") : "";
-  const subject = command || (item.tool ? `${item.tool}${inlineArgs ? `(${inlineArgs})` : ""}` : String(item.detail || ""));
+  const subject = isWait ? "for background task" : command || (item.tool ? `${item.tool}${inlineArgs ? `(${inlineArgs})` : ""}` : String(item.detail || ""));
   const cwd = item.cwd ? `<small class="activity-cwd" title="${esc(item.cwd)}">${esc(item.cwd)}</small>` : "";
   const subjectBlock = subject ? `<code class="activity-inline-subject" title="${esc(subject)}">${esc(subject)}</code>` : "";
   const changesBlock = changes.length ? `<div class="activity-changes">${changes.slice(0, 8).map(change => `<span>${esc(change.kind || "update")} · ${esc(change.path || change)}</span>`).join("")}</div>` : "";
   let outputBlock = "";
-  if (output) {
+  if (output && !isWait) {
     const outputLines = output.split(/\r?\n/);
     const meta = item.exitCode != null ? `exit ${item.exitCode}` : "";
     if (outputLines.length <= 9) {
