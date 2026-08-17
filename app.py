@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import base64
 import binascii
@@ -847,7 +848,12 @@ def decoded_tool_output(value: Any) -> tuple[Any, Optional[int]]:
         try:
             decoded = json.loads(value)
         except json.JSONDecodeError:
-            return value, None
+            try:
+                decoded = ast.literal_eval(value) if value.lstrip().startswith(("[", "{")) else value
+            except (SyntaxError, ValueError):
+                return value, None
+            if not isinstance(decoded, (list, dict)):
+                return value, None
         if decoded == value:
             return value, None
         return decoded_tool_output(decoded)
