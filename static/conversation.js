@@ -290,11 +290,13 @@ function goalStatusLabel(value) {
 function goalStatusSummary(task, goal) {
   return `${uiLabel("goalStatusPrefix")}：${goalStatusLabel(task.goal_status || (goal ? "active" : "none"))}`;
 }
-function goalCanAutoResume(status) {
-  return !["paused", "blocked", "complete", "none"].includes(status || "none");
+function goalCanAutoResume(status, retryForever = false) {
+  const value = status || "none";
+  if (["complete", "none"].includes(value)) return false;
+  return retryForever || !["paused", "blocked"].includes(value);
 }
 function goalIsActive(task) {
-  return Boolean(String(task?.goal || "").trim()) && goalCanAutoResume(task.goal_status || "active");
+  return Boolean(String(task?.goal || "").trim()) && goalCanAutoResume(task.goal_status || "active", Boolean(task.retry_forever));
 }
 function renderGoalBar() {
   const task = state.selectedTask;

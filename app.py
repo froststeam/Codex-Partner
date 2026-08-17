@@ -540,9 +540,20 @@ async def lifespan(_: FastAPI):
                 await launch(row["id"], "resume" if latest_codex_session(task) else "start")
             except Exception:
                 continue
-    for row in db.all("SELECT DISTINCT task_id FROM task_messages WHERE status='queued'"):
-        if row.get("task_id"):
-            schedule_task_drain(row["task_id"])
+    drain_task_ids = {
+        row["task_id"]
+        for row in db.all("SELECT DISTINCT task_id FROM task_messages WHERE status='queued'")
+        if row.get("task_id")
+    }
+    drain_task_ids.update(
+        row["id"]
+        for row in db.all(
+            "SELECT id FROM tasks WHERE trashed=0 AND goal!='' AND retry_forever=1 "
+            "AND goal_status NOT IN ('complete','none')"
+        )
+    )
+    for task_id in drain_task_ids:
+        schedule_task_drain(task_id)
     try:
         yield
     finally:
@@ -2558,7 +2569,10 @@ async def supervise_appserver_turn(
         native_history_cache.pop(task["id"], None)
         goal_task = task_or_404(task["id"])
         if goal_task.get("goal"):
-            goal_result = await client.request("thread/goal/set", {"threadId": thread_id, "objective": goal_task["goal"], "status": goal_task.get("goal_status") if goal_task.get("goal_status") not in {None, "none"} else "active"})
+            goal_result = await client.request(
+                "thread/goal/set",
+                {"threadId": thread_id, "objective": goal_task["goal"], "status": goal_status_for_resume(goal_task)},
+            )
             goal = goal_result.get("goal") or {}
             db.execute("UPDATE tasks SET goal_status=?, goal_tokens_used=?, updated_at=? WHERE id=?", (goal.get("status", "active"), goal.get("tokensUsed", 0), now(), task["id"]))
         codex_label = f"ssh {task['ssh_host']} codex" if task.get("ssh_host") else CODEX_BIN
@@ -3319,7 +3333,16 @@ def requested_run_mode(task: dict, mode: str, message_id: str = "") -> str:
     return "operation"
 
 
-GOAL_AUTO_RESUME_STOP_STATUSES = {"paused", "blocked", "complete", "none"}
+GOAL_TERMINAL_STATUSES = {"complete", "none"}
+GOAL_MANUAL_STOP_STATUSES = {"paused", "blocked"}
+
+
+def goal_status_for_resume(task: dict) -> str:
+    """Reactivate unfinished Goals when durable auto-resume owns scheduling."""
+    status = task.get("goal_status") or "active"
+    if task.get("retry_forever") and status not in GOAL_TERMINAL_STATUSES:
+        return "active"
+    return "active" if status == "none" else status
 
 
 def goal_auto_resume_enabled(task: dict) -> bool:
@@ -3327,12 +3350,16 @@ def goal_auto_resume_enabled(task: dict) -> bool:
     if not task.get("goal") or not task.get("retry_forever"):
         return False
     status = task.get("goal_status") or "active"
-    return status not in GOAL_AUTO_RESUME_STOP_STATUSES
+    return status not in GOAL_TERMINAL_STATUSES
 
 
 def task_retry_allowed(task: dict, retries: int) -> bool:
-    if task.get("goal") and (task.get("goal_status") or "active") in GOAL_AUTO_RESUME_STOP_STATUSES:
-        return False
+    if task.get("goal"):
+        status = task.get("goal_status") or "active"
+        if status in GOAL_TERMINAL_STATUSES:
+            return False
+        if status in GOAL_MANUAL_STOP_STATUSES and not task.get("retry_forever"):
+            return False
     retry_forever = goal_auto_resume_enabled(task) if task.get("goal") else bool(task.get("retry_forever"))
     return retry_forever or retries <= int(task["max_retries"])
 
@@ -3684,15 +3711,11 @@ async def drain_task_messages(task_id: str) -> None:
             return
         row = db.one("SELECT * FROM task_messages WHERE task_id=? AND status='queued' ORDER BY created_at, id LIMIT 1", (task_id,))
         if not row:
-            goal_resume = bool(
-                current.get("goal")
-                and current.get("run_mode") == "goal_resume"
-                and goal_auto_resume_enabled(current)
-            )
+            goal_resume = goal_auto_resume_enabled(current)
             if not goal_resume:
                 return
-            # A browser can adopt a terminal-owned Goal turn. Once that turn
-            # ends, continue the same Goal through the shared app-server.
+            # Durable auto-resume owns unfinished Goal work whenever no user
+            # message or active turn has priority.
             db.execute(
                 "UPDATE tasks SET status='queued',execution_source='dashboard',execution_turn_id='',updated_at=? WHERE id=?",
                 (now(), task_id),
@@ -3762,6 +3785,7 @@ def schedule_task_drain(task_id: str) -> None:
         return
 
     async def run() -> None:
+        goal_retry_delay = 0.5
         try:
             # Keep one lightweight worker alive while queued rows remain.  It
             # sleeps during the active turn and wakes naturally after the
@@ -3774,11 +3798,18 @@ def schedule_task_drain(task_id: str) -> None:
                 except HTTPException:
                     return
                 pending = db.one("SELECT id FROM task_messages WHERE task_id=? AND status='queued' LIMIT 1", (task_id,))
-                if not pending:
+                active = task_turn_active(task_id, current)
+                goal_pending = goal_auto_resume_enabled(current) and not active
+                if not pending and not goal_pending:
                     return
                 # Keep a small backoff even after a launch race.  This avoids
                 # hammering the app-server while its turn boundary is settling.
-                await asyncio.sleep(0.35 if task_turn_active(task_id, current) else 0.1)
+                if goal_pending and current.get("status") == "failed":
+                    await asyncio.sleep(goal_retry_delay)
+                    goal_retry_delay = min(30.0, goal_retry_delay * 2)
+                else:
+                    goal_retry_delay = 0.5
+                    await asyncio.sleep(0.35 if active else 0.1)
         finally:
             if task_workers.get(task_id) is asyncio.current_task():
                 task_workers.pop(task_id, None)
@@ -4348,6 +4379,8 @@ async def patch_task(task_id: str, payload: TaskPatch, _: Any = Depends(auth)):
     if "model" in values:
         persist_native_thread_model(result.get("codex_session_id") or task_id, str(values.get("model") or ""))
     await broadcast_overview(task_id, {"type": "updated"})
+    if values.get("retry_forever") and goal_auto_resume_enabled(result):
+        schedule_task_drain(task_id)
     return result
 
 
@@ -4361,6 +4394,8 @@ async def patch_context(task_id: str, payload: ContextPatch, _: Any = Depends(au
 @app.put("/api/tasks/{task_id}/goal")
 async def patch_goal(task_id: str, payload: GoalPatch, _: Any = Depends(auth)):
     task = task_or_404(task_id)
+    if payload.status == "paused" and task.get("retry_forever"):
+        raise HTTPException(409, "Turn off Goal auto-resume before pausing the Goal")
     remote_goal: dict[str, Any] = {}
     thread_id = latest_codex_session(task)
     if thread_id and (payload.objective is not None or payload.status is not None):

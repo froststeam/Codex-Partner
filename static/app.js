@@ -294,6 +294,7 @@ async function toggleGoalRun() {
   const goal = String(task?.goal || "").trim();
   if (!task || !state.selectedId || !goal) return toast("请先设置 Goal");
   const goalActive = goalIsActive(task);
+  if (goalActive && task.retry_forever) return toast("请先关闭 Goal 自动续跑，再暂停 Goal");
   const turnActive = ["running", "retrying", "queued"].includes(task.status);
   if (goalActive && turnActive) {
     const stopped = await changeSelectedRun("stop", false);

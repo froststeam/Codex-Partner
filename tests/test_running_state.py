@@ -485,7 +485,7 @@ class RunningStateTests(unittest.TestCase):
         launch.assert_awaited_once_with(task_id, "resume")
         self.assertEqual("queued", self.app.task_or_404(task_id)["status"])
 
-    def test_paused_or_blocked_goal_does_not_auto_resume(self):
+    def test_paused_or_blocked_goal_auto_resumes_when_retry_forever_is_on(self):
         for status in ("paused", "blocked"):
             task_id = f"external-goal-{status}-{time.time_ns()}"
             self.make_task(task_id, "available")
@@ -494,15 +494,47 @@ class RunningStateTests(unittest.TestCase):
                 (status, task_id),
             )
             try:
-                with mock.patch.object(self.app, "launch", new=mock.AsyncMock()) as launch:
+                with mock.patch.object(self.app, "launch", new=mock.AsyncMock(return_value={"session_id": "next"})) as launch:
                     asyncio.run(self.app.drain_task_messages(task_id))
-                launch.assert_not_awaited()
+                launch.assert_awaited_once_with(task_id, "resume")
                 task = self.app.task_or_404(task_id)
-                self.assertEqual("available", task["status"])
+                self.assertEqual("queued", task["status"])
                 self.assertEqual(status, task["goal_status"])
-                self.assertFalse(self.app.goal_auto_resume_enabled(task))
+                self.assertTrue(self.app.goal_auto_resume_enabled(task))
+                self.assertEqual("active", self.app.goal_status_for_resume(task))
             finally:
                 self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_paused_or_blocked_goal_stays_stopped_when_retry_forever_is_off(self):
+        for status in ("paused", "blocked"):
+            task = {"goal": "finish it", "goal_status": status, "retry_forever": 0}
+            self.assertFalse(self.app.goal_auto_resume_enabled(task))
+            self.assertFalse(self.app.task_retry_allowed(task, 0))
+            self.assertEqual(status, self.app.goal_status_for_resume(task))
+
+    def test_goal_cannot_be_paused_before_auto_resume_is_disabled(self):
+        task_id = f"goal-pause-order-{time.time_ns()}"
+        self.make_task(task_id, "available")
+        self.app.db.execute(
+            "UPDATE tasks SET goal='finish it',goal_status='active',retry_forever=1 WHERE id=?",
+            (task_id,),
+        )
+        with self.assertRaises(self.app.HTTPException) as raised:
+            asyncio.run(self.app.patch_goal(task_id, self.app.GoalPatch(status="paused"), None))
+        self.assertEqual(409, raised.exception.status_code)
+        self.assertEqual("active", self.app.task_or_404(task_id)["goal_status"])
+
+    def test_enabling_auto_resume_wakes_a_paused_goal(self):
+        task_id = f"goal-retry-enable-{time.time_ns()}"
+        self.make_task(task_id, "available")
+        self.app.db.execute(
+            "UPDATE tasks SET goal='finish it',goal_status='paused',retry_forever=0 WHERE id=?",
+            (task_id,),
+        )
+        with mock.patch.object(self.app, "schedule_task_drain") as schedule:
+            result = asyncio.run(self.app.patch_task(task_id, self.app.TaskPatch(retry_forever=True), None))
+        self.assertTrue(result["retry_forever"])
+        schedule.assert_called_once_with(task_id)
 
     def test_stop_clears_unowned_running_state(self):
         task_id = "orphan-thread"
@@ -2009,11 +2041,11 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn("attachmentUploadName", app_js)
         self.assertIn("new File([file]", app_js)
         self.assertIn('uiLabel("binaryAttachment"', app_js)
-        self.assertIn('/app.js?v=20260817-goal-pause', html)
+        self.assertIn('/app.js?v=20260817-goal-auto-resume', html)
         self.assertIn('/core.js?v=20260817-inactive-trash', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260817-goal-pause', html)
+        self.assertIn('/conversation.js?v=20260817-goal-auto-resume', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -2067,14 +2099,15 @@ process.stdout.write(JSON.stringify(blocks));
         app_js = (root / "static" / "app.js").read_text(encoding="utf-8")
         database_py = (root / "codex_partner" / "database.py").read_text(encoding="utf-8")
         self.assertIn("function goalIsActive", conversation_js)
-        self.assertIn('goalCanAutoResume(task.goal_status || "active")', conversation_js)
+        self.assertIn('goalCanAutoResume(task.goal_status || "active", Boolean(task.retry_forever))', conversation_js)
         self.assertIn("goalIsActive(task)", app_js)
         self.assertIn('const turnActive = ["running", "retrying", "queued"].includes(task.status)', app_js)
         self.assertIn('active: "enabled"', conversation_js)
         self.assertIn('goalProgress.textContent = goalStatusLabel', conversation_js)
         self.assertIn('function goalStatusSummary', conversation_js)
         self.assertIn('function goalCanAutoResume', conversation_js)
-        self.assertIn('"paused", "blocked", "complete", "none"', conversation_js)
+        self.assertIn('return retryForever || !["paused", "blocked"].includes(value)', conversation_js)
+        self.assertIn('请先关闭 Goal 自动续跑，再暂停 Goal', app_js)
         self.assertIn('${uiLabel("goalStatusPrefix")}：${goalStatusLabel', conversation_js)
         self.assertNotIn('statusLabel(task.status)}', conversation_js)
         self.assertNotIn('sessionStatusPrefix', conversation_js)
@@ -2240,10 +2273,10 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260817-goal-pause', html)
+        self.assertIn('/conversation.js?v=20260817-goal-auto-resume', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
-        self.assertIn('/app.js?v=20260817-goal-pause', html)
+        self.assertIn('/app.js?v=20260817-goal-auto-resume', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
         self.assertIn('/styles.css?v=20260817-goal-pause-label', html)
         self.assertIn('<span id="goal-run-label">暂停</span>', html)
