@@ -1850,6 +1850,19 @@ process.stdout.write(JSON.stringify(browserMessages));
                     asyncio.run(self.app.delete_skill(system_updated["id"], None))
                 self.assertEqual(403, protected_delete.exception.status_code)
 
+    def test_skill_actions_distinguish_edit_from_protected_delete(self):
+        static = Path(__file__).resolve().parents[1] / "static"
+        settings = (static / "settings.js").read_text(encoding="utf-8")
+        styles = (static / "styles.css").read_text(encoding="utf-8")
+        html = (static / "index.html").read_text(encoding="utf-8")
+        self.assertIn('class="danger-text" data-skill-delete', settings)
+        self.assertIn('disabled title="${esc(uiLabel("protectedSkillDelete"))}"', settings)
+        self.assertIn(".panel-item button.danger-text:not(:disabled)", styles)
+        self.assertNotIn(".panel-item button:last-child", styles)
+        self.assertIn('/styles.css?v=20260817-skill-actions', html)
+        self.assertIn('/core.js?v=20260817-skill-actions', html)
+        self.assertIn('/settings.js?v=20260817-skill-actions', html)
+
     def test_provider_probe_status_and_endpoint_refresh(self):
         provider_id = f"provider-status-{os.getpid()}"
         history_task_id = f"provider-history-{os.getpid()}"
@@ -2402,7 +2415,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("new File([file]", app_js)
         self.assertIn('uiLabel("binaryAttachment"', app_js)
         self.assertIn('/app.js?v=20260817-queue-races', html)
-        self.assertIn('/core.js?v=20260817-link-recovery', html)
+        self.assertIn('/core.js?v=20260817-skill-actions', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
         self.assertIn('/conversation.js?v=20260817-session-navigation', html)
@@ -2639,7 +2652,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260817-queue-races', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
-        self.assertIn('/styles.css?v=20260817-activity-history', html)
+        self.assertIn('/styles.css?v=20260817-skill-actions', html)
         self.assertIn('/vendor/katex/katex.min.css', html)
         self.assertIn('<span id="goal-run-label">暂停</span>', html)
         self.assertNotIn('id="goal-run-label" class="sr-only"', html)
