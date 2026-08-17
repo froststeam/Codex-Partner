@@ -252,7 +252,11 @@ function buildBlocks(events, rawActivity, labels) {
         continue;
       }
       let group = blocks[blocks.length - 1];
-      if (!group || group.role !== "activities") { group = { role: "activities", items: [] }; blocks.push(group); }
+      if (!group || group.role !== "activities") {
+        const activityKey = [event.stream || "activity", event.id || item.itemId || event.session_id || event.ts || blocks.length].join(":");
+        group = { role: "activities", activityKey, items: [] };
+        blocks.push(group);
+      }
       group.items.push(item); if (item.itemId) activityItems.set(item.itemId, item); current = null; continue;
     }
     const commandBlock = ["slashCommand", "commandResult"].includes(payload?.type);

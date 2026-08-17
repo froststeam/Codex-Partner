@@ -2,7 +2,7 @@
 const state = {
   tasks: [], sessions: [], skills: [], providers: [], memories: [], generatedMemories: [], commands: [], sshHosts: [], sshConfig: "", activeSSHHost: localStorage.getItem("codex-dashboard-ssh-host") || "",
   selectedId: null, selectedTask: null, selectedEvents: [], selectedMessages: [], pendingApprovals: [], sessionRequestId: 0, sessionAbortController: null, workspacePath: "", workspaceFile: null, workspaceRequestId: 0, workspacePickerPath: "", workspaceUploading: false, inspectorClosed: false, filter: "all", query: "",
-  historyCursor: "", historyHasMore: false, historyLoading: false, chatBlocks: [], chatVirtualStart: null, chatAverageHeight: 112,
+  historyCursor: "", historyHasMore: false, historyLoading: false, chatBlocks: [], chatVirtualStart: null, chatAverageHeight: 112, activityVisibleCounts: {},
   commandIndex: 0, rawActivity: true, composerHistory: [], historyIndex: -1, editingQueuedId: null, defaultWorkspace: "", codexAvailable: true, codexInstall: null, codexInfo: null,
   runtimeMetrics: { taskId: "", ttftMs: null, tpotMs: null, estimated: true, outputTokens: 0 }, serverInfo: { user: "", hostname: "" }, chatSnapToBottom: false, userAvatar: localStorage.getItem("codex-dashboard-user-avatar") || "",
 };
@@ -41,7 +41,7 @@ const UI_LABELS = {
   activityTool: { zh: "正在调用工具", en: "Using tool", fr: "Utilisation d’un outil", ja: "ツールを使用中", ko: "도구 사용 중" },
   activityToolDone: { zh: "工具调用完成", en: "Tool completed", fr: "Outil terminé", ja: "ツール完了", ko: "도구 호출 완료" },
   activitySearch: { zh: "正在检索资料", en: "Searching", fr: "Recherche", ja: "検索中", ko: "검색 중" },
-  earlierActivity: { zh: "较早活动 {{count}} 条", en: "{{count}} earlier activities", fr: "{{count}} activités antérieures", ja: "以前のアクティビティ {{count}} 件", ko: "이전 활동 {{count}}개" },
+  loadEarlierActivity: { zh: "查看较早活动（{{count}}）", en: "Load earlier activity ({{count}})", fr: "Charger les activités précédentes ({{count}})", ja: "以前のアクティビティを表示（{{count}}）", ko: "이전 활동 보기 ({{count}})" },
   sending: { zh: "发送中", en: "Sending", fr: "Envoi", ja: "送信中", ko: "전송 중" },
   steering: { zh: "当前 turn", en: "Current turn", fr: "Tour actuel", ja: "現在のターン", ko: "현재 턴" },
   queued: { zh: "排队中", en: "Queued", fr: "En file", ja: "待機中", ko: "대기 중" },

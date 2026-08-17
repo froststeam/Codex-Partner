@@ -1027,6 +1027,44 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertEqual("OK", blocks[0]["items"][0]["output"])
         self.assertNotIn("outputDelta", json.dumps(blocks))
 
+    def test_activity_history_expands_independently_from_message_history(self):
+        static = Path(__file__).resolve().parents[1] / "static"
+        worker = static / "chat-worker.js"
+        script = f"""
+const fs = require("fs");
+const vm = require("vm");
+const context = {{ self: {{ postMessage() {{}} }} }};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync({json.dumps(str(worker))}, "utf8"), context);
+const events = Array.from({{ length: 21 }}, (_, index) => ({{
+  id: `event-${{index}}`,
+  stream: "app-server",
+  payload: JSON.stringify({{ type: "commandExecution", command: `command-${{index}}`, item_id: `command-${{index}}`, status: "completed" }})
+}}));
+const blocks = context.buildBlocks(events, true, {{ activityCommandDone: "done", activityWorking: "working" }});
+process.stdout.write(JSON.stringify(blocks));
+"""
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+        blocks = json.loads(result.stdout)
+        self.assertEqual(1, len(blocks))
+        self.assertEqual(21, len(blocks[0]["items"]))
+        self.assertTrue(blocks[0]["activityKey"].startswith("app-server:event-0"))
+
+        conversation = (static / "conversation.js").read_text(encoding="utf-8")
+        core = (static / "core.js").read_text(encoding="utf-8")
+        styles = (static / "styles.css").read_text(encoding="utf-8")
+        function_start = conversation.index("function loadEarlierActivity")
+        function_end = conversation.index("\n}\n", function_start)
+        activity_loader = conversation[function_start:function_end]
+        self.assertIn("visibleCount + 16", activity_loader)
+        self.assertIn("paintVirtualChat(false)", activity_loader)
+        self.assertNotIn("loadOlderTimeline", activity_loader)
+        self.assertIn('class="activity-load-older"', conversation)
+        self.assertIn("data-activity-key", conversation)
+        self.assertIn("activityVisibleCounts: {}", core)
+        self.assertIn("loadEarlierActivity", core)
+        self.assertIn(".activity-load-older", styles)
+
     def test_model_slash_command_supports_named_updates_and_defaults(self):
         task_id = "model-command-thread"
         self.make_task(task_id)
@@ -2229,10 +2267,10 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn("new File([file]", app_js)
         self.assertIn('uiLabel("binaryAttachment"', app_js)
         self.assertIn('/app.js?v=20260817-queue-races', html)
-        self.assertIn('/core.js?v=20260817-queue-races', html)
+        self.assertIn('/core.js?v=20260817-activity-history', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260817-protocol-filter', html)
+        self.assertIn('/conversation.js?v=20260817-activity-history', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -2461,19 +2499,19 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260817-protocol-filter', html)
+        self.assertIn('/conversation.js?v=20260817-activity-history', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260817-queue-races', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
-        self.assertIn('/styles.css?v=20260817-markdown-math', html)
+        self.assertIn('/styles.css?v=20260817-activity-history', html)
         self.assertIn('/vendor/katex/katex.min.css', html)
         self.assertIn('<span id="goal-run-label">暂停</span>', html)
         self.assertNotIn('id="goal-run-label" class="sr-only"', html)
         self.assertIn(".session-card.selected::before", styles)
         self.assertNotIn("renderSessionList(); renderConversation(); await loadWorkspace(\"\")", conversation_js)
         self.assertIn(".queued-messages { width: auto; height: auto; min-height: 0; max-height: none; align-self: stretch;", styles)
-        self.assertIn('/chat-worker.js?v=20260817-protocol-filter', conversation_js)
+        self.assertIn('/chat-worker.js?v=20260817-activity-history', conversation_js)
         self.assertIn('data-live="true" open', conversation_js)
         self.assertIn("activity-event.current::after", styles)
         self.assertIn("function renderActivityEvent", conversation_js)
@@ -2542,7 +2580,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn("task.id !== oldTaskId && task.id !== newTaskId", conversation_js)
         self.assertIn("connectSocket(newTaskId, true)", conversation_js)
         self.assertIn("native.aggregatedOutput", worker_js)
-        self.assertIn('uiLabel("earlierActivity"', conversation_js)
+        self.assertIn('uiLabel("loadEarlierActivity"', conversation_js)
         self.assertIn("inactiveTrashReason", (static / "settings.js").read_text(encoding="utf-8"))
         self.assertIn("scroll-behavior: auto", styles)
         self.assertIn("grid-template-columns: auto minmax(0, 1fr) auto", styles)

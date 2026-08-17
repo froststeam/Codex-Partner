@@ -2,7 +2,7 @@
 const chatFileObjectUrls = new Map();
 const chatThumbnailObjectUrls = new Map();
 const chatThumbnailLoads = new Map();
-const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260817-protocol-filter") : null;
+const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260817-activity-history") : null;
 let chatBuildRequestId = 0;
 let chatHistoryLoadPromise = null;
 let mediaViewerMarkdown = null;
@@ -66,7 +66,7 @@ async function selectSession(id, openSocket = true) {
   const wasEmpty = $("#conversation-view").hidden;
   if (state.selectedId !== id) {
     resetWorkspaceBrowser(); state.titleExpanded = false; state.historyCursor = ""; state.historyHasMore = false;
-    state.historyLoading = false; state.chatBlocks = []; state.chatVirtualStart = null; state.pendingApprovals = [];
+    state.historyLoading = false; state.chatBlocks = []; state.chatVirtualStart = null; state.activityVisibleCounts = {}; state.pendingApprovals = [];
     state.selectedEvents = []; state.selectedMessages = []; state.composerHistory = []; state.historyIndex = -1;
     state.runtimeMetrics = { taskId: "", ttftMs: null, tpotMs: null, estimated: true, outputTokens: 0 };
   }
@@ -524,16 +524,27 @@ function renderActivityEvent(item, active = false, blockIndex = -1, itemIndex = 
 function renderChatBlock(block, blockIndex, liveActivity = false) {
   const blockAttribute = ` data-chat-block-index="${blockIndex}"`;
   if (block.role === "activities") {
-    const items = block.items.slice(-16);
+    const activityKey = String(block.activityKey || `activity-${blockIndex}`);
+    const visibleCount = Math.max(16, Number(state.activityVisibleCounts[activityKey]) || 16);
+    const items = block.items.slice(-visibleCount);
     const latest = items[items.length - 1] || {};
     const itemOffset = block.items.length - items.length;
     const current = liveActivity ? `<span class="activity-current">${esc(latest.text || uiLabel("activityWorking"))}</span>` : "";
-    const older = block.items.length > items.length ? `<div class="activity-older">${uiLabel("earlierActivity", { count: block.items.length - items.length })}</div>` : "";
+    const hiddenCount = block.items.length - items.length;
+    const older = hiddenCount ? `<button type="button" class="activity-load-older" data-activity-key="${esc(activityKey)}">${uiLabel("loadEarlierActivity", { count: hiddenCount })}</button>` : "";
     return `<details class="activity-group${liveActivity ? " live" : ""}"${blockAttribute}${liveActivity ? ' data-live="true" open' : ""}><summary><span class="activity-pulse" aria-hidden="true"><i></i></span><strong>${uiLabel("activity")}</strong>${current}<small>${block.items.length}</small></summary><div class="activity-events">${older}${items.map((item, index) => renderActivityEvent(item, liveActivity && index === items.length - 1, blockIndex, itemOffset + index)).join("")}</div></details>`;
   }
   const deliveryLabels = { sending: uiLabel("sending"), steering: uiLabel("steering"), steered: uiLabel("steering"), queued: uiLabel("queued"), running: `${statusLabel("running")} · Codex`, failed: uiLabel("failedSend") };
   const label = block.role === "user" ? (block.commandBlock ? uiLabel("commandLabel") : "") : (block.commandBlock ? uiLabel("commandResult") : uiLabel("codexPartner"));
   return `<article class="message ${block.role}${block.commandBlock ? " command-message" : ""}${block.streaming ? " streaming" : ""}"${blockAttribute} data-item-id="${esc(block.itemId || "")}"><div class="message-avatar" role="img" aria-label="${block.role === "user" ? uiLabel("you") : uiLabel("codexPartner")}" title="${block.role === "user" ? uiLabel("you") : uiLabel("codexPartner")}">${block.role === "user" ? humanMarkup() : mascotMarkup("mascot-chat")}</div><div class="message-body copyable-chat-block"><button type="button" class="chat-copy-button" data-copy-chat-block="${blockIndex}" title="复制消息" aria-label="复制消息">⧉</button><div class="message-meta">${label ? `<strong>${label}</strong>` : ""}${block.origin === "terminal" ? `<span>${uiLabel("messageFromTerminal")}</span>` : ""}${block.time ? `<time datetime="${esc(block.time)}">${esc(shortDate(block.time))}</time>` : ""}</div><div class="message-content">${block.html || ""}${block.streaming ? `<span class="stream-cursor"></span>` : ""}</div>${deliveryLabels[block.delivery] ? `<div class="message-delivery ${esc(block.delivery)}" title="${esc(block.error)}">${esc(deliveryLabels[block.delivery])}</div>` : ""}</div></article>`;
+}
+
+function loadEarlierActivity(activityKey) {
+  const block = (state.chatBlocks || []).find(item => item.role === "activities" && String(item.activityKey || "") === activityKey);
+  if (!block) return;
+  const visibleCount = Math.max(16, Number(state.activityVisibleCounts[activityKey]) || 16);
+  state.activityVisibleCounts[activityKey] = Math.min(block.items.length, visibleCount + 16);
+  paintVirtualChat(false);
 }
 
 function paintVirtualChat(stickToBottom = false) {
@@ -560,6 +571,7 @@ function paintVirtualChat(stickToBottom = false) {
     state.chatAverageHeight = Math.max(72, Math.min(360, state.chatAverageHeight * .75 + measured * .25));
   }
   $(".chat-load-older", stream)?.addEventListener("click", loadOlderTimeline);
+  $$(".activity-load-older", stream).forEach(button => button.addEventListener("click", () => loadEarlierActivity(button.dataset.activityKey || "")));
   hydrateChatFiles();
   if (!stream.dataset.virtualScroll) {
     stream.dataset.virtualScroll = "1";
