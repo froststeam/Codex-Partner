@@ -745,6 +745,29 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
             self.app.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
+    def test_worker_hides_native_media_tags(self):
+        script = f"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync({json.dumps(str(Path(__file__).resolve().parents[1] / "static/chat-worker.js"))}, "utf8");
+const context = {{ self: {{ postMessage() {{}} }} }};
+vm.createContext(context);
+vm.runInContext(source, context);
+const buildBlocks = context.buildBlocks || context.self.buildBlocks;
+if (!buildBlocks) throw new Error("buildBlocks missing");
+const blocks = buildBlocks([
+  {{ id: "media", stream: "rollout", payload: JSON.stringify({{ type: "userMessage", text: "see this\\n<image name=[Image #1] path=\\"/home/ori/work/image-mswtyzp4.png\\">\\n</image>" }}) }}
+], false, {{}});
+process.stdout.write(JSON.stringify(blocks[0].html));
+"""
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+        html = json.loads(result.stdout)
+        self.assertNotIn("<image", html)
+        self.assertNotIn("</image>", html)
+        self.assertNotIn("/home/ori/work", html)
+        self.assertIn('data-chat-file="image-mswtyzp4.png"', html)
+        self.assertIn("chat-image-attachment", html)
+
     def test_model_slash_command_supports_named_updates_and_defaults(self):
         task_id = "model-command-thread"
         self.make_task(task_id)
@@ -2100,7 +2123,7 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
         self.assertIn(".session-card.selected::before", styles)
         self.assertNotIn("renderSessionList(); renderConversation(); await loadWorkspace(\"\")", conversation_js)
         self.assertIn(".queued-messages { width: auto; height: auto; min-height: 0; max-height: none; align-self: stretch;", styles)
-        self.assertIn('/chat-worker.js?v=20260817-message-dedupe', conversation_js)
+        self.assertIn('/chat-worker.js?v=20260817-hide-media-tags', conversation_js)
         self.assertIn("scroll-behavior: auto", styles)
         self.assertIn("grid-template-columns: auto minmax(0, 1fr) auto", styles)
         self.assertIn(".shortcut-hints { position: absolute; left: 50%", styles)

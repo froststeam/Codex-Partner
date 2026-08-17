@@ -58,6 +58,16 @@ function userDedupeBody(text) {
     .trim();
 }
 
+function attachmentPath(value) {
+  const raw = String(value || "").trim();
+  let text = raw;
+  try { text = decodeURIComponent(raw); } catch (_) {}
+  if (/^[a-zA-Z]:[\\/]/.test(text) || text.startsWith("/")) {
+    return text.split(/[\\/]/).filter(Boolean).pop() || text;
+  }
+  return text;
+}
+
 function mergeEvents(events, messages) {
   const visible = (messages || []).filter(message => ["running", "steering", "steered", "sent"].includes(message.status));
   const merged = [];
@@ -99,8 +109,14 @@ function mergeEvents(events, messages) {
 function markdown(text) {
   const files = [];
   const clean = String(text || "")
-    .replace(/\[\[codex-input:(localImage|localAudio|mention):([^\]]+)\]\]/g, (_, kind, path) => { files.push({ kind, path: decodeURIComponent(path) }); return ""; })
-    .replace(/\[\[codex-file:([^\]]+)\]\]/g, (_, path) => { files.push({ kind: "legacy", path: decodeURIComponent(path) }); return ""; })
+    .replace(/<(image|audio|video)\b[^>]*\bpath=["']([^"']+)["'][^>]*>[\s\S]*?<\/\1>/gi, (_, tag, path) => {
+      const kind = tag.toLowerCase() === "image" ? "localImage" : tag.toLowerCase() === "audio" ? "localAudio" : "legacy";
+      files.push({ kind, path: attachmentPath(path) });
+      return "";
+    })
+    .replace(/<(?:image|audio|video)\b[^>]*>[\s\S]*?<\/(?:image|audio|video)>/gi, "")
+    .replace(/\[\[codex-input:(localImage|localAudio|mention):([^\]]+)\]\]/g, (_, kind, path) => { files.push({ kind, path: attachmentPath(path) }); return ""; })
+    .replace(/\[\[codex-file:([^\]]+)\]\]/g, (_, path) => { files.push({ kind: "legacy", path: attachmentPath(path) }); return ""; })
     .replace(/(?:Uploaded to workspace|已上传到工作区)\s*[:：]\s*([^\n\r，。]+?\.[a-z0-9]{1,12})(?=\s|[，。]|$)/gi, (_, path) => { files.push({ kind: "legacy", path: path.trim() }); return ""; })
     .replace(/\[(?:Attachments?|附件)\s*[:：]\s*[^\]]+\]/gi, "")
     .trim();
