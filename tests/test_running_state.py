@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -1618,6 +1619,58 @@ process.stdout.write(JSON.stringify(blocks));
         ids = [row["id"] for row in rows]
         self.assertLess(ids.index(newer_id), ids.index(older_id))
 
+    def test_inactive_sessions_move_to_recycle_bin_after_thirty_days(self):
+        old_id = "inactive-trash-old"
+        recent_id = "inactive-trash-recent"
+        running_id = "inactive-trash-running"
+        queued_id = "inactive-trash-queued"
+        for task_id, status in ((old_id, "stopped"), (recent_id, "stopped"), (running_id, "running"), (queued_id, "stopped")):
+            self.make_task(task_id, status)
+        self.app.db.execute("UPDATE tasks SET last_interaction_at=? WHERE id=?", ("2026-07-01T00:00:00+00:00", old_id))
+        self.app.db.execute("UPDATE tasks SET last_interaction_at=? WHERE id=?", ("2026-07-20T00:00:00+00:00", recent_id))
+        self.app.db.execute("UPDATE tasks SET last_interaction_at=? WHERE id=?", ("2026-07-01T00:00:00+00:00", running_id))
+        self.app.db.execute("UPDATE tasks SET last_interaction_at=? WHERE id=?", ("2026-07-01T00:00:00+00:00", queued_id))
+        self.app.db.execute(
+            "INSERT INTO task_messages (id,task_id,body,status,created_at) VALUES (?,?,?,?,?)",
+            ("inactive-trash-pending-message", queued_id, "pending", "queued", "2026-07-01T00:00:00+00:00"),
+        )
+        try:
+            moved = self.app.trash_inactive_tasks(datetime(2026, 8, 17, tzinfo=timezone.utc))
+            self.assertEqual([old_id], moved)
+            old = self.app.task_or_404(old_id)
+            self.assertTrue(old["trashed"])
+            self.assertEqual("trashed", old["status"])
+            self.assertEqual("inactive_30_days", old["trashed_reason"])
+            self.assertFalse(self.app.task_or_404(recent_id)["trashed"])
+            self.assertFalse(self.app.task_or_404(running_id)["trashed"])
+            self.assertFalse(self.app.task_or_404(queued_id)["trashed"])
+
+            restored = asyncio.run(self.app.restore_trash(old_id, None))
+            self.assertFalse(restored["trashed"])
+            self.assertEqual("", restored["trashed_reason"])
+            self.assertEqual(restored["updated_at"], restored["last_interaction_at"])
+        finally:
+            for task_id in (old_id, recent_id, running_id, queued_id):
+                self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_chat_events_advance_last_interaction_timestamp(self):
+        task_id = "last-interaction-event"
+        session_id = "last-interaction-session"
+        self.make_task(task_id, "stopped")
+        self.app.db.execute(
+            "INSERT INTO sessions (id,task_id,status,attempt,command,started_at) VALUES (?,?,?,?,?,?)",
+            (session_id, task_id, "succeeded", 1, "codex", "2026-07-01T00:00:00+00:00"),
+        )
+        self.app.db.execute("UPDATE tasks SET last_interaction_at=? WHERE id=?", ("2026-07-01T00:00:00+00:00", task_id))
+        try:
+            self.app.db.execute(
+                "INSERT INTO events (session_id,ts,stream,payload) VALUES (?,?,?,?)",
+                (session_id, "2026-08-17T01:00:00+00:00", "app-server", json.dumps({"type": "agentMessage", "text": "done"})),
+            )
+            self.assertEqual("2026-08-17T01:00:00+00:00", self.app.task_or_404(task_id)["last_interaction_at"])
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
     def test_queued_message_refreshes_task_recency_and_overview(self):
         task_id = "queued-message-recency"
         self.make_task(task_id, "stopped")
@@ -1957,10 +2010,10 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn("new File([file]", app_js)
         self.assertIn('uiLabel("binaryAttachment"', app_js)
         self.assertIn('/app.js?v=20260817-goal-status', html)
-        self.assertIn('/core.js?v=20260817-live-activity', html)
+        self.assertIn('/core.js?v=20260817-inactive-trash', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260817-live-activity', html)
+        self.assertIn('/conversation.js?v=20260817-inactive-trash', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -2186,18 +2239,20 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260817-live-activity', html)
+        self.assertIn('/conversation.js?v=20260817-inactive-trash', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260817-goal-status', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
-        self.assertIn('/styles.css?v=20260817-live-activity', html)
+        self.assertIn('/styles.css?v=20260817-inactive-trash', html)
         self.assertIn(".session-card.selected::before", styles)
         self.assertNotIn("renderSessionList(); renderConversation(); await loadWorkspace(\"\")", conversation_js)
         self.assertIn(".queued-messages { width: auto; height: auto; min-height: 0; max-height: none; align-self: stretch;", styles)
         self.assertIn('/chat-worker.js?v=20260817-live-activity', conversation_js)
         self.assertIn('data-live="true" open', conversation_js)
         self.assertIn("activity-event.current::after", styles)
+        self.assertIn('uiLabel("earlierActivity"', conversation_js)
+        self.assertIn("inactiveTrashReason", (static / "settings.js").read_text(encoding="utf-8"))
         self.assertIn("scroll-behavior: auto", styles)
         self.assertIn("grid-template-columns: auto minmax(0, 1fr) auto", styles)
         self.assertIn(".shortcut-hints { position: absolute; left: 50%", styles)

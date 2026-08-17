@@ -33,7 +33,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
@@ -102,6 +102,14 @@ AUTH_SESSION_TTL = max(300, int(os.getenv("CODEX_DASHBOARD_AUTH_TTL", "43200")))
 AUTH_SSH_HOST = os.getenv("CODEX_DASHBOARD_AUTH_SSH_HOST", "127.0.0.1").strip() or "127.0.0.1"
 CODEX_APP_SERVER_ENABLED = os.getenv("CODEX_APP_SERVER", "1").lower() not in {"0", "false", "no"}
 AUTO_RESUME = os.getenv("CODEX_DASHBOARD_AUTO_RESUME", "1").lower() not in {"0", "false", "no"}
+try:
+    INACTIVE_TRASH_DAYS = max(1, int(os.getenv("CODEX_DASHBOARD_INACTIVE_TRASH_DAYS", "30")))
+except ValueError:
+    INACTIVE_TRASH_DAYS = 30
+try:
+    INACTIVE_TRASH_SCAN_SECONDS = max(60, int(os.getenv("CODEX_DASHBOARD_INACTIVE_TRASH_SCAN_SECONDS", "3600")))
+except ValueError:
+    INACTIVE_TRASH_SCAN_SECONDS = 3600
 app_shutting_down = False
 CODEX_INSTALL_PACKAGE = "@openai/codex@latest"
 
@@ -455,11 +463,52 @@ def reconcile_delivered_task_messages() -> None:
     )
 
 
+def trash_inactive_tasks(reference: Optional[datetime] = None) -> list[str]:
+    """Move recoverable, idle sessions with no interaction for the retention window to trash."""
+    current = reference or datetime.now(timezone.utc)
+    cutoff = (current - timedelta(days=INACTIVE_TRASH_DAYS)).astimezone(timezone.utc).isoformat()
+    stamp = current.astimezone(timezone.utc).isoformat()
+    rows = db.all(
+        "SELECT id FROM tasks WHERE trashed=0 AND status NOT IN ('running','retrying','queued') "
+        "AND COALESCE(last_interaction_at,created_at)<? ORDER BY COALESCE(last_interaction_at,created_at)",
+        (cutoff,),
+    )
+    moved: list[str] = []
+    for row in rows:
+        task_id = row["id"]
+        if external_turns.get(task_id) or db.one(
+            "SELECT id FROM task_messages WHERE task_id=? AND status IN ('queued','dispatching','running','steering') LIMIT 1",
+            (task_id,),
+        ):
+            continue
+        db.execute(
+            "UPDATE tasks SET trashed=1,trashed_at=?,trashed_reason='inactive_30_days',status='trashed',"
+            "active_session_id=NULL,execution_source='',execution_turn_id='',run_mode='',updated_at=? "
+            "WHERE id=? AND trashed=0 AND status NOT IN ('running','retrying','queued')",
+            (stamp, stamp, task_id),
+        )
+        moved.append(task_id)
+    return moved
+
+
+async def inactive_trash_loop() -> None:
+    while True:
+        await asyncio.sleep(INACTIVE_TRASH_SCAN_SECONDS)
+        try:
+            for task_id in trash_inactive_tasks():
+                await broadcast_overview_removed(task_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            continue
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global app_shutting_down
     app_shutting_down = False
     observer_task: Optional[asyncio.Task] = None
+    inactive_trash_task: Optional[asyncio.Task] = None
     reconcile_task_session_ids()
     try:
         await sync_native_threads()
@@ -474,6 +523,12 @@ async def lifespan(_: FastAPI):
     except Exception:
         # Rollout observation augments native Codex sessions. A malformed or
         # temporarily locked state database must not prevent the UI starting.
+        pass
+    try:
+        trash_inactive_tasks()
+        inactive_trash_task = asyncio.create_task(inactive_trash_loop())
+    except Exception:
+        # Retention cleanup is best effort and must never block the dashboard.
         pass
     if AUTO_RESUME:
         await asyncio.sleep(0)
@@ -495,6 +550,9 @@ async def lifespan(_: FastAPI):
         if observer_task:
             observer_task.cancel()
             await asyncio.gather(observer_task, return_exceptions=True)
+        if inactive_trash_task:
+            inactive_trash_task.cancel()
+            await asyncio.gather(inactive_trash_task, return_exceptions=True)
         workers = list(task_workers.values())
         for worker in workers:
             worker.cancel()
@@ -2127,9 +2185,10 @@ async def sync_native_threads() -> dict:
                 retry_forever = int(existing.get("retry_forever", 0)) if existing.get("retry_explicit") else int(bool(objective))
                 db.execute(
                     "UPDATE tasks SET name=?,prompt=?,goal=?,workspace=?,model=?,provider_id=?,goal_status=?,goal_tokens_used=?,"
-                    "retry_forever=?,yolo=?,native=1,archived=?,memory_mode=?,status=?,updated_at=? WHERE id=?",
+                    "retry_forever=?,yolo=?,native=1,archived=?,memory_mode=?,status=?,updated_at=?,"
+                    "last_interaction_at=CASE WHEN COALESCE(last_interaction_at,'')<? THEN ? ELSE last_interaction_at END WHERE id=?",
                     (title[:160], prompt, objective, workspace, model, provider_id, goal_status, int(goal.get("tokensUsed", 0) or 0),
-                     retry_forever, int(yolo), int(archived), memory_mode, status, updated_at, existing["id"]),
+                     retry_forever, int(yolo), int(archived), memory_mode, status, updated_at, updated_at, updated_at, existing["id"]),
                 )
                 persist_native_thread_model(thread_id, model)
                 task_id = existing["id"]
@@ -2140,8 +2199,8 @@ async def sync_native_threads() -> dict:
                 if db.one("SELECT id FROM tasks WHERE id=?", (task_id,)):
                     task_id = str(uuid.uuid4())
                 db.execute(
-                    "INSERT INTO tasks (id,name,prompt,goal,workspace,status,yolo,max_retries,retry_forever,provider_id,model,context,codex_session_id,goal_status,created_at,updated_at,native,archived,memory_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (task_id, title[:160], prompt, objective, workspace, "archived" if archived else "available", int(yolo), 3, int(bool(objective)), provider_id, model, "", thread_id, goal_status, created, updated_at, 1, int(archived), memory_mode),
+                    "INSERT INTO tasks (id,name,prompt,goal,workspace,status,yolo,max_retries,retry_forever,provider_id,model,context,codex_session_id,goal_status,created_at,updated_at,last_interaction_at,native,archived,memory_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (task_id, title[:160], prompt, objective, workspace, "archived" if archived else "available", int(yolo), 3, int(bool(objective)), provider_id, model, "", thread_id, goal_status, created, updated_at, updated_at, 1, int(archived), memory_mode),
                 )
                 persist_native_thread_model(thread_id, model)
                 imported += 1
@@ -4128,9 +4187,9 @@ async def create_task(payload: TaskCreate, _: Any = Depends(auth)):
             else str(create_session_workspace(task_id) if requested_thread_id and task_id == requested_thread_id else initial_session_workspace())
         )
     db.execute(
-        "INSERT INTO tasks (id,name,prompt,goal,workspace,status,yolo,max_retries,retry_forever,provider_id,model,context,codex_session_id,goal_status,created_at,updated_at,native,reasoning_effort,service_tier,personality,collaboration_mode,permission_profile,ssh_host) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (task_id, payload.name, payload.prompt, payload.goal, workspace, "queued", int(payload.yolo), payload.max_retries, int(payload.retry_forever or bool(payload.goal.strip())), payload.provider_id, payload.model, payload.context, requested_thread_id, goal_status, stamp, stamp, 0, payload.reasoning_effort, payload.service_tier, payload.personality, payload.collaboration_mode, payload.permission_profile, ssh_host),
+        "INSERT INTO tasks (id,name,prompt,goal,workspace,status,yolo,max_retries,retry_forever,provider_id,model,context,codex_session_id,goal_status,created_at,updated_at,last_interaction_at,native,reasoning_effort,service_tier,personality,collaboration_mode,permission_profile,ssh_host) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (task_id, payload.name, payload.prompt, payload.goal, workspace, "queued", int(payload.yolo), payload.max_retries, int(payload.retry_forever or bool(payload.goal.strip())), payload.provider_id, payload.model, payload.context, requested_thread_id, goal_status, stamp, stamp, stamp, 0, payload.reasoning_effort, payload.service_tier, payload.personality, payload.collaboration_mode, payload.permission_profile, ssh_host),
     )
     result = task_or_404(task_id)
     await broadcast_overview(task_id, {"type": "created"})
@@ -4148,9 +4207,9 @@ async def create_quick_task(payload: QuickTaskCreate = QuickTaskCreate(), _: Any
     else:
         workspace = str(resolve_task_workspace(payload.workspace)) if payload.workspace.strip() else str(initial_session_workspace())
     db.execute(
-        "INSERT INTO tasks (id,name,prompt,goal,workspace,status,yolo,max_retries,retry_forever,provider_id,model,context,codex_session_id,goal_status,created_at,updated_at,native,reasoning_effort,service_tier,personality,collaboration_mode,permission_profile,ssh_host) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (task_id, payload.name.strip() or "新 Codex 会话", "", "", workspace, "available", 1, 3, 0, None, "", "", "", "none", stamp, stamp, 0, "", "", "", "default", "", ssh_host),
+        "INSERT INTO tasks (id,name,prompt,goal,workspace,status,yolo,max_retries,retry_forever,provider_id,model,context,codex_session_id,goal_status,created_at,updated_at,last_interaction_at,native,reasoning_effort,service_tier,personality,collaboration_mode,permission_profile,ssh_host) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (task_id, payload.name.strip() or "新 Codex 会话", "", "", workspace, "available", 1, 3, 0, None, "", "", "", "none", stamp, stamp, stamp, 0, "", "", "", "default", "", ssh_host),
     )
     result = task_or_404(task_id)
     await broadcast_overview(task_id, {"type": "created", "quick": True})
@@ -4184,7 +4243,11 @@ async def restore_trash(task_id: str, _: Any = Depends(auth)):
     if not task.get("trashed"):
         raise HTTPException(409, "Task is not in the recycle bin")
     status = "archived" if task.get("archived") else "available"
-    db.execute("UPDATE tasks SET trashed=0,trashed_at=NULL,status=?,updated_at=? WHERE id=?", (status, now(), task_id))
+    stamp = now()
+    db.execute(
+        "UPDATE tasks SET trashed=0,trashed_at=NULL,trashed_reason='',status=?,updated_at=?,last_interaction_at=? WHERE id=?",
+        (status, stamp, stamp, task_id),
+    )
     result = task_or_404(task_id)
     await broadcast_overview(task_id, {"type": "trash", "operation": "restore"})
     return result
@@ -5490,7 +5553,8 @@ async def run_thread_operation(task: dict, payload: OperationIn) -> dict:
     thread_id = latest_codex_session(task)
     operation = payload.operation
     if payload.operation == "delete":
-        db.execute("UPDATE tasks SET trashed=1,trashed_at=?,status='trashed',active_session_id=NULL,execution_source='',execution_turn_id='',updated_at=? WHERE id=?", (now(), now(), task["id"]))
+        stamp = now()
+        db.execute("UPDATE tasks SET trashed=1,trashed_at=?,trashed_reason='manual',status='trashed',active_session_id=NULL,execution_source='',execution_turn_id='',updated_at=? WHERE id=?", (stamp, stamp, task["id"]))
         await broadcast_overview_removed(task["id"])
         return {"ok": True, "trashed": True, "thread_id": thread_id or ""}
     if operation in {"memory-enable", "memory-disable"}:
@@ -5891,7 +5955,8 @@ async def execute_slash_command(task: dict, command: str, arg_text: str, args: l
             raise HTTPException(409, "线程运行中不能执行该操作")
         if not latest_codex_session(task):
             if command == "delete":
-                db.execute("UPDATE tasks SET trashed=1,trashed_at=?,status='trashed',updated_at=? WHERE id=?", (now(), now(), task["id"]))
+                stamp = now()
+                db.execute("UPDATE tasks SET trashed=1,trashed_at=?,trashed_reason='manual',status='trashed',updated_at=? WHERE id=?", (stamp, stamp, task["id"]))
                 await broadcast_overview_removed(task["id"])
             else:
                 archived = command == "archive"

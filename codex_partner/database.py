@@ -45,6 +45,8 @@ class Database:
                   archived INTEGER NOT NULL DEFAULT 0,
                   trashed INTEGER NOT NULL DEFAULT 0,
                   trashed_at TEXT,
+                  trashed_reason TEXT DEFAULT '',
+                  last_interaction_at TEXT,
                   memory_mode TEXT DEFAULT 'enabled',
                   execution_source TEXT DEFAULT '',
                   execution_turn_id TEXT DEFAULT '',
@@ -130,6 +132,8 @@ class Database:
             "archived": "INTEGER NOT NULL DEFAULT 0",
             "trashed": "INTEGER NOT NULL DEFAULT 0",
             "trashed_at": "TEXT",
+            "trashed_reason": "TEXT DEFAULT ''",
+            "last_interaction_at": "TEXT",
             "memory_mode": "TEXT DEFAULT 'enabled'",
             "reasoning_effort": "TEXT DEFAULT ''",
             "service_tier": "TEXT DEFAULT ''",
@@ -144,6 +148,27 @@ class Database:
         for column, definition in task_migrations.items():
             if column not in task_columns:
                 connection.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")
+        connection.execute(
+            "UPDATE tasks SET last_interaction_at=max(created_at, "
+            "COALESCE((SELECT MAX(ts) FROM events WHERE events.task_id=tasks.id "
+            "AND json_extract(events.payload, '$.type') IN ('userMessage','browserMessage','slashCommand','agentMessage','commandResult')), created_at), "
+            "COALESCE((SELECT MAX(created_at) FROM task_messages WHERE task_messages.task_id=tasks.id), created_at)) "
+            "WHERE COALESCE(last_interaction_at,'')=''"
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_tasks_inactive_trash ON tasks(trashed,status,last_interaction_at)")
+        connection.execute(
+            "CREATE TRIGGER IF NOT EXISTS trg_events_touch_interaction AFTER INSERT ON events "
+            "WHEN json_extract(NEW.payload, '$.type') IN ('userMessage','browserMessage','slashCommand','agentMessage','commandResult') BEGIN "
+            "UPDATE tasks SET last_interaction_at=CASE "
+            "WHEN COALESCE(last_interaction_at,'')<NEW.ts THEN NEW.ts ELSE last_interaction_at END "
+            "WHERE id=COALESCE(NEW.task_id,(SELECT task_id FROM sessions WHERE id=NEW.session_id)); END"
+        )
+        connection.execute(
+            "CREATE TRIGGER IF NOT EXISTS trg_task_messages_touch_interaction AFTER INSERT ON task_messages BEGIN "
+            "UPDATE tasks SET last_interaction_at=CASE "
+            "WHEN COALESCE(last_interaction_at,'')<NEW.created_at THEN NEW.created_at ELSE last_interaction_at END "
+            "WHERE id=NEW.task_id; END"
+        )
 
         provider_columns = {row[1] for row in connection.execute("PRAGMA table_info(providers)")}
         provider_migrations = {
