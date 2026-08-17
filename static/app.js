@@ -59,12 +59,19 @@ document.addEventListener("click", async event => {
     if (button.dataset.queueDispatch) {
       const message = state.selectedMessages.find(item => item.id === button.dataset.queueDispatch);
       if (!message) return;
+      if (button.dataset.dispatching === "1") return;
+      button.dataset.dispatching = "1";
       button.disabled = true; button.textContent = "…";
       try {
         const result = await api(`/tasks/${state.selectedId}/messages/${button.dataset.queueDispatch}/dispatch`, { method: "POST" });
         upsertTaskMessage(result); renderQueuedMessages(); scheduleRenderChat();
-        toast(result.status === "steered" ? "已插入当前 Codex turn" : "已立即执行");
-      } catch (error) { button.disabled = false; button.textContent = "▶"; toast(error.message); }
+        if (result.dispatch_error) toast(`立即执行失败，仍在队列：${result.dispatch_error}`);
+        else toast(result.status === "steered" ? "已插入当前 Codex turn" : "已立即执行");
+      } catch (error) {
+        button.disabled = false; button.textContent = "▶"; toast(error.message);
+      } finally {
+        delete button.dataset.dispatching;
+      }
       return;
     }
     if (button.dataset.queueDelete) {

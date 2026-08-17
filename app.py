@@ -5158,10 +5158,13 @@ async def dispatch_task_message(task_id: str, message_id: str, _: Any = Depends(
             return row
         current = task_or_404(task_id)
         if current["status"] == "running" or task_id in running or task_id in appserver_turn_tasks:
-            return await steer_task_message(
+            result = await steer_task_message(
                 task_id,
                 TaskMessageIn(message=row["body"], client_message_id=message_id, delivery="auto"),
             )
+            if result.get("status") == "queued" and result.get("error"):
+                result = {**result, "dispatch_error": result["error"]}
+            return result
 
         stamp = now()
         db.execute("UPDATE task_messages SET status='dispatching', started_at=?, error='' WHERE id=?", (stamp, message_id))

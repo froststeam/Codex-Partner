@@ -860,6 +860,46 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
 
         asyncio.run(exercise())
 
+    def test_manual_dispatch_reports_steer_error_when_message_remains_queued(self):
+        task_id = "manual-steer-error-thread"
+        message_id = "manual-steer-error-message"
+        self.make_task(task_id)
+        stamp = self.app.now()
+        self.app.db.execute(
+            "INSERT INTO task_messages (id,task_id,body,status,created_at) VALUES (?,?,?,?,?)",
+            (message_id, task_id, "send now", "queued", stamp),
+        )
+
+        class FakeClient:
+            async def request(self, _method, _params):
+                raise RuntimeError("expected active turn id mismatch")
+
+        async def exercise():
+            blocker = asyncio.create_task(asyncio.Event().wait())
+            self.app.app_servers["test-error"] = FakeClient()
+            self.app.app_thread_bindings[task_id] = ("test-error", "thread-1", "session-1")
+            self.app.appserver_turn_ids[task_id] = "turn-1"
+            self.app.appserver_turn_tasks[task_id] = blocker
+            try:
+                result = await self.app.dispatch_task_message(task_id, message_id, None)
+                self.assertEqual("queued", result["status"])
+                self.assertIn("expected active turn id mismatch", result["dispatch_error"])
+                row = self.app.db.one("SELECT status,error FROM task_messages WHERE id=?", (message_id,))
+                self.assertEqual("queued", row["status"])
+                self.assertIn("expected active turn id mismatch", row["error"])
+            finally:
+                blocker.cancel()
+                await asyncio.gather(blocker, return_exceptions=True)
+                self.app.app_servers.pop("test-error", None)
+                self.app.app_thread_bindings.pop(task_id, None)
+                self.app.appserver_turn_ids.pop(task_id, None)
+                self.app.appserver_turn_tasks.pop(task_id, None)
+                self.app.task_workers.pop(task_id, None)
+                self.app.db.execute("DELETE FROM task_messages WHERE task_id=?", (task_id,))
+                self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+        asyncio.run(exercise())
+
     def test_goal_retry_defaults_on_and_manual_override_is_preserved(self):
         task_id = "goal-retry-thread"
         self.make_task(task_id, "available")
@@ -1784,7 +1824,7 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
         self.assertIn("attachmentUploadName", app_js)
         self.assertIn("new File([file]", app_js)
         self.assertIn('uiLabel("binaryAttachment"', app_js)
-        self.assertIn('/app.js?v=20260816-structured-inputs', html)
+        self.assertIn('/app.js?v=20260817-queue-dispatch', html)
         self.assertIn('/core.js?v=20260817-session-switch', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
@@ -1965,10 +2005,13 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
         app_js = (static / "app.js").read_text(encoding="utf-8")
         conversation_js = (static / "conversation.js").read_text(encoding="utf-8")
         self.assertIn("button.dataset.queueDispatch", app_js)
+        self.assertIn('button.dataset.dispatching === "1"', app_js)
+        self.assertIn("result.dispatch_error", app_js)
         self.assertIn('const delivery = mode === "queue" || activeTurn ? "queue" : "auto"', app_js)
         self.assertIn('toast(uiLabel("queuedAfterTurn"))', app_js)
         self.assertNotIn('if (mode === "codex" && activeTurn)', app_js)
         self.assertIn("data-queue-dispatch", conversation_js)
+        self.assertIn("queued-error", conversation_js)
 
     def test_topbar_documents_non_conflicting_session_shortcuts(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -1999,9 +2042,10 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260817-media-viewer', html)
+        self.assertIn('/conversation.js?v=20260817-queue-dispatch', html)
+        self.assertIn('/app.js?v=20260817-queue-dispatch', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
-        self.assertIn('/styles.css?v=20260817-media-viewer', html)
+        self.assertIn('/styles.css?v=20260817-queue-dispatch', html)
         self.assertIn(".session-card.selected::before", styles)
         self.assertNotIn("renderSessionList(); renderConversation(); await loadWorkspace(\"\")", conversation_js)
         self.assertIn(".queued-messages { width: auto; height: auto; min-height: 0; max-height: none; align-self: stretch;", styles)
