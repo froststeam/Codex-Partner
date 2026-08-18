@@ -8,6 +8,8 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Optional
 
+from .platform_support import prepare_subprocess_command
+
 
 def executable_works(candidate: str) -> bool:
     path = Path(candidate).expanduser()
@@ -15,7 +17,7 @@ def executable_works(candidate: str) -> bool:
         return False
     try:
         result = subprocess.run(
-            [str(path), "--version"],
+            prepare_subprocess_command([str(path), "--version"]),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -122,7 +124,7 @@ def install_plan(system: str, npm: str, package: str) -> dict:
     if not supported:
         reason = f"暂不支持在 {system} 上自动安装 Codex"
     elif not npm:
-        reason = "未找到 npm；请先安装 Node.js LTS（Windows 建议在 WSL 中运行 Codex Partner），然后重试"
+        reason = "未找到 npm；请先安装 Node.js LTS，然后重试"
     else:
         reason = ""
     display = subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)

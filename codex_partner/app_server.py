@@ -4,6 +4,8 @@ import asyncio
 import json
 from typing import Any, Awaitable, Callable, Optional
 
+from .platform_support import prepare_subprocess_command
+
 
 NotificationHandler = Callable[[str, dict], Awaitable[None]]
 
@@ -55,8 +57,9 @@ class AppServerClient:
                 await asyncio.wait_for(self.process.wait(), 1)
             except Exception:
                 pass
+        command = prepare_subprocess_command(self.command)
         self.process = await asyncio.create_subprocess_exec(
-            *self.command,
+            *command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,

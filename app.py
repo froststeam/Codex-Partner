@@ -7,7 +7,6 @@ import binascii
 import codecs
 import errno
 import getpass
-import fcntl
 import glob
 import hashlib
 import io
@@ -16,7 +15,6 @@ import json
 import mimetypes
 import os
 import posixpath
-import pty
 import platform
 import re
 import signal
@@ -27,7 +25,6 @@ import sqlite3
 import socket
 import struct
 import subprocess
-import termios
 import time
 import uuid
 import urllib.error
@@ -43,7 +40,20 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.middleware.gzip import GZipMiddleware
 from dotenv import load_dotenv
 import yaml
-import pexpect
+try:
+    import fcntl
+    import pty
+    import termios
+except ImportError:  # Native Windows has no POSIX PTY APIs.
+    fcntl = pty = termios = None
+try:
+    import pexpect
+except ImportError:  # Password-driven SSH prompts are optional on Windows.
+    pexpect = None
+try:
+    from winpty import PtyProcess as WindowsPtyProcess
+except ImportError:  # Installed through the Windows-only pywinpty dependency.
+    WindowsPtyProcess = None
 from PIL import Image, ImageOps, ImageSequence, UnidentifiedImageError
 
 from codex_partner import APP_NAME, APP_VERSION
@@ -58,6 +68,14 @@ from codex_partner.discovery import (
     install_plan,
     official_candidates,
     vscode_candidates,
+)
+from codex_partner.platform_support import (
+    IS_WINDOWS,
+    default_auth_mode,
+    default_data_dir,
+    local_shell_command,
+    prepare_subprocess_command,
+    validate_bind_auth,
 )
 from codex_partner.schemas import (
     ApprovalResolveIn,
@@ -91,12 +109,12 @@ except ModuleNotFoundError:  # Python 3.10
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env", override=False)
 STATIC = ROOT / "static"
-DATA_DIR = Path(os.getenv("CODEX_DASHBOARD_DATA", str(ROOT / "data")))
+DATA_DIR = default_data_dir(ROOT)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "dashboard.sqlite3"
 CODEX_HOME = Path(os.getenv("CODEX_HOME", str(Path.home() / ".codex"))).expanduser().resolve()
 CODEX_MEMORY_DIR = CODEX_HOME / "memories"
-AUTH_MODE = os.getenv("CODEX_DASHBOARD_AUTH", "ssh").strip().lower()
+AUTH_MODE = os.getenv("CODEX_DASHBOARD_AUTH", default_auth_mode()).strip().lower()
 if AUTH_MODE not in {"ssh", "none"}:
     raise RuntimeError("CODEX_DASHBOARD_AUTH must be 'ssh' or 'none'")
 AUTH_COOKIE = "codex_partner_session"
@@ -128,6 +146,7 @@ def configured_port(name: str, default: int) -> int:
 
 
 DASHBOARD_HOST = os.getenv("CODEX_DASHBOARD_HOST", "127.0.0.1").strip() or "127.0.0.1"
+validate_bind_auth(DASHBOARD_HOST, AUTH_MODE, "CODEX_DASHBOARD_AUTH" in os.environ)
 DASHBOARD_PORT = configured_port("CODEX_DASHBOARD_PORT", 8787)
 AUTH_SSH_PORT = configured_port("CODEX_DASHBOARD_AUTH_SSH_PORT", 22)
 SSH_BIN = shutil.which("ssh") or "ssh"
@@ -135,7 +154,12 @@ SSH_CONFIG = Path.home() / ".ssh/config"
 SSH_FIXED_HOST = os.getenv("CODEX_DASHBOARD_SSH_HOST", "").strip()
 SSH_FIXED_USER = os.getenv("CODEX_DASHBOARD_SSH_USER", "").strip()
 SSH_FIXED_PORT = configured_port("CODEX_DASHBOARD_SSH_PORT", 22)
-SSH_RUNTIME_DIR = Path(os.getenv("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "codex-dashboard-ssh"
+if os.getenv("XDG_RUNTIME_DIR"):
+    SSH_RUNTIME_DIR = Path(os.environ["XDG_RUNTIME_DIR"]) / "codex-dashboard-ssh"
+elif hasattr(os, "getuid") and platform.system() == "Linux":
+    SSH_RUNTIME_DIR = Path(f"/run/user/{os.getuid()}") / "codex-dashboard-ssh"
+else:
+    SSH_RUNTIME_DIR = DATA_DIR / "ssh-runtime"
 try:
     SSH_RUNTIME_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     SSH_RUNTIME_DIR.chmod(0o700)
@@ -207,7 +231,7 @@ def codex_management_snapshot() -> dict[str, Any]:
     if CODEX_AVAILABLE:
         try:
             result = subprocess.run(
-                [CODEX_BIN, "--version"],
+                prepare_subprocess_command([CODEX_BIN, "--version"]),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -1154,8 +1178,23 @@ def rollout_writer_pids(path: str, refresh: bool = False) -> set[int]:
     try:
         processes = os.scandir("/proc")
     except OSError:
+        lsof = shutil.which("lsof")
+        if lsof:
+            try:
+                result = subprocess.run(
+                    [lsof, "-t", "--", target],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=2,
+                    check=False,
+                )
+                writers = {int(value) for value in result.stdout.splitlines() if value.isdigit()}
+            except (OSError, subprocess.SubprocessError, ValueError):
+                pass
         rollout_writer_cache[target] = (stamp, writers)
-        return writers
+        return set(writers)
     with processes:
         for process in processes:
             if not process.name.isdigit():
@@ -1826,7 +1865,7 @@ def ssh_config_aliases(path: Path = SSH_CONFIG, seen: Optional[set[Path]] = None
         return []
     for line in lines:
         try:
-            parts = shlex.split(line, comments=True, posix=True)
+            parts = shlex.split(line, comments=True, posix=not IS_WINDOWS)
         except ValueError:
             continue
         if not parts:
@@ -1995,6 +2034,8 @@ exit 1
 
 
 def password_ssh_connect(host: str, password: str) -> tuple[bool, str]:
+    if pexpect is None:
+        return False, "SSH password authentication is unavailable on this platform"
     args = [
         *ssh_options(host, batch=False),
         "-o", "ConnectTimeout=10",
@@ -3613,7 +3654,7 @@ def appserver_turn_inputs(task: dict, message: str) -> list[dict[str, Any]]:
             continue
         seen.add((kind, path))
         if kind == "mention":
-            inputs.append({"type": "mention", "name": PurePosixPath(path).name, "path": path})
+            inputs.append({"type": "mention", "name": Path(path).name, "path": path})
         else:
             item: dict[str, Any] = {"type": kind, "path": path}
             if kind == "localImage":
@@ -3867,6 +3908,13 @@ async def close_terminal_session(terminal_id: str) -> None:
     if not session:
         return
     session["closed"] = True
+    windows_pty = session.get("windows_pty")
+    if windows_pty is not None:
+        try:
+            await asyncio.to_thread(lambda: windows_pty.close(force=True))
+        except Exception:
+            pass
+        return
     fd, pid = session.get("fd"), session.get("pid")
     loop = session.get("loop")
     if loop and fd is not None:
@@ -3905,6 +3953,81 @@ def set_terminal_size(fd: int, cols: int, rows: int) -> None:
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
 
+async def windows_terminal_socket(websocket: WebSocket, task_id: str, cwd: str, ssh_host: str) -> None:
+    if WindowsPtyProcess is None:
+        await websocket.send_json({"type": "error", "message": "Windows terminal support requires pywinpty"})
+        await websocket.close(code=1011)
+        return
+    env = os.environ.copy()
+    env.update({"TERM": "xterm-256color", "COLORTERM": "truecolor"})
+    if ssh_host:
+        remote_command = f"cd -- {shlex.quote(cwd)} && exec \"${{SHELL:-/bin/sh}}\" -il"
+        command = [*ssh_options(ssh_host, batch=True, tty=True), ssh_destination(ssh_host), remote_command]
+        shell_label = f"ssh:{ssh_host}"
+    else:
+        command, shell_label = local_shell_command()
+    try:
+        spawn_cwd = cwd if not ssh_host else str(DEFAULT_WORKSPACE)
+        process = await asyncio.to_thread(WindowsPtyProcess.spawn, command, cwd=spawn_cwd, env=env)
+    except Exception as exc:
+        await websocket.send_json({"type": "error", "message": f"terminal start failed: {exc}"})
+        await websocket.close(code=1011)
+        return
+
+    terminal_id = str(uuid.uuid4())
+    session = {"windows_pty": process, "task_id": task_id, "closed": False}
+    terminal_sessions[terminal_id] = session
+    await websocket.send_json({"type": "ready", "terminal_id": terminal_id, "cwd": cwd, "shell": shell_label})
+
+    async def pump_output() -> None:
+        while not session["closed"]:
+            try:
+                data = await asyncio.to_thread(process.read, 65536)
+            except (EOFError, OSError):
+                data = ""
+            if data:
+                await websocket.send_json({"type": "output", "data": data})
+                continue
+            await websocket.send_json({"type": "exit", "code": getattr(process, "exitstatus", None)})
+            return
+
+    async def receive_input() -> None:
+        while True:
+            incoming = await websocket.receive_json()
+            kind = incoming.get("type")
+            if kind == "input":
+                value = incoming.get("data", incoming.get("input", ""))
+                if isinstance(value, str) and value:
+                    await asyncio.to_thread(process.write, value)
+            elif kind == "resize":
+                try:
+                    cols = max(20, min(int(incoming.get("cols", 120)), 400))
+                    rows = max(4, min(int(incoming.get("rows", 32)), 160))
+                    await asyncio.to_thread(process.setwinsize, rows, cols)
+                except (OSError, ValueError, TypeError):
+                    continue
+            elif kind == "ping":
+                await websocket.send_json({"type": "pong"})
+            elif kind == "close":
+                return
+
+    pump_task = asyncio.create_task(pump_output())
+    receive_task = asyncio.create_task(receive_input())
+    try:
+        _done, pending = await asyncio.wait({pump_task, receive_task}, return_when=asyncio.FIRST_COMPLETED)
+        for waiter in pending:
+            waiter.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        for waiter in (pump_task, receive_task):
+            if not waiter.done():
+                waiter.cancel()
+        await asyncio.gather(pump_task, receive_task, return_exceptions=True)
+        await close_terminal_session(terminal_id)
+
+
 @app.websocket("/ws/terminal/{task_id}")
 async def terminal_socket(websocket: WebSocket, task_id: str):
     if not websocket_auth_session(websocket):
@@ -3921,11 +4044,17 @@ async def terminal_socket(websocket: WebSocket, task_id: str):
             await websocket.close(code=4428, reason="SSH login required")
             return
     await websocket.accept()
-    terminal_id = str(uuid.uuid4())
     cwd = task["workspace"] if ssh_host else (task["workspace"] if Path(task["workspace"]).is_dir() else str(DEFAULT_WORKSPACE))
-    shell = f"ssh:{ssh_host}" if ssh_host else os.environ.get("SHELL", "/bin/bash")
-    if not ssh_host and not Path(shell).is_file():
-        shell = "/bin/bash"
+    if IS_WINDOWS:
+        await windows_terminal_socket(websocket, task_id, cwd, ssh_host)
+        return
+    terminal_id = str(uuid.uuid4())
+    shell_command, local_shell = local_shell_command()
+    shell = f"ssh:{ssh_host}" if ssh_host else local_shell
+    if pty is None or fcntl is None or termios is None:
+        await websocket.send_json({"type": "error", "message": "PTY support is unavailable on this platform"})
+        await websocket.close(code=1011)
+        return
     pid, fd = pty.fork()
     if pid == 0:
         try:
@@ -3937,7 +4066,7 @@ async def terminal_socket(websocket: WebSocket, task_id: str):
                 os.execvpe(command[0], command, env)
             else:
                 os.chdir(cwd)
-                os.execvpe(shell, [shell, "-i"], env)
+                os.execvpe(shell_command[0], shell_command, env)
         except Exception as exc:
             os.write(2, f"terminal start failed: {exc}\n".encode())
         os._exit(127)
@@ -4473,7 +4602,7 @@ async def install_codex(force: bool = False, _: Any = Depends(auth)):
         env["PATH"] = os.pathsep.join((str(Path(npm).parent), str(extra_bin), env.get("PATH", "")))
         try:
             process = await asyncio.create_subprocess_exec(
-                *command,
+                *prepare_subprocess_command(command),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 env=env,
@@ -5655,6 +5784,8 @@ async def supervise(task: dict, session_id: str, providers: list[Optional[dict]]
                 cwd = None
                 env.pop("OPENAI_API_KEY", None)
                 env.pop("OPENAI_BASE_URL", None)
+            else:
+                spawn_cmd = prepare_subprocess_command(spawn_cmd)
             process = await asyncio.create_subprocess_exec(*spawn_cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env)
             async with running_lock:
                 running[task_id] = process
@@ -6249,7 +6380,7 @@ def git_diff_summary(task: dict) -> str:
     sections = []
     for index, command in enumerate(commands):
         try:
-            completed = ssh_capture(task["ssh_host"], shlex.join(command), 12) if task.get("ssh_host") else subprocess.run(command, capture_output=True, text=True, timeout=8, check=False)
+            completed = ssh_capture(task["ssh_host"], shlex.join(command), 12) if task.get("ssh_host") else subprocess.run(prepare_subprocess_command(command), capture_output=True, text=True, timeout=8, check=False)
         except (OSError, subprocess.TimeoutExpired) as exc:
             return f"无法读取 Git 变更：{exc}"
         output = (completed.stdout or completed.stderr).strip()
@@ -6805,6 +6936,8 @@ async def supervise_operation(task: dict, session_id: str, cmd: list[str]) -> No
             connection = await require_ssh_connection(task["ssh_host"], codex=True)
             spawn_cmd = [*ssh_options(task["ssh_host"], batch=True), ssh_destination(task["ssh_host"]), shlex.join([connection["codex_bin"], *cmd[1:]])]
             cwd = None
+        else:
+            spawn_cmd = prepare_subprocess_command(spawn_cmd)
         process = await asyncio.create_subprocess_exec(*spawn_cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=os.environ.copy())
         async with running_lock:
             running[task_id] = process

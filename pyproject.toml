@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-partner"
-version = "0.0.5"
+version = "0.0.6"
 description = "A self-hosted web interface for managing persistent Codex tasks."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,6 +13,8 @@ classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Web Environment",
   "Framework :: FastAPI",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
@@ -24,6 +26,7 @@ dependencies = [
   "tomli>=2.0; python_version < '3.11'",
   "PyYAML>=6.0",
   "pexpect>=4.8; platform_system != 'Windows'",
+  "pywinpty>=2.0.13; platform_system == 'Windows'",
   "python-dotenv>=1.0",
   "Pillow>=10.0",
 ]

@@ -7,7 +7,10 @@ import re
 import time
 from pathlib import Path
 
-import pexpect
+try:
+    import pexpect
+except ImportError:  # Native Windows uses local-only auth by default.
+    pexpect = None
 
 
 USERNAME_PATTERN = re.compile(r"^[a-z_][a-z0-9_.-]{0,63}$", re.IGNORECASE)
@@ -33,6 +36,8 @@ def verify_ssh_password(
     username = username.strip()
     if not valid_ssh_username(username) or not password:
         return False, "Invalid SSH username or password"
+    if pexpect is None:
+        return False, "SSH password authentication is unavailable on this platform"
 
     known_hosts.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     args = [
