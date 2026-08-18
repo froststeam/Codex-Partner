@@ -2,6 +2,7 @@
 
 import sqlite3
 import threading
+from contextlib import closing
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -27,7 +28,7 @@ class Database:
         return connection
 
     def initialize(self) -> None:
-        with self.lock, self.connect() as connection:
+        with self.lock, closing(self.connect()) as connection:
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS tasks (
@@ -262,15 +263,15 @@ class Database:
         )
 
     def one(self, sql: str, args: tuple = ()) -> Optional[dict]:
-        with self.lock, self.connect() as connection:
+        with self.lock, closing(self.connect()) as connection:
             row = connection.execute(sql, args).fetchone()
             return dict(row) if row else None
 
     def all(self, sql: str, args: tuple = ()) -> list[dict]:
-        with self.lock, self.connect() as connection:
+        with self.lock, closing(self.connect()) as connection:
             return [dict(row) for row in connection.execute(sql, args).fetchall()]
 
     def execute(self, sql: str, args: tuple = ()) -> None:
-        with self.lock, self.connect() as connection:
+        with self.lock, closing(self.connect()) as connection:
             connection.execute(sql, args)
             connection.commit()

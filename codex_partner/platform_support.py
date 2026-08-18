@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import platform
 import shutil
 import subprocess
-import ipaddress
 from pathlib import Path
 from typing import Iterable
 
@@ -21,7 +21,8 @@ def default_data_dir(package_root: Path) -> Path:
     if override:
         return Path(override).expanduser()
     if IS_WINDOWS:
-        base = Path(os.getenv("LOCALAPPDATA", str(Path.home() / "AppData/Local")))
+        local_app_data = os.getenv("LOCALAPPDATA", "").strip()
+        base = Path(local_app_data) if local_app_data else Path.home() / "AppData/Local"
         return base / "CodexPartner"
     if IS_MACOS:
         return Path.home() / "Library/Application Support/CodexPartner"

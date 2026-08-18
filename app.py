@@ -1178,8 +1178,23 @@ def rollout_writer_pids(path: str, refresh: bool = False) -> set[int]:
     try:
         processes = os.scandir("/proc")
     except OSError:
+        lsof = shutil.which("lsof")
+        if lsof:
+            try:
+                result = subprocess.run(
+                    [lsof, "-t", "--", target],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=2,
+                    check=False,
+                )
+                writers = {int(value) for value in result.stdout.splitlines() if value.isdigit()}
+            except (OSError, subprocess.SubprocessError, ValueError):
+                pass
         rollout_writer_cache[target] = (stamp, writers)
-        return writers
+        return set(writers)
     with processes:
         for process in processes:
             if not process.name.isdigit():
@@ -1850,7 +1865,7 @@ def ssh_config_aliases(path: Path = SSH_CONFIG, seen: Optional[set[Path]] = None
         return []
     for line in lines:
         try:
-            parts = shlex.split(line, comments=True, posix=True)
+            parts = shlex.split(line, comments=True, posix=not IS_WINDOWS)
         except ValueError:
             continue
         if not parts:
@@ -3639,7 +3654,7 @@ def appserver_turn_inputs(task: dict, message: str) -> list[dict[str, Any]]:
             continue
         seen.add((kind, path))
         if kind == "mention":
-            inputs.append({"type": "mention", "name": PurePosixPath(path).name, "path": path})
+            inputs.append({"type": "mention", "name": Path(path).name, "path": path})
         else:
             item: dict[str, Any] = {"type": kind, "path": path}
             if kind == "localImage":

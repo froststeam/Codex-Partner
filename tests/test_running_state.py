@@ -25,7 +25,9 @@ class RunningStateTests(unittest.TestCase):
         root = Path(cls.temp.name)
         os.environ["CODEX_DASHBOARD_DATA"] = str(root / "data")
         os.environ["CODEX_HOME"] = str(root / "codex-home")
-        os.environ["CODEX_BIN"] = str(Path(__file__).parent / "fake_codex")
+        fake_codex = "fake_codex.cmd" if os.name == "nt" else "fake_codex"
+        os.environ["CODEX_BIN"] = str(Path(__file__).parent / fake_codex)
+        os.environ["CODEX_DASHBOARD_AUTH"] = "ssh"
         os.environ["CODEX_DASHBOARD_EXTERNAL_TURN_GRACE"] = "1"
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
         cls.app = importlib.import_module("app")
@@ -169,7 +171,7 @@ class RunningStateTests(unittest.TestCase):
                 task = self.app.task_or_404(thread_id)
                 self.assertEqual(thread_id, task["id"])
                 self.assertEqual(thread_id, task["codex_session_id"])
-                self.assertEqual(str(root / thread_id), task["workspace"])
+                self.assertEqual(str((root / thread_id).resolve()), task["workspace"])
                 self.assertTrue((root / thread_id).is_dir())
                 session = self.app.db.one("SELECT task_id FROM sessions WHERE id=?", (session_id,))
                 self.assertEqual(thread_id, session["task_id"])
@@ -201,7 +203,8 @@ class RunningStateTests(unittest.TestCase):
             ))
             path = self.app.profile_avatar_path("avatar-user")
             self.assertTrue(path.is_file())
-            self.assertEqual(0o600, path.stat().st_mode & 0o777)
+            if os.name != "nt":
+                self.assertEqual(0o600, path.stat().st_mode & 0o777)
             with self.app.Image.open(path) as saved:
                 self.assertTrue(saved.is_animated)
                 self.assertEqual(2, saved.n_frames)
@@ -499,6 +502,8 @@ class RunningStateTests(unittest.TestCase):
         self.assertEqual(["userMessage", "agentMessage"], [json.loads(event["payload"])["type"] for event in result])
 
     def test_writer_detection_and_stale_file(self):
+        if os.name == "nt":
+            self.skipTest("Windows does not expose portable process file-descriptor metadata")
         path = Path(self.temp.name) / "writer.jsonl"
         path.write_text("{}\n", encoding="utf-8")
         with path.open("a", encoding="utf-8"):
@@ -910,7 +915,7 @@ const merged = mergeEvents(
 );
 process.stdout.write(JSON.stringify(merged.map(item => JSON.parse(item.payload).type)));
 """
-            result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+            result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
             self.assertEqual(["userMessage"], json.loads(result.stdout))
         finally:
             self.app.app_thread_bindings.pop(task_id, None)
@@ -983,7 +988,7 @@ const blocks = buildBlocks([
 ], false, {{}});
 process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
 """
-            result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+            result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
             self.assertEqual(["visible user message"], json.loads(result.stdout))
         finally:
             self.app.app_thread_bindings.pop(task_id, None)
@@ -1052,7 +1057,7 @@ const blocks = context.buildBlocks([
 ], false, {{}});
 process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
 """
-        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(["keep this request", "visible answer\nafter"], json.loads(result.stdout))
 
         conversation = (worker.parent / "conversation.js").read_text(encoding="utf-8")
@@ -1075,7 +1080,7 @@ const blocks = buildBlocks([
 ], false, {{}});
 process.stdout.write(JSON.stringify(blocks[0].html));
 """
-        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
         html = json.loads(result.stdout)
         self.assertNotIn("<image", html)
         self.assertNotIn("</image>", html)
@@ -1129,7 +1134,7 @@ context.importScripts = (...urls) => {{
 vm.runInContext(fs.readFileSync(path.join(staticRoot, "chat-worker.js"), "utf8"), context);
 process.stdout.write(JSON.stringify(context.markdown({json.dumps(source)})));
 """
-        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
         html = json.loads(result.stdout)
         self.assertIn('<div class="markdown-table-wrap"><table>', html)
         self.assertIn('style="text-align:right"', html)
@@ -1171,7 +1176,7 @@ const blocks = context.buildBlocks([
 ], true, {{ activityCommand: "running", activityCommandDone: "done", activityWorking: "working" }});
 process.stdout.write(JSON.stringify(blocks));
 """
-        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
         blocks = json.loads(result.stdout)
         self.assertEqual(1, len(blocks))
         self.assertEqual(1, len(blocks[0]["items"]))
@@ -1195,7 +1200,7 @@ const blocks = context.buildBlocks([
 ], true, {{ activityCommand: "running", activityCommandDone: "done", activityWorking: "working" }});
 process.stdout.write(JSON.stringify(blocks));
 """
-        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
         blocks = json.loads(result.stdout)
         self.assertEqual(1, len(blocks))
         self.assertEqual(1, len(blocks[0]["items"]))
@@ -1225,7 +1230,7 @@ const semanticBlocks = context.buildBlocks(events, true, labels);
 const decisionBlocks = context.buildBlocks([events[0], {{ id: "reason-1", ts: 2, stream: "rollout", payload: {{ type: "reasoning", item_id: "reason-1", turn_id: "turn-1", text: "确认根因是后端分页游标没有推进" }} }}], true, labels);
 process.stdout.write(JSON.stringify({{ visibleBlocks, nodes: context.buildExplorationTree(semanticBlocks, true), failed: context.buildExplorationTree(semanticBlocks, false, "failed"), stopped: context.buildExplorationTree(semanticBlocks, false, "stopped"), decision: context.buildExplorationTree(decisionBlocks, true) }}));
 """
-        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
         data = json.loads(result.stdout)
         nodes = data["nodes"]
         self.assertEqual(4, len(nodes))
@@ -1300,7 +1305,7 @@ context.self.onmessage({{ data: {{ requestId: 1, taskId: "task-1", events, explo
 context.self.onmessage({{ data: {{ requestId: 2, taskId: "task-1", events: [], explorationEvents: null, explorationRevision: 1, messages: [], rawActivity: true, labels: {{}}, taskRunning: true, taskStatus: "running" }} }});
 process.stdout.write(JSON.stringify(posts));
 """
-        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
         posts = json.loads(result.stdout)
         self.assertEqual(2, len(posts))
         self.assertEqual(posts[0]["explorationNodes"], posts[1]["explorationNodes"])
@@ -1419,7 +1424,7 @@ const events = Array.from({{ length: 21 }}, (_, index) => ({{
 const blocks = context.buildBlocks(events, true, {{ activityCommandDone: "done", activityWorking: "working" }});
 process.stdout.write(JSON.stringify(blocks));
 """
-        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
         blocks = json.loads(result.stdout)
         self.assertEqual(1, len(blocks))
         self.assertEqual(21, len(blocks[0]["items"]))
@@ -1498,7 +1503,7 @@ const cursors = [];
   process.stdout.write(JSON.stringify({{ result, cursors }}));
 }})().catch(error => {{ console.error(error); process.exit(1); }});
 """
-        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
         payload = json.loads(result.stdout)
         self.assertEqual(["newest", "middle", "oldest"], payload["cursors"])
         self.assertEqual(3, payload["result"]["pages_loaded"])
@@ -1538,7 +1543,7 @@ const bodies = events => context.mergeEvents(events, messages)
   .map(event => (typeof event.payload === "string" ? JSON.parse(event.payload) : event.payload).text);
 process.stdout.write(JSON.stringify({{ recent: bodies(recentEvents), older: bodies(olderEvents) }}));
 """
-        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
         payload = json.loads(result.stdout)
         self.assertEqual(["currently running message", "current sent message"], payload["recent"])
         self.assertEqual(["currently running message", "old sent message", "current sent message"], payload["older"])
@@ -1574,7 +1579,7 @@ const merged = context.mergeEvents([
 const browserMessages = merged.filter(event => event.stream === "user").map(event => event.payload.text);
 process.stdout.write(JSON.stringify(browserMessages));
 """
-        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(["keep this message"], json.loads(result.stdout))
 
     def test_model_slash_command_supports_named_updates_and_defaults(self):
@@ -1937,7 +1942,7 @@ process.stdout.write(JSON.stringify(browserMessages));
                 command = self.app.create_command_task(quick, "", "available")
             for task in (quick, regular, command):
                 workspace = Path(task["workspace"])
-                self.assertEqual(root, workspace)
+                self.assertEqual(root.resolve(), workspace)
                 self.assertFalse((root / task["id"]).exists())
             self.app.db.execute("DELETE FROM tasks WHERE id IN (?,?,?)", (quick["id"], regular["id"], command["id"]))
 
@@ -1947,7 +1952,7 @@ process.stdout.write(JSON.stringify(browserMessages));
             with mock.patch.object(self.app, "SESSION_WORKSPACE_ROOT", root):
                 task = asyncio.run(self.app.create_quick_task(self.app.QuickTaskCreate(), None))
                 target = self.app.align_session_workspace(task["id"], "thread-123")
-                self.assertEqual(root / "thread-123", target)
+                self.assertEqual((root / "thread-123").resolve(), target)
                 self.assertTrue(target.is_dir())
                 self.assertFalse((root / task["id"]).exists())
                 self.assertEqual(str(target), self.app.task_or_404(task["id"])["workspace"])
@@ -1966,8 +1971,8 @@ process.stdout.write(JSON.stringify(browserMessages));
                 target = root / "thread-after-rename"
                 target.mkdir()
                 aligned = self.app.align_session_workspace(task["id"], target.name)
-                self.assertEqual(target, aligned)
-                self.assertEqual(str(target), self.app.task_or_404(task["id"])["workspace"])
+                self.assertEqual(target.resolve(), aligned)
+                self.assertEqual(str(target.resolve()), self.app.task_or_404(task["id"])["workspace"])
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task["id"],))
 
     def test_temp_directory_cannot_be_configured_as_default(self):
@@ -3349,6 +3354,10 @@ process.stdout.write(JSON.stringify(browserMessages));
             (None, [], [], set(), "missing", ""),
         )
         for direct, vscode, official, usable, source, expected in cases:
+            if direct:
+                resolved_direct = str(Path(direct).expanduser().resolve())
+                usable = {resolved_direct if value == direct else value for value in usable}
+                expected = resolved_direct if expected == direct else expected
             with self.subTest(source=source), \
                  mock.patch.dict(os.environ, {"CODEX_BIN": "codex"}), \
                  mock.patch.object(self.app.shutil, "which", return_value=direct), \

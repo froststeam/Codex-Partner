@@ -22,11 +22,11 @@ class PlatformSupportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             with mock.patch.object(platform_support, "IS_WINDOWS", True), mock.patch.object(
                 platform_support, "IS_MACOS", False
-            ), mock.patch.dict(os.environ, {"LOCALAPPDATA": temporary}, clear=True):
+            ), mock.patch.dict(os.environ, {"LOCALAPPDATA": temporary, "CODEX_DASHBOARD_DATA": ""}):
                 self.assertEqual(Path(temporary) / "CodexPartner", platform_support.default_data_dir(package_root))
             with mock.patch.object(platform_support, "IS_WINDOWS", False), mock.patch.object(
                 platform_support, "IS_MACOS", True
-            ), mock.patch.dict(os.environ, {}, clear=True):
+            ), mock.patch.dict(os.environ, {"CODEX_DASHBOARD_DATA": ""}):
                 self.assertEqual(
                     Path.home() / "Library/Application Support/CodexPartner",
                     platform_support.default_data_dir(package_root),
