@@ -1,5 +1,6 @@
 /* Chat history normalization stays off the UI thread; output is sanitized HTML. */
 const escapeHtml = (value = "") => String(value).replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
+const explorationCache = new Map();
 
 let chatMarkdownRenderer = null;
 if (typeof importScripts === "function") {
@@ -150,6 +151,8 @@ function activityItem(raw, labels, event) {
     status: status || (type.includes("reason") ? "started" : ""),
     type,
     itemId: String(payload?.item_id || payload?.id || ""),
+    eventId: String(event?.id || ""),
+    turnId: String(payload?.turn_id || payload?.turnId || native.turnId || ""),
     time: event?.ts || event?.created_at || "",
   };
 }
@@ -299,7 +302,7 @@ function buildBlocks(events, rawActivity, labels) {
       continue;
     }
     if (!current || current.role !== role || role === "user" || commandBlock || current.commandBlock) {
-      current = { role, text: "", session: event.session_id, commandBlock, itemId, delivery: payload?.type === "browserMessage" ? payload.status : "", error: payload?.error || "", streaming: payload?.type === "agent_delta", origin: event.stream === "rollout" ? "terminal" : "web", time: event.ts || event.created_at || "" };
+      current = { role, text: "", session: event.session_id, commandBlock, itemId, eventId: String(event.id || ""), turnId: String(payload?.turn_id || payload?.turnId || ""), delivery: payload?.type === "browserMessage" ? payload.status : "", error: payload?.error || "", streaming: payload?.type === "agent_delta", origin: event.stream === "rollout" ? "terminal" : "web", time: event.ts || event.created_at || "" };
       blocks.push(current); if (itemId) itemMap.set(itemId, current);
     }
     current.text += `${current.text ? "\n" : ""}${text}`;
@@ -313,11 +316,196 @@ function buildBlocks(events, rawActivity, labels) {
   });
 }
 
+function explorationFingerprint(value) {
+  const text = String(value || "").toLowerCase().replace(/<[^>]+>/g, " ").replace(/[`*_#>[\](){}]/g, " ").replace(/[^\p{L}\p{N}./_-]+/gu, " ").trim();
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function explorationTitle(value, fallback = "关键活动") {
+  const clean = stripCodexHiddenContext(value)
+    .replace(/<(image|audio|video)\b[^>]*>[\s\S]*?<\/\1>/gi, " ")
+    .replace(/\[\[(?:codex-input|codex-file):[^\]]+\]\]/g, " ")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/[`*_#>\[\]()]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!clean) return fallback;
+  const first = clean.split(/(?<=[。！？!?])\s+|\n/)[0].trim();
+  return first.length > 58 ? `${first.slice(0, 57)}…` : first;
+}
+
+function substantiveDirection(text) {
+  const clean = explorationTitle(text, "");
+  if (!clean || /^\s*\//.test(clean)) return false;
+  if (/^(继续|继续吧|好|好的|可以|行|嗯|收到|重试|再试一次|实现了吧|ok|okay|yes|go on)[！!。.？?\s]*$/i.test(clean)) return false;
+  let score = clean.length >= 18 ? 2 : 0;
+  if (/(帮|修|改|增加|添加|删除|实现|排查|检查|优化|设计|支持|恢复|回退|提交|推送|重启|需要|不要|必须|应该|为什么|为啥|异常|失败|卡|问题|bug|please|fix|add|remove|implement|investigate|debug|optimi[sz]e|design|support|error|fail)/i.test(clean)) score += 5;
+  if (/(改成|换成|重新|不是|只要|不要再|范围|相反|回退|撤销|instead|rather|revert|rollback)/i.test(clean)) score += 3;
+  return score >= 5;
+}
+
+function buildExplorationTree(blocks, taskRunning = false, taskStatus = "") {
+  const nodes = [];
+  const byId = new Map();
+  const planNodes = new Map();
+  const decisionNodes = new Map();
+  let latestNode = null;
+  let latestDirection = null;
+  let planTail = null;
+
+  const addNode = node => {
+    if (byId.has(node.id)) return byId.get(node.id);
+    const complete = { summary: "", evidence: [], files: [], commands: [], failures: 0, ...node };
+    nodes.push(complete);
+    byId.set(complete.id, complete);
+    latestNode = complete;
+    return complete;
+  };
+  const addEvidence = (node, value) => {
+    const text = explorationTitle(value, "");
+    if (node && text && !node.evidence.includes(text)) node.evidence.push(text);
+  };
+
+  for (let blockIndex = 0; blockIndex < blocks.length; blockIndex += 1) {
+    const block = blocks[blockIndex];
+    if (block.role === "user" && !block.commandBlock && substantiveDirection(block.text)) {
+      const correction = /(改成|换成|重新|不是|只要|不要再|范围|回退|撤销|instead|rather|revert|rollback)/i.test(block.text);
+      const rollback = /(回退|撤销|恢复到|revert|rollback)/i.test(block.text);
+      const previous = latestNode;
+      if (correction && previous && ["active", "planned"].includes(previous.status)) previous.status = rollback ? "rolledback" : "abandoned";
+      const parentId = correction && previous ? previous.parentId : previous?.id || null;
+      const source = block.itemId || block.eventId || `${block.turnId}:${blockIndex}`;
+      latestDirection = addNode({
+        id: `direction-${explorationFingerprint(source || block.text)}`,
+        parentId,
+        kind: rollback ? "rollback" : correction ? "steering" : "direction",
+        title: explorationTitle(block.text, "调整目标"),
+        status: "active",
+        blockIndex,
+        turnId: block.turnId || "",
+        time: block.time || "",
+        score: correction ? 8 : 6,
+      });
+      planTail = null;
+      continue;
+    }
+
+    if (block.role === "activities") {
+      for (const item of block.items || []) {
+        const decisionText = String(item.detail || "").trim();
+        const isDecision = item.kind.includes("reason") && /(决定|确认|根因|证明|改用|转向|放弃|不可行|关键是|结论|选择|root cause|decid|confirmed|switch(?:ing)? to|not viable)/i.test(decisionText);
+        if (isDecision) {
+          const title = explorationTitle(decisionText, "形成关键结论");
+          const key = explorationFingerprint(`${item.turnId || item.itemId || block.activityKey || "turn"}:decision:${title}`);
+          if (!decisionNodes.has(key)) {
+            const switchesDirection = /(改用|转向|放弃|不可行|switch(?:ing)? to|not viable)/i.test(decisionText);
+            const previous = latestNode;
+            if (switchesDirection && previous && ["active", "planned"].includes(previous.status)) previous.status = "abandoned";
+            const decision = addNode({
+              id: `decision-${key}`,
+              parentId: switchesDirection && previous ? previous.parentId : previous?.id || null,
+              kind: "decision",
+              title,
+              status: "completed",
+              blockIndex,
+              itemId: item.itemId || "",
+              turnId: item.turnId || "",
+              time: item.time || "",
+              score: 8,
+            });
+            addEvidence(decision, decisionText);
+            decisionNodes.set(key, decision);
+          }
+        }
+        const plans = Array.isArray(item.plan) ? item.plan : [];
+        for (let planIndex = 0; planIndex < plans.length; planIndex += 1) {
+          const plan = plans[planIndex] || {};
+          const title = explorationTitle(plan.step || plan.text, "计划步骤");
+          if (!title) continue;
+          const key = explorationFingerprint(`${item.turnId || item.itemId || block.activityKey || "turn"}:${title}`);
+          let node = planNodes.get(key);
+          const planStatus = String(plan.status || "pending").toLowerCase();
+          const status = planStatus === "completed" ? "completed" : planStatus === "in_progress" ? "active" : planStatus === "failed" ? "failed" : "planned";
+          if (!node) {
+            node = addNode({
+              id: `plan-${key}`,
+              parentId: planTail?.id || latestNode?.id || latestDirection?.id || null,
+              kind: "plan",
+              title,
+              status,
+              blockIndex,
+              itemId: item.itemId || "",
+              turnId: item.turnId || "",
+              time: item.time || "",
+              score: 7,
+            });
+            planNodes.set(key, node);
+            planTail = node;
+          } else {
+            node.status = status;
+            node.blockIndex = blockIndex;
+            node.time = item.time || node.time;
+          }
+        }
+
+        const target = [...nodes].reverse().find(node => node.status === "active") || [...nodes].reverse().find(node => node.status === "planned") || latestNode;
+        if (!target) continue;
+        if (item.command && !target.commands.includes(item.command)) target.commands.push(item.command);
+        for (const change of item.changes || []) {
+          const path = String(change?.path || change || "").trim();
+          if (path && !target.files.includes(path)) target.files.push(path);
+        }
+        if (item.detail && (item.kind.includes("reason") || item.kind.includes("search"))) addEvidence(target, item.detail);
+        if (item.status === "failed" || (item.exitCode != null && Number(item.exitCode) !== 0)) target.failures += 1;
+      }
+      continue;
+    }
+
+    if (block.role === "assistant" && !block.commandBlock && latestNode) {
+      const target = taskRunning ? ([...nodes].reverse().find(node => node.status === "active") || latestNode) : latestNode;
+      target.summary = explorationTitle(block.text, target.summary || "");
+      if (!taskRunning && target.status === "active") target.status = "completed";
+    }
+  }
+
+  if (taskRunning) {
+    const active = [...nodes].reverse().find(node => node.status === "active") || [...nodes].reverse().find(node => node.status === "planned") || latestNode;
+    for (const node of nodes) if (node !== active && node.status === "active") node.status = "completed";
+    if (active && !["failed", "rolledback", "abandoned"].includes(active.status)) active.status = "active";
+  } else if (taskStatus === "failed") {
+    const failed = [...nodes].reverse().find(node => !["rolledback", "abandoned"].includes(node.status));
+    if (failed) failed.status = "failed";
+    for (const node of nodes) if (node !== failed && node.status === "active") node.status = "completed";
+  } else if (taskStatus === "stopped") {
+    const stopped = [...nodes].reverse().find(node => node.status === "active");
+    if (stopped) stopped.status = "planned";
+    for (const node of nodes) if (node !== stopped && node.status === "active") node.status = "completed";
+  } else {
+    for (const node of nodes) if (node.status === "active") node.status = "completed";
+  }
+  return nodes.map(node => ({ ...node, evidence: node.evidence.slice(0, 4), files: node.files.slice(0, 8), commands: node.commands.slice(0, 5) }));
+}
+
 self.onmessage = event => {
-  const { requestId, events, messages, rawActivity, labels } = event.data;
+  const { requestId, taskId, events, explorationEvents, explorationRevision, messages, rawActivity, labels, taskRunning, taskStatus } = event.data;
   try {
     const merged = mergeEvents(events, messages);
-    self.postMessage({ requestId, blocks: buildBlocks(merged, rawActivity, labels || {}) });
+    const blocks = buildBlocks(merged, rawActivity, labels || {});
+    let explorationNodes;
+    if (Array.isArray(explorationEvents)) {
+      const semanticEvents = explorationEvents.length ? mergeEvents(explorationEvents, messages) : merged;
+      const semanticBlocks = semanticEvents === merged && rawActivity ? blocks : buildBlocks(semanticEvents, true, labels || {});
+      explorationNodes = buildExplorationTree(semanticBlocks, taskRunning, taskStatus);
+      explorationCache.set(taskId || "default", { revision: explorationRevision, nodes: explorationNodes });
+    } else {
+      explorationNodes = explorationCache.get(taskId || "default")?.nodes || [];
+    }
+    self.postMessage({ requestId, blocks, explorationNodes });
   } catch (error) {
     self.postMessage({ requestId, error: String(error?.message || error) });
   }

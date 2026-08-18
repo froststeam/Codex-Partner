@@ -923,8 +923,8 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
 
         conversation = (worker.parent / "conversation.js").read_text(encoding="utf-8")
         html = (worker.parent / "index.html").read_text(encoding="utf-8")
-        self.assertIn('/chat-worker.js?v=20260818-hidden-context', conversation)
-        self.assertIn('/conversation.js?v=20260818-activity-details', html)
+        self.assertIn('/chat-worker.js?v=20260818-full-exploration-graph', conversation)
+        self.assertIn('/conversation.js?v=20260818-full-exploration-graph', html)
 
     def test_worker_hides_native_media_tags(self):
         script = f"""
@@ -1070,6 +1070,88 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertEqual("OK", blocks[0]["items"][0]["output"])
         self.assertNotIn("outputDelta", json.dumps(blocks))
 
+    def test_worker_builds_key_activity_tree_without_command_nodes(self):
+        worker = Path(__file__).resolve().parents[1] / "static/chat-worker.js"
+        script = f"""
+const fs = require("fs");
+const vm = require("vm");
+const context = {{ self: {{ postMessage() {{}} }} }};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync({json.dumps(str(worker))}, "utf8"), context);
+const labels = {{ activityPlanning: "planning", activityCommandDone: "done", activityWorking: "working" }};
+const events = [
+  {{ id: "user-1", ts: 1, stream: "user", payload: {{ type: "userMessage", text: "帮我修复会话切换时消息丢失的问题", item_id: "user-1", turn_id: "turn-1" }} }},
+  {{ id: "plan-1", ts: 2, stream: "app-server", payload: {{ type: "planUpdate", item_id: "plan-1", turn_id: "turn-1", plan: [{{ step: "排查 timeline 缓存边界", status: "in_progress" }}, {{ step: "修复并验证消息恢复", status: "pending" }}] }} }},
+  {{ id: "command-1", ts: 3, stream: "app-server", payload: {{ type: "commandExecution", item_id: "command-1", turn_id: "turn-1", command: "rg timeline static", status: "completed", exit_code: 0 }} }},
+  {{ id: "plan-2", ts: 4, stream: "app-server", payload: {{ type: "planUpdate", item_id: "plan-2", turn_id: "turn-1", plan: [{{ step: "排查 timeline 缓存边界", status: "completed" }}, {{ step: "修复并验证消息恢复", status: "in_progress" }}] }} }},
+  {{ id: "user-2", ts: 5, stream: "user", payload: {{ type: "userMessage", text: "不是前端缓存，改成检查后端分页游标", item_id: "user-2", turn_id: "turn-2" }} }}
+];
+const visibleBlocks = context.buildBlocks(events, false, labels);
+const semanticBlocks = context.buildBlocks(events, true, labels);
+const decisionBlocks = context.buildBlocks([events[0], {{ id: "reason-1", ts: 2, stream: "rollout", payload: {{ type: "reasoning", item_id: "reason-1", turn_id: "turn-1", text: "确认根因是后端分页游标没有推进" }} }}], true, labels);
+process.stdout.write(JSON.stringify({{ visibleBlocks, nodes: context.buildExplorationTree(semanticBlocks, true), failed: context.buildExplorationTree(semanticBlocks, false, "failed"), stopped: context.buildExplorationTree(semanticBlocks, false, "stopped"), decision: context.buildExplorationTree(decisionBlocks, true) }}));
+"""
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+        data = json.loads(result.stdout)
+        nodes = data["nodes"]
+        self.assertEqual(4, len(nodes))
+        self.assertEqual(["direction", "plan", "plan", "steering"], [node["kind"] for node in nodes])
+        self.assertEqual(1, sum(node["status"] == "active" for node in nodes))
+        self.assertEqual("abandoned", nodes[2]["status"])
+        self.assertEqual(nodes[1]["id"], nodes[3]["parentId"])
+        self.assertEqual(["rg timeline static"], nodes[1]["commands"])
+        self.assertEqual([], nodes[2]["commands"])
+        self.assertFalse(any(node["kind"] == "command" for node in nodes))
+        self.assertFalse(any(block["role"] == "activities" for block in data["visibleBlocks"]))
+        self.assertEqual("failed", data["failed"][-1]["status"])
+        self.assertEqual("planned", data["stopped"][-1]["status"])
+        self.assertEqual(["direction", "decision"], [node["kind"] for node in data["decision"]])
+        self.assertIn("确认根因", data["decision"][-1]["title"])
+
+    def test_exploration_map_is_separate_from_chat_and_incremental(self):
+        static = Path(__file__).resolve().parents[1] / "static"
+        html = (static / "index.html").read_text(encoding="utf-8")
+        conversation = (static / "conversation.js").read_text(encoding="utf-8")
+        tree = (static / "exploration-tree.js").read_text(encoding="utf-8")
+        styles = (static / "styles.css").read_text(encoding="utf-8")
+        self.assertIn('id="exploration-map-open"', html)
+        self.assertIn('id="exploration-map"', html)
+        self.assertIn('/exploration-tree.js?v=20260818-full-exploration-graph', html)
+        self.assertIn("explorationNodes: []", (static / "core.js").read_text(encoding="utf-8"))
+        self.assertIn("event.data.explorationNodes", conversation)
+        self.assertIn("explorationEvents: explorationSync ? state.explorationEvents : null", conversation)
+        self.assertIn("const explorationCache = new Map()", (static / "chat-worker.js").read_text(encoding="utf-8"))
+        self.assertIn("function explorationLayout", tree)
+        self.assertIn("function loadFullExplorationHistory", tree)
+        self.assertIn("timeline?limit=500", tree)
+        self.assertIn("while (hasMore", tree)
+        self.assertIn("position.column * 244", tree)
+        self.assertIn("data-exploration-jump", tree)
+        self.assertIn(".exploration-map-viewport", styles)
+        self.assertIn(".exploration-node-time", styles)
+        self.assertIn("FULL CONVERSATION GRAPH", html)
+        self.assertNotIn("setInterval", tree)
+
+    def test_exploration_worker_reuses_full_history_projection(self):
+        worker = Path(__file__).resolve().parents[1] / "static/chat-worker.js"
+        script = f"""
+const fs = require("fs");
+const vm = require("vm");
+const posts = [];
+const context = {{ self: {{ postMessage(value) {{ posts.push(value); }} }} }};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync({json.dumps(str(worker))}, "utf8"), context);
+const events = [{{ id: "user-1", ts: 1, stream: "user", payload: {{ type: "userMessage", text: "帮我排查完整历史缓存问题", item_id: "user-1", turn_id: "turn-1" }} }}];
+context.self.onmessage({{ data: {{ requestId: 1, taskId: "task-1", events, explorationEvents: events, explorationRevision: 1, messages: [], rawActivity: true, labels: {{}}, taskRunning: true, taskStatus: "running" }} }});
+context.self.onmessage({{ data: {{ requestId: 2, taskId: "task-1", events: [], explorationEvents: null, explorationRevision: 1, messages: [], rawActivity: true, labels: {{}}, taskRunning: true, taskStatus: "running" }} }});
+process.stdout.write(JSON.stringify(posts));
+"""
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+        posts = json.loads(result.stdout)
+        self.assertEqual(2, len(posts))
+        self.assertEqual(posts[0]["explorationNodes"], posts[1]["explorationNodes"])
+        self.assertEqual("direction", posts[1]["explorationNodes"][0]["kind"])
+
     def test_activity_history_expands_independently_from_message_history(self):
         static = Path(__file__).resolve().parents[1] / "static"
         worker = static / "chat-worker.js"
@@ -1123,7 +1205,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn('data-activity-output-key="${esc(outputKey)}"', conversation)
         self.assertIn("Object.prototype.hasOwnProperty.call(state.activityOutputOpen, outputKey)", conversation)
         self.assertIn("state.activityOutputOpen[output.dataset.activityOutputKey] = output.open", conversation)
-        self.assertIn('/conversation.js?v=20260818-activity-details', html)
+        self.assertIn('/conversation.js?v=20260818-full-exploration-graph', html)
 
     def test_message_history_skips_activity_only_pages(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -1179,7 +1261,7 @@ const cursors = [];
         self.assertIn("HistoryPagination.fetchEarlierTimelinePages", conversation)
         self.assertIn("messageTarget: 12, maxPages: 8", conversation)
         self.assertIn('/history-pagination.js?v=20260817-message-history', html)
-        self.assertIn('/conversation.js?v=20260818-activity-details', html)
+        self.assertIn('/conversation.js?v=20260818-full-exploration-graph', html)
 
     def test_sent_browser_messages_follow_the_loaded_timeline_boundary(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -1212,7 +1294,7 @@ process.stdout.write(JSON.stringify({{ recent: bodies(recentEvents), older: bodi
         self.assertEqual(["currently running message", "old sent message", "current sent message"], payload["older"])
 
         conversation = (worker.parent / "conversation.js").read_text(encoding="utf-8")
-        self.assertIn('/chat-worker.js?v=20260818-hidden-context', conversation)
+        self.assertIn('/chat-worker.js?v=20260818-full-exploration-graph', conversation)
 
     def test_metrics_user_event_does_not_hide_its_browser_message(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -1904,7 +1986,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('disabled title="${esc(uiLabel("protectedSkillDelete"))}"', settings)
         self.assertIn(".panel-item button.danger-text:not(:disabled)", styles)
         self.assertNotIn(".panel-item button:last-child", styles)
-        self.assertIn('/styles.css?v=20260818-chat-layout-stable', html)
+        self.assertIn('/styles.css?v=20260818-full-exploration-graph', html)
         self.assertIn('/core.js?v=20260818-chat-performance', html)
         self.assertIn('/settings.js?v=20260817-skill-actions', html)
 
@@ -2328,7 +2410,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         html = (static / "index.html").read_text(encoding="utf-8")
         scripts = "\n".join(
             (static / name).read_text(encoding="utf-8")
-            for name in ("core.js", "conversation.js", "settings.js", "app.js")
+            for name in ("core.js", "conversation.js", "exploration-tree.js", "settings.js", "app.js")
         )
         button_ids = set(re.findall(r'<button[^>]+\bid="([^"]+)"', html))
         missing = sorted(
@@ -2463,7 +2545,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('/core.js?v=20260818-chat-performance', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260818-activity-details', html)
+        self.assertIn('/conversation.js?v=20260818-full-exploration-graph', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -2692,19 +2774,19 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260818-activity-details', html)
+        self.assertIn('/conversation.js?v=20260818-full-exploration-graph', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260818-chat-performance', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
-        self.assertIn('/styles.css?v=20260818-chat-layout-stable', html)
+        self.assertIn('/styles.css?v=20260818-full-exploration-graph', html)
         self.assertIn('/vendor/katex/katex.min.css', html)
         self.assertIn('<span id="goal-run-label">暂停</span>', html)
         self.assertNotIn('id="goal-run-label" class="sr-only"', html)
         self.assertIn(".session-card.selected::before", styles)
         self.assertNotIn("renderSessionList(); renderConversation(); await loadWorkspace(\"\")", conversation_js)
         self.assertIn(".queued-messages { width: auto; height: auto; min-height: 0; max-height: none; align-self: stretch;", styles)
-        self.assertIn('/chat-worker.js?v=20260818-hidden-context', conversation_js)
+        self.assertIn('/chat-worker.js?v=20260818-full-exploration-graph', conversation_js)
         self.assertIn('data-live="true" open', conversation_js)
         self.assertIn("activity-event.current::after", styles)
         self.assertIn("function renderActivityEvent", conversation_js)
@@ -2753,7 +2835,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         clear_start = conversation.index("clearChatSelectionForSessionSwitch()", select_start)
         self.assertLess(clear_start, request_start)
         self.assertIn("if (state.selectedId !== id)", conversation[select_start:request_start])
-        self.assertIn('/conversation.js?v=20260818-activity-details', html)
+        self.assertIn('/conversation.js?v=20260818-full-exploration-graph', html)
 
     def test_live_chat_rendering_coalesces_expensive_work(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -2767,11 +2849,12 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("chatBuildQueued = true", conversation)
         self.assertIn("const stale = state.selectedId !== taskId", conversation)
         self.assertIn("function isHiddenProtocolNoise", conversation)
-        self.assertIn("if (!protocolNoise || tokenUsage) state.selectedEvents.push", conversation)
+        self.assertIn("if (!protocolNoise || tokenUsage) {", conversation)
+        self.assertIn("state.explorationNeedsSync && (state.explorationOpen || !state.explorationNodes.length)", conversation)
         self.assertIn("if (current !== previous) scheduleRenderChat()", conversation)
         self.assertIn("renderConversation(false)", conversation)
         self.assertIn('/core.js?v=20260818-chat-performance', html)
-        self.assertIn('/conversation.js?v=20260818-activity-details', html)
+        self.assertIn('/conversation.js?v=20260818-full-exploration-graph', html)
         styles = (static / "styles.css").read_text(encoding="utf-8")
         app_js = (static / "app.js").read_text(encoding="utf-8")
         self.assertNotIn("content-visibility: auto", styles)
@@ -2783,7 +2866,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("if (chatIsNearBottom(stream))", conversation)
         self.assertNotIn("stream.scrollTop = target * state.chatAverageHeight", conversation)
         self.assertIn("function syncPageVisibility", app_js)
-        self.assertIn('/styles.css?v=20260818-chat-layout-stable', html)
+        self.assertIn('/styles.css?v=20260818-full-exploration-graph', html)
         self.assertIn('/app.js?v=20260818-chat-performance', html)
 
     def test_optimistic_queue_messages_survive_authoritative_refresh(self):
