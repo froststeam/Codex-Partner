@@ -875,6 +875,23 @@ process.stdout.write(JSON.stringify(merged.map(item => JSON.parse(item.payload).
             self.assertEqual("active", task["goal_status"])
             self.assertEqual(42, task["goal_tokens_used"])
 
+            self.app.db.execute(
+                "UPDATE tasks SET goal='dashboard objective',goal_status='active',goal_tokens_used=7,goal_revision=1 WHERE id=?",
+                (task_id,),
+            )
+            notification["params"]["goal"] = {
+                "objective": "old objective",
+                "status": "complete",
+                "tokensUsed": 99,
+            }
+            with mock.patch.object(self.app, "duplicate_live_event", return_value=False), \
+                 mock.patch.object(self.app, "broadcast_task", new=mock.AsyncMock()):
+                asyncio.run(self.app.handle_appserver_notification(server_key, notification))
+            guarded = self.app.task_or_404(task_id)
+            self.assertEqual("dashboard objective", guarded["goal"])
+            self.assertEqual("active", guarded["goal_status"])
+            self.assertEqual(7, guarded["goal_tokens_used"])
+
             script = f"""
 const fs = require("fs");
 const vm = require("vm");
@@ -897,6 +914,41 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
             self.app.app_thread_bindings.pop(task_id, None)
             self.app.db.execute("DELETE FROM events WHERE session_id=?", (session_id,))
             self.app.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_native_goal_update_cannot_overwrite_a_newer_dashboard_revision(self):
+        task_id = "native-goal-revision-thread"
+        self.make_task(task_id, "available")
+        self.app.db.execute(
+            "UPDATE tasks SET goal='dashboard objective',goal_status='active',goal_revision=1,goal_updated_at=?,updated_at=? WHERE id=?",
+            ("2026-08-18T06:00:00+00:00", "2026-08-18T06:00:00+00:00", task_id),
+        )
+        old_record = {
+            "timestamp": "2026-08-18T05:59:00+00:00",
+            "type": "event_msg",
+            "payload": {"type": "thread_goal_updated", "goal": {
+                "objective": "old terminal objective", "status": "complete", "tokensUsed": 99,
+            }},
+        }
+        new_record = {
+            "timestamp": "2026-08-18T06:01:00+00:00",
+            "type": "event_msg",
+            "payload": {"type": "thread_goal_updated", "goal": {
+                "objective": "new terminal objective", "status": "active", "tokensUsed": 3,
+            }},
+        }
+        try:
+            asyncio.run(self.app.process_native_rollout_record(task_id, task_id, old_record))
+            guarded = self.app.task_or_404(task_id)
+            self.assertEqual("dashboard objective", guarded["goal"])
+            self.assertEqual(1, guarded["goal_revision"])
+
+            asyncio.run(self.app.process_native_rollout_record(task_id, task_id, new_record))
+            updated = self.app.task_or_404(task_id)
+            self.assertEqual("new terminal objective", updated["goal"])
+            self.assertEqual(2, updated["goal_revision"])
+            self.assertEqual(3, updated["goal_tokens_used"])
+        finally:
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
     def test_worker_hides_codex_environment_context_from_user_messages(self):
@@ -1736,6 +1788,7 @@ process.stdout.write(JSON.stringify(browserMessages));
             self.assertEqual("none", result["goal_status"])
             self.assertFalse(result["retry_forever"])
             self.assertEqual(0, result["goal_tokens_used"])
+            self.assertEqual(1, result["goal_revision"])
         finally:
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 

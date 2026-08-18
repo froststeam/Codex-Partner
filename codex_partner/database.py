@@ -41,6 +41,8 @@ class Database:
                   created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                   last_error TEXT DEFAULT '', active_session_id TEXT, codex_session_id TEXT DEFAULT '',
                   goal_status TEXT DEFAULT 'active', goal_tokens_used INTEGER DEFAULT 0,
+                  goal_revision INTEGER NOT NULL DEFAULT 0,
+                  goal_updated_at TEXT DEFAULT '',
                   native INTEGER NOT NULL DEFAULT 0,
                   archived INTEGER NOT NULL DEFAULT 0,
                   trashed INTEGER NOT NULL DEFAULT 0,
@@ -149,6 +151,8 @@ class Database:
             "retry_explicit": "INTEGER NOT NULL DEFAULT 0",
             "goal_status": "TEXT DEFAULT 'active'",
             "goal_tokens_used": "INTEGER DEFAULT 0",
+            "goal_revision": "INTEGER NOT NULL DEFAULT 0",
+            "goal_updated_at": "TEXT DEFAULT ''",
             "native": "INTEGER NOT NULL DEFAULT 0",
             "archived": "INTEGER NOT NULL DEFAULT 0",
             "trashed": "INTEGER NOT NULL DEFAULT 0",
@@ -169,6 +173,11 @@ class Database:
         for column, definition in task_migrations.items():
             if column not in task_columns:
                 connection.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")
+        connection.execute(
+            "UPDATE tasks SET goal_revision=CASE WHEN goal_revision=0 THEN 1 ELSE goal_revision END, "
+            "goal_updated_at=CASE WHEN COALESCE(goal_updated_at,'')='' THEN updated_at ELSE goal_updated_at END "
+            "WHERE COALESCE(goal,'')!=''"
+        )
         connection.execute(
             "UPDATE tasks SET last_interaction_at=max(created_at, "
             "COALESCE((SELECT MAX(ts) FROM events WHERE events.task_id=tasks.id "

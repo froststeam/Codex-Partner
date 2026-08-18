@@ -1490,9 +1490,11 @@ async def process_native_rollout_record(task_id: str, thread_id: str, record: di
         return
     if record.get("type") == "event_msg" and payload_type == "thread_goal_updated":
         goal = record_payload.get("goal") or {}
+        stamp = rollout_stamp(record)
         db.execute(
-            "UPDATE tasks SET goal=?,goal_status=?,goal_tokens_used=?,updated_at=? WHERE id=?",
-            (goal.get("objective", ""), goal.get("status", "active"), int(goal.get("tokensUsed", 0) or 0), rollout_stamp(record), task_id),
+            "UPDATE tasks SET goal=?,goal_status=?,goal_tokens_used=?,goal_revision=goal_revision+1,goal_updated_at=?,updated_at=? "
+            "WHERE id=? AND COALESCE(goal_updated_at,'')<=?",
+            (goal.get("objective", ""), goal.get("status", "active"), int(goal.get("tokensUsed", 0) or 0), stamp, stamp, task_id, stamp),
         )
         await broadcast_task(task_id, {"type": "task_status", "task": task_or_404(task_id), "source": {"kind": "external_goal"}})
         return
@@ -2536,11 +2538,27 @@ async def handle_appserver_notification(server_key: str, message: dict) -> None:
         goal = params.get("goal") or {}
         payload = {"type": "goal_updated", "goal": goal, "thread_id": thread_id}
         objective = goal.get("objective")
+        current_goal = task_or_404(task_id)
+        stale_objective = (
+            objective is not None
+            and int(current_goal.get("goal_revision") or 0) > 0
+            and str(objective or "") != str(current_goal.get("goal") or "")
+        )
+        if stale_objective:
+            # A running turn may report the objective it started with after a
+            # dashboard edit. Keep the newer durable revision authoritative.
+            payload["ignored_stale"] = True
+            objective = None
+        stamp = now()
         fields = ["goal_status=?", "goal_tokens_used=?", "updated_at=?"]
-        values: list[Any] = [goal.get("status", "active"), goal.get("tokensUsed", 0), now()]
+        values: list[Any] = [
+            current_goal.get("goal_status", "active") if stale_objective else goal.get("status", "active"),
+            current_goal.get("goal_tokens_used", 0) if stale_objective else goal.get("tokensUsed", 0),
+            stamp,
+        ]
         if objective is not None:
-            fields.insert(0, "goal=?")
-            values.insert(0, str(objective or ""))
+            fields[0:0] = ["goal=?", "goal_updated_at=?"]
+            values[0:0] = [str(objective or ""), stamp]
         values.append(task_id)
         db.execute(
             f"UPDATE tasks SET {','.join(fields)} WHERE id=?",
@@ -4589,10 +4607,15 @@ async def patch_task(task_id: str, payload: TaskPatch, _: Any = Depends(auth)):
             continue
         sets.append(f"{key}=?")
         args.append(int(value) if key in {"yolo", "retry_forever"} else value)
+    stamp = now()
     if "retry_forever" in values:
         sets.append("retry_explicit=?")
         args.append(1)
-    sets.append("updated_at=?"); args.append(now()); args.append(task_id)
+    if "goal" in values:
+        sets.append("goal_revision=goal_revision+1")
+        sets.append("goal_updated_at=?")
+        args.append(stamp)
+    sets.append("updated_at=?"); args.append(stamp); args.append(task_id)
     db.execute(f"UPDATE tasks SET {','.join(sets)} WHERE id=?", tuple(args))
     result = task_or_404(task_id)
     if "model" in values:
@@ -4650,7 +4673,10 @@ async def patch_goal(task_id: str, payload: GoalPatch, _: Any = Depends(auth)):
         updates["goal_status"] = remote_goal.get("status") or payload.status
     if updates:
         sets = ",".join(f"{key}=?" for key in updates)
-        db.execute(f"UPDATE tasks SET {sets}, updated_at=? WHERE id=?", tuple(updates.values()) + (now(), task_id))
+        stamp = now()
+        revision_update = ",goal_revision=goal_revision+1,goal_updated_at=?" if payload.objective is not None else ""
+        revision_args = (stamp,) if payload.objective is not None else ()
+        db.execute(f"UPDATE tasks SET {sets}{revision_update}, updated_at=? WHERE id=?", tuple(updates.values()) + revision_args + (stamp, task_id))
     result = task_or_404(task_id)
     await broadcast_task(task_id, {"type": "task_status", "task": result, "source": {"kind": "goal"}})
     await broadcast_overview(task_id, {"kind": "goal"})
@@ -6175,7 +6201,8 @@ async def execute_slash_command(task: dict, command: str, arg_text: str, args: l
         if first == "clear":
             if client and thread_id:
                 await client.request("thread/goal/clear", {"threadId": thread_id})
-            db.execute("UPDATE tasks SET goal='',goal_status='none',goal_tokens_used=0,retry_forever=0,retry_explicit=0,updated_at=? WHERE id=?", (now(), task["id"]))
+            stamp = now()
+            db.execute("UPDATE tasks SET goal='',goal_status='none',goal_tokens_used=0,goal_revision=goal_revision+1,goal_updated_at=?,retry_forever=0,retry_explicit=0,updated_at=? WHERE id=?", (stamp, stamp, task["id"]))
             return result_message(command, "Goal 已清除。")
         if first == "budget":
             if len(args) != 2 or not args[1].isdigit():
@@ -6208,7 +6235,8 @@ async def execute_slash_command(task: dict, command: str, arg_text: str, args: l
         if client and thread_id:
             goal = (await client.request("thread/goal/set", {"threadId": thread_id, "objective": objective, "status": status})).get("goal") or {}
             status = goal.get("status", status)
-        db.execute("UPDATE tasks SET goal=?,goal_status=?,goal_tokens_used=0,updated_at=? WHERE id=?", (objective, status, now(), task["id"]))
+        stamp = now()
+        db.execute("UPDATE tasks SET goal=?,goal_status=?,goal_tokens_used=0,goal_revision=goal_revision+1,goal_updated_at=?,updated_at=? WHERE id=?", (objective, status, stamp, stamp, task["id"]))
         return result_message(command, f"Goal 已设置：\n\n{objective}\n\n状态：`{status}`。", goal={"objective": objective, "status": status})
 
     if command == "status":
