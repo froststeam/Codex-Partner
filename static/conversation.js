@@ -23,7 +23,7 @@ function renderSidebarStats() {
 function renderSessionList() {
   const list = $("#task-list"); const tasks = sortTasks(state.tasks.filter(taskMatches));
   if (!tasks.length) { list.innerHTML = `<div class="empty">${state.query ? "没有匹配的会话" : "还没有 Codex 会话"}</div>`; return; }
-  list.innerHTML = tasks.map(task => { const active = ["running", "retrying"].includes(task.status); const selected = task.id === state.selectedId; const name = task.name || t("sessions"); return `<button class="session-card ${selected ? "selected" : ""} ${active ? "running" : "paused"}" data-session-id="${esc(task.id)}" title="${esc(name)}" aria-current="${selected ? "true" : "false"}"><span class="session-card-body"><strong title="${esc(name)}">${esc(name)}</strong><time class="session-card-time">${esc(shortDate(task.updated_at))}</time></span></button>`; }).join("");
+  list.innerHTML = tasks.map(task => { const active = ["running", "retrying"].includes(task.status); const selected = task.id === state.selectedId; const name = task.name || t("sessions"); const stateText = statusLabel(task.status); return `<button class="session-card ${selected ? "selected" : ""} ${active ? "running" : "paused"}" data-session-id="${esc(task.id)}" title="${esc(name)} · ${esc(stateText)}" aria-label="${esc(name)} · ${esc(stateText)}" aria-current="${selected ? "true" : "false"}"><span class="session-card-body"><strong title="${esc(name)}">${esc(name)}</strong>${active ? `<span class="session-card-live"><i aria-hidden="true"></i>${esc(stateText)}</span>` : ""}<time class="session-card-time">${esc(shortDate(task.updated_at))}</time></span></button>`; }).join("");
 }
 
 let pointerSelectedSessionId = "";
