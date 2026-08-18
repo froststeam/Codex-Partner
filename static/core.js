@@ -3,7 +3,7 @@ const DEFAULT_USER_AVATAR = "/default-user-avatar.webp?v=20260818";
 const state = {
   tasks: [], sessions: [], skills: [], providers: [], memories: [], generatedMemories: [], commands: [], sshHosts: [], sshConfig: "", activeSSHHost: localStorage.getItem("codex-dashboard-ssh-host") || "",
   selectedId: null, selectedTask: null, selectedEvents: [], selectedMessages: [], pendingApprovals: [], sessionRequestId: 0, sessionAbortController: null, workspacePath: "", workspaceFile: null, workspaceRequestId: 0, workspacePickerPath: "", workspaceUploading: false, inspectorClosed: false, filter: "all", query: "",
-  historyCursor: "", historyHasMore: false, historyLoading: false, chatBlocks: [], chatVirtualStart: null, chatAverageHeight: 112, activityVisibleCounts: {}, activityOutputOpen: {},
+  historyCursor: "", historyHasMore: false, historyLoading: false, chatBlocks: [], chatVirtualStart: null, chatAverageHeight: 112, activityVisibleCounts: {}, activityOutputOpen: {}, explorationNodes: [], explorationEvents: [], explorationOpen: false, explorationSelectedNodeId: "", explorationLoading: false, explorationHistoryComplete: false, explorationLoadedEventCount: 0, explorationLoadError: "", explorationRequestId: 0, explorationRevision: 0, explorationNeedsSync: false, explorationPrecomputed: false, explorationMapStatus: "pending", explorationProcessedEvents: 0,
   commandIndex: 0, rawActivity: true, composerHistory: [], historyIndex: -1, editingQueuedId: null, defaultWorkspace: "", codexAvailable: true, codexInstall: null, codexInfo: null,
   runtimeMetrics: { taskId: "", ttftMs: null, tpotMs: null, estimated: true, outputTokens: 0 }, serverInfo: { user: "", hostname: "" }, chatSnapToBottom: false, chatSelectionActive: false, chatPointerSelecting: false, chatPointerDragged: false, chatPointerStartX: 0, chatPointerStartY: 0, userAvatar: localStorage.getItem("codex-dashboard-user-avatar") || DEFAULT_USER_AVATAR,
 };
@@ -110,6 +110,55 @@ const UI_LABELS = {
   noRunHistory: { zh: "暂无运行记录", en: "No runs yet", fr: "Aucune exécution", ja: "実行履歴なし", ko: "실행 기록 없음" },
   threadControls: { zh: "线程控制", en: "Thread controls", fr: "Contrôles du thread", ja: "スレッド操作", ko: "스레드 제어" },
   copySession: { zh: "复制会话", en: "Duplicate session", fr: "Dupliquer", ja: "セッションを複製", ko: "세션 복제" },
+  sessionRenamed: { zh: "会话已重命名", en: "Session renamed", fr: "Session renommée", ja: "セッション名を変更しました", ko: "세션 이름이 변경되었습니다" },
+  sessionDuplicating: { zh: "正在复制会话…", en: "Duplicating session…", fr: "Duplication de la session…", ja: "セッションを複製中…", ko: "세션 복제 중…" },
+  sessionDuplicated: { zh: "会话已复制", en: "Session duplicated", fr: "Session dupliquée", ja: "セッションを複製しました", ko: "세션이 복제되었습니다" },
+  operationComplete: { zh: "操作已完成", en: "Operation completed", fr: "Opération terminée", ja: "操作が完了しました", ko: "작업이 완료되었습니다" },
+  explorationOpen: { zh: "探索地图", en: "Activity map", fr: "Carte d’exploration", ja: "探索マップ", ko: "탐색 지도" },
+  explorationEyebrow: { zh: "完整会话活动图", en: "Full conversation graph", fr: "Graphe complet de la conversation", ja: "会話全体グラフ", ko: "전체 대화 그래프" },
+  explorationTitle: { zh: "探索地图", en: "Exploration map", fr: "Carte d’exploration", ja: "探索マップ", ko: "탐색 지도" },
+  explorationDescription: { zh: "从左到右还原完整会话的时间方向，工具调用收纳在关键节点内部。", en: "Read the full conversation from left to right; tool activity is grouped into key nodes.", fr: "Parcourez la conversation de gauche à droite ; les outils sont regroupés dans les nœuds clés.", ja: "会話全体を左から右へ表示し、ツール活動を主要ノードにまとめます。", ko: "전체 대화를 왼쪽에서 오른쪽으로 표시하고 도구 활동을 핵심 노드에 묶습니다." },
+  explorationZoomOut: { zh: "缩小地图", en: "Zoom out", fr: "Réduire", ja: "縮小", ko: "축소" },
+  explorationZoomReset: { zh: "恢复 100% 缩放", en: "Reset to 100%", fr: "Rétablir à 100 %", ja: "100% に戻す", ko: "100%로 재설정" },
+  explorationZoomIn: { zh: "放大地图", en: "Zoom in", fr: "Agrandir", ja: "拡大", ko: "확대" },
+  explorationZoomGroup: { zh: "地图缩放", en: "Map zoom", fr: "Zoom de la carte", ja: "マップのズーム", ko: "지도 확대/축소" },
+  explorationViewportHint: { zh: "滚轮缩放，按住拖动地图", en: "Use the wheel to zoom; drag to pan", fr: "Molette pour zoomer ; glissez pour déplacer", ja: "ホイールでズーム、ドラッグで移動", ko: "휠로 확대/축소하고 드래그하여 이동" },
+  explorationFit: { zh: "全图", en: "Fit", fr: "Ajuster", ja: "全体", ko: "전체" },
+  explorationFitTitle: { zh: "查看完整活动树", en: "Fit the full activity tree", fr: "Afficher tout l’arbre", ja: "活動ツリー全体を表示", ko: "전체 활동 트리 보기" },
+  explorationFollow: { zh: "跟随当前", en: "Follow current", fr: "Suivre l’activité", ja: "現在を追跡", ko: "현재 항목 추적" },
+  explorationClose: { zh: "关闭探索地图", en: "Close exploration map", fr: "Fermer la carte", ja: "探索マップを閉じる", ko: "탐색 지도 닫기" },
+  explorationStatusPlanned: { zh: "未进行", en: "Planned", fr: "Planifié", ja: "未着手", ko: "예정" },
+  explorationStatusActive: { zh: "进行中", en: "Active", fr: "En cours", ja: "進行中", ko: "진행 중" },
+  explorationStatusCompleted: { zh: "完成", en: "Completed", fr: "Terminé", ja: "完了", ko: "완료" },
+  explorationStatusFailed: { zh: "失败", en: "Failed", fr: "Échec", ja: "失敗", ko: "실패" },
+  explorationStatusRolledBack: { zh: "已回退", en: "Rolled back", fr: "Annulé", ja: "ロールバック済み", ko: "롤백됨" },
+  explorationStatusAbandoned: { zh: "已转向", en: "Redirected", fr: "Réorienté", ja: "方向転換", ko: "전환됨" },
+  explorationKindPlan: { zh: "计划步骤", en: "Plan step", fr: "Étape du plan", ja: "計画ステップ", ko: "계획 단계" },
+  explorationKindPhase: { zh: "执行阶段", en: "Execution phase", fr: "Phase d’exécution", ja: "実行フェーズ", ko: "실행 단계" },
+  explorationKindDecision: { zh: "关键结论", en: "Key decision", fr: "Décision clé", ja: "主要な結論", ko: "핵심 결론" },
+  explorationKindSteering: { zh: "方向调整", en: "Direction change", fr: "Changement de direction", ja: "方向調整", ko: "방향 조정" },
+  explorationKindRollback: { zh: "回退决策", en: "Rollback", fr: "Retour en arrière", ja: "ロールバック", ko: "롤백" },
+  explorationKindDirection: { zh: "用户目标", en: "User direction", fr: "Objectif utilisateur", ja: "ユーザー目標", ko: "사용자 목표" },
+  explorationSelectNode: { zh: "选择一个关键节点", en: "Select a key node", fr: "Sélectionnez un nœud clé", ja: "主要ノードを選択", ko: "핵심 노드 선택" },
+  explorationSelectNodeDescription: { zh: "查看它为什么出现、相关修改以及执行证据。", en: "Review why it appeared, related changes, and execution evidence.", fr: "Consultez son origine, les modifications et les preuves d’exécution.", ja: "発生理由、関連変更、実行証拠を確認します。", ko: "발생 이유, 관련 변경 및 실행 근거를 확인합니다." },
+  explorationTime: { zh: "时间", en: "Time", fr: "Heure", ja: "時刻", ko: "시간" },
+  explorationCurrentSession: { zh: "当前会话", en: "Current session", fr: "Session actuelle", ja: "現在のセッション", ko: "현재 세션" },
+  explorationImportance: { zh: "关键度", en: "Importance", fr: "Importance", ja: "重要度", ko: "중요도" },
+  explorationErrors: { zh: "执行异常", en: "Execution errors", fr: "Erreurs d’exécution", ja: "実行エラー", ko: "실행 오류" },
+  explorationEvidence: { zh: "方向证据", en: "Evidence", fr: "Éléments probants", ja: "方向の根拠", ko: "방향 근거" },
+  explorationFiles: { zh: "相关文件", en: "Related files", fr: "Fichiers associés", ja: "関連ファイル", ko: "관련 파일" },
+  explorationCommands: { zh: "核心命令 · {{count}}", en: "Key commands · {{count}}", fr: "Commandes clés · {{count}}", ja: "主要コマンド · {{count}}", ko: "핵심 명령 · {{count}}" },
+  explorationJump: { zh: "在对话中查看", en: "View in conversation", fr: "Voir dans la conversation", ja: "会話で表示", ko: "대화에서 보기" },
+  explorationNoPath: { zh: "还没有形成关键路径", en: "No key path yet", fr: "Aucun chemin clé", ja: "主要パスはまだありません", ko: "아직 핵심 경로가 없습니다" },
+  explorationNoPathDescription: { zh: "出现明确目标、计划步骤或方向调整后，地图会自动生长。", en: "The map grows automatically when goals, plan steps, or direction changes appear.", fr: "La carte évolue avec les objectifs, étapes et changements de direction.", ja: "目標、計画、方向変更が現れるとマップが自動で成長します。", ko: "목표, 계획 단계 또는 방향 변경이 생기면 지도가 자동으로 확장됩니다." },
+  explorationIndex: { zh: "活动图索引", en: "Activity graph index", fr: "Index du graphe", ja: "活動グラフ索引", ko: "활동 그래프 인덱스" },
+  explorationIndexLoading: { zh: "正在读取活动图索引", en: "Loading activity graph index", fr: "Chargement du graphe", ja: "活動グラフを読み込み中", ko: "활동 그래프 불러오는 중" },
+  explorationIndexBuilding: { zh: "后台预计算中 · {{count}} 条事件", en: "Precomputing · {{count}} events", fr: "Pré-calcul · {{count}} événements", ja: "事前計算中 · {{count}} 件", ko: "사전 계산 중 · 이벤트 {{count}}개" },
+  explorationIndexReady: { zh: "活动图已预计算 · {{count}} 条事件", en: "Activity graph ready · {{count}} events", fr: "Graphe prêt · {{count}} événements", ja: "活動グラフ準備完了 · {{count}} 件", ko: "활동 그래프 준비됨 · 이벤트 {{count}}개" },
+  explorationIndexWaiting: { zh: "活动图等待预计算", en: "Waiting for activity graph", fr: "En attente du graphe", ja: "活動グラフを待機中", ko: "활동 그래프 대기 중" },
+  explorationIndexFailed: { zh: "活动图失败 · {{error}}", en: "Activity graph failed · {{error}}", fr: "Échec du graphe · {{error}}", ja: "活動グラフ失敗 · {{error}}", ko: "활동 그래프 실패 · {{error}}" },
+  explorationRetry: { zh: "重试活动图", en: "Retry activity graph", fr: "Réessayer", ja: "活動グラフを再試行", ko: "활동 그래프 재시도" },
+  explorationLegend: { zh: "● 进行中   ✓ 完成   ○ 未进行   ! 失败   ↶ 已回退   ↗ 已转向", en: "● Active   ✓ Completed   ○ Planned   ! Failed   ↶ Rolled back   ↗ Redirected", fr: "● En cours   ✓ Terminé   ○ Planifié   ! Échec   ↶ Annulé   ↗ Réorienté", ja: "● 進行中   ✓ 完了   ○ 未着手   ! 失敗   ↶ ロールバック   ↗ 方向転換", ko: "● 진행 중   ✓ 완료   ○ 예정   ! 실패   ↶ 롤백   ↗ 전환" },
   compactContext: { zh: "压缩上下文", en: "Compact context", fr: "Compacter le contexte", ja: "コンテキストを圧縮", ko: "컨텍스트 압축" },
   archive: { zh: "归档", en: "Archive", fr: "Archiver", ja: "アーカイブ", ko: "보관" },
   unarchive: { zh: "取消归档", en: "Unarchive", fr: "Désarchiver", ja: "アーカイブ解除", ko: "보관 해제" },
@@ -436,10 +485,12 @@ function applyLanguage(language = state.language) {
   window.i18next.changeLanguage(state.language);
   localStorage.setItem("codex-dashboard-language", state.language);
   document.documentElement.lang = state.language === "zh" ? "zh-CN" : state.language;
-  const text = { "#new-task span": "newSession", ".shortcut-hint:nth-child(1) .shortcut-label": "terminal", ".shortcut-hint:nth-child(2) .shortcut-label": "shortcutNext", ".shortcut-hint:nth-child(3) .shortcut-label": "shortcutPrevious", ".shortcut-hint:nth-child(4) .shortcut-label": "shortcutFirst", ".shortcut-hint:nth-child(5) .shortcut-label": "shortcutComposer", ".sidebar-top h1": "sessions", ".filter[data-filter=all]": "all", ".filter[data-filter=running]": "running", ".filter[data-filter=available]": "available", ".trash-filter": "trash", ".sidebar-link[data-panel=memories] span": "memories", ".sidebar-link[data-panel=skills] span": "skills", "#empty-conversation h2": "emptyTitle", "#empty-conversation p": "emptyCopy", "#empty-new-task": "create", "#send-codex-label": "send", "#message-input": "composerPlaceholder", "#session-search": "searchSessions", ".composer-model-control > span": "model", ".composer-effort-control > span": "effort", "#inspector .inspector-head h2": "workspace", "#goal-bar .eyebrow": "goal", "#goal-clear": "clear", "#goal-edit-cancel": "cancel", "#goal-edit-form .primary-small": "save", "#goal-input": "goalInput", "#composer-live-state > span": "ready", "#terminal-eyebrow": "terminalRemoteShell", "#terminal-title": "terminalTitle", "#terminal-cwd": "terminalNotConnected", "#terminal-hint": "terminalHint", "#terminal-reconnect": "terminalReconnect", "#terminal-screen": "terminalOutput" };
+  const text = { "#new-task span": "newSession", ".shortcut-hint:nth-child(1) .shortcut-label": "terminal", ".shortcut-hint:nth-child(2) .shortcut-label": "shortcutNext", ".shortcut-hint:nth-child(3) .shortcut-label": "shortcutPrevious", ".shortcut-hint:nth-child(4) .shortcut-label": "shortcutFirst", ".shortcut-hint:nth-child(5) .shortcut-label": "shortcutComposer", ".sidebar-top h1": "sessions", ".filter[data-filter=all]": "all", ".filter[data-filter=running]": "running", ".filter[data-filter=available]": "available", ".trash-filter": "trash", ".sidebar-link[data-panel=memories] span": "memories", ".sidebar-link[data-panel=skills] span": "skills", "#empty-conversation h2": "emptyTitle", "#empty-conversation p": "emptyCopy", "#empty-new-task": "create", "#send-codex-label": "send", "#message-input": "composerPlaceholder", "#session-search": "searchSessions", ".composer-model-control > span": "model", ".composer-effort-control > span": "effort", "#inspector .inspector-head h2": "workspace", "#goal-bar .eyebrow": "goal", "#goal-clear": "clear", "#goal-edit-cancel": "cancel", "#goal-edit-form .primary-small": "save", "#goal-input": "goalInput", "#composer-live-state > span": "ready", "#terminal-eyebrow": "terminalRemoteShell", "#terminal-title": "terminalTitle", "#terminal-cwd": "terminalNotConnected", "#terminal-hint": "terminalHint", "#terminal-reconnect": "terminalReconnect", "#terminal-screen": "terminalOutput", "#exploration-map-open-label": "explorationOpen", "#exploration-map-eyebrow": "explorationEyebrow", "#exploration-map-title": "explorationTitle", "#exploration-map-description": "explorationDescription", "#exploration-zoom-fit": "explorationFit", "#exploration-follow-label": "explorationFollow", "#exploration-load-older": "explorationRetry" };
   for (const [selector, key] of Object.entries(text)) { const node = $(selector); if (!node) continue; if (["#message-input", "#session-search"].includes(selector)) node.placeholder = t(key); else if (selector === "#terminal-screen") node.setAttribute("aria-label", t(key)); else node.textContent = t(key); }
-  const titles = { "#open-terminal": "terminal", "#sync-native": "sync", "#conversation-rename": "rename", "#conversation-fork": "fork", "#conversation-more": "more", "#language-select": "language", "#goal-edit": "editGoal", "#inspector": "workspace", "#composer-meta": "session", "#terminal-close": "terminalClose", ".shortcut-hint:nth-child(1)": "shortcutTerminal", ".shortcut-hint:nth-child(2)": "shortcutNext", ".shortcut-hint:nth-child(3)": "shortcutPrevious", ".shortcut-hint:nth-child(4)": "shortcutFirst", ".shortcut-hint:nth-child(5)": "shortcutComposerToggle" };
+  const titles = { "#open-terminal": "terminal", "#sync-native": "sync", "#conversation-rename": "rename", "#conversation-fork": "fork", "#conversation-more": "more", "#language-select": "language", "#goal-edit": "editGoal", "#inspector": "workspace", "#composer-meta": "session", "#terminal-close": "terminalClose", ".shortcut-hint:nth-child(1)": "shortcutTerminal", ".shortcut-hint:nth-child(2)": "shortcutNext", ".shortcut-hint:nth-child(3)": "shortcutPrevious", ".shortcut-hint:nth-child(4)": "shortcutFirst", ".shortcut-hint:nth-child(5)": "shortcutComposerToggle", "#exploration-map-open": "explorationOpen", "#exploration-zoom-out": "explorationZoomOut", "#exploration-zoom-reset": "explorationZoomReset", "#exploration-zoom-in": "explorationZoomIn", "#exploration-zoom-fit": "explorationFitTitle", "#exploration-map-close": "explorationClose" };
   for (const [selector, key] of Object.entries(titles)) { const node = $(selector); if (node) { node.title = t(key); node.setAttribute("aria-label", t(key)); } }
+  const explorationZoom = $("#exploration-map .exploration-zoom"); if (explorationZoom) explorationZoom.setAttribute("aria-label", t("explorationZoomGroup"));
+  const explorationViewport = $("#exploration-map-viewport"); if (explorationViewport) explorationViewport.title = t("explorationViewportHint");
   const select = $("#language-select"); if (select) select.value = state.language;
   updateThemeToggle();
   updateSessionSidebarControls();

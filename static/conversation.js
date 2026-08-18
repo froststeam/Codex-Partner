@@ -2,7 +2,7 @@
 const chatFileObjectUrls = new Map();
 const chatThumbnailObjectUrls = new Map();
 const chatThumbnailLoads = new Map();
-const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260818-hidden-context") : null;
+const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260818-full-exploration-graph") : null;
 let chatBuildRequestId = 0;
 let chatBuildInFlight = false;
 let chatBuildQueued = false;
@@ -23,8 +23,28 @@ function renderSidebarStats() {
 function renderSessionList() {
   const list = $("#task-list"); const tasks = sortTasks(state.tasks.filter(taskMatches));
   if (!tasks.length) { list.innerHTML = `<div class="empty">${state.query ? "没有匹配的会话" : "还没有 Codex 会话"}</div>`; return; }
-  list.innerHTML = tasks.map(task => { const active = ["running", "retrying"].includes(task.status); const name = task.name || t("sessions"); return `<button class="session-card ${task.id === state.selectedId ? "selected" : ""} ${active ? "running" : "paused"}" data-session-id="${esc(task.id)}" title="${esc(name)}"><span class="session-card-body"><strong title="${esc(name)}">${esc(name)}</strong><time class="session-card-time">${esc(shortDate(task.updated_at))}</time></span></button>`; }).join("");
+  list.innerHTML = tasks.map(task => { const active = ["running", "retrying"].includes(task.status); const selected = task.id === state.selectedId; const name = task.name || t("sessions"); const stateText = statusLabel(task.status); return `<button class="session-card ${selected ? "selected" : ""} ${active ? "running" : "paused"}" data-session-id="${esc(task.id)}" title="${esc(name)} · ${esc(stateText)}" aria-label="${esc(name)} · ${esc(stateText)}" aria-current="${selected ? "true" : "false"}"><span class="session-card-body"><strong title="${esc(name)}">${esc(name)}</strong><time class="session-card-time">${esc(shortDate(task.updated_at))}</time></span></button>`; }).join("");
 }
+
+let pointerSelectedSessionId = "";
+const sessionList = $("#task-list");
+sessionList?.addEventListener("pointerdown", event => {
+  if (event.pointerType !== "mouse" || event.button !== 0) return;
+  const card = event.target.closest(".session-card[data-session-id]");
+  if (!card || !sessionList.contains(card)) return;
+  pointerSelectedSessionId = card.dataset.sessionId || "";
+  event.preventDefault();
+  void selectSession(pointerSelectedSessionId).catch(error => toast(error.message));
+});
+sessionList?.addEventListener("click", event => {
+  const card = event.target.closest(".session-card[data-session-id]");
+  if (!card || !sessionList.contains(card)) return;
+  const id = card.dataset.sessionId || "";
+  event.preventDefault();
+  event.stopPropagation();
+  if (id && id !== pointerSelectedSessionId) void selectSession(id).catch(error => toast(error.message));
+  pointerSelectedSessionId = "";
+});
 function scrollSessionIntoView(id) {
   const card = $$(".session-card").find(node => node.dataset.sessionId === id);
   card?.scrollIntoView({ block: "nearest" });
@@ -52,7 +72,7 @@ async function syncQueuedMessages() {
     queueSyncInFlight = false;
   }
 }
-function showEmptyConversation() { if (terminalTaskId) destroyTerminal(); stopQueueSync(); state.sessionAbortController?.abort(); state.sessionAbortController = null; state.editingQueuedId = null; state.pendingApprovals = []; state.inspectorClosed = true; $("#empty-conversation").hidden = false; $("#conversation-view").hidden = true; $("#goal-bar").hidden = true; $("#queued-messages").hidden = true; $("#approval-center").hidden = true; setInspectorOpen(false); }
+function showEmptyConversation() { if (terminalTaskId) destroyTerminal(); stopQueueSync(); state.sessionAbortController?.abort(); state.sessionAbortController = null; state.editingQueuedId = null; state.pendingApprovals = []; state.inspectorClosed = true; state.explorationNodes = []; state.explorationEvents = []; state.explorationPrecomputed = false; state.explorationRequestId += 1; if (typeof closeExplorationMap === "function") closeExplorationMap(); $("#empty-conversation").hidden = false; $("#conversation-view").hidden = true; $("#goal-bar").hidden = true; $("#queued-messages").hidden = true; $("#approval-center").hidden = true; setInspectorOpen(false); }
 function resetWorkspaceBrowser() {
   state.workspacePath = "";
   state.workspaceFile = null;
@@ -80,8 +100,9 @@ async function selectSession(id, openSocket = true) {
   const wasEmpty = $("#conversation-view").hidden;
   if (state.selectedId !== id) {
     resetWorkspaceBrowser(); state.titleExpanded = false; state.historyCursor = ""; state.historyHasMore = false;
-    state.historyLoading = false; state.chatBlocks = []; state.chatVirtualStart = null; state.activityVisibleCounts = {}; state.activityOutputOpen = {}; state.pendingApprovals = [];
+    state.historyLoading = false; state.chatBlocks = []; state.chatVirtualStart = null; state.activityVisibleCounts = {}; state.activityOutputOpen = {}; state.explorationNodes = []; state.explorationEvents = []; state.explorationSelectedNodeId = ""; state.explorationLoading = false; state.explorationHistoryComplete = false; state.explorationLoadedEventCount = 0; state.explorationLoadError = ""; state.explorationRequestId += 1; state.explorationRevision = 0; state.explorationNeedsSync = false; state.explorationPrecomputed = false; state.explorationMapStatus = "pending"; state.explorationProcessedEvents = 0; state.pendingApprovals = [];
     state.selectedEvents = []; state.selectedMessages = []; state.composerHistory = []; state.historyIndex = -1;
+    if (typeof renderExplorationMap === "function") renderExplorationMap();
     state.runtimeMetrics = { taskId: "", ttftMs: null, tpotMs: null, estimated: true, outputTokens: 0 };
   }
   state.selectedId = id; localStorage.setItem("codex-dashboard-session", id);
@@ -96,12 +117,13 @@ async function selectSession(id, openSocket = true) {
     setInspectorOpen(window.innerWidth >= 861 && !state.inspectorClosed);
     renderConversation();
   }
-  let fullTask, timeline, messages;
+  let fullTask, timeline, messages, activityMap;
   try {
-    [fullTask, timeline, messages] = await Promise.all([
+    [fullTask, timeline, messages, activityMap] = await Promise.all([
       api(`/tasks/${encodeURIComponent(id)}`, { signal: controller.signal }),
       api(`/tasks/${encodeURIComponent(id)}/timeline?limit=160`, { signal: controller.signal }),
       api(`/tasks/${encodeURIComponent(id)}/messages`, { signal: controller.signal }),
+      api(`/tasks/${encodeURIComponent(id)}/activity-map`, { signal: controller.signal }),
     ]);
   } catch (error) {
     if (error.name === "AbortError") return;
@@ -110,7 +132,11 @@ async function selectSession(id, openSocket = true) {
   if (requestId !== state.sessionRequestId || state.selectedId !== id) return;
   if (state.sessionAbortController === controller) state.sessionAbortController = null;
   state.selectedTask = fullTask;
+  state.explorationPrecomputed = true;
+  if (typeof applyActivityMapSnapshot === "function") applyActivityMapSnapshot(activityMap);
   state.selectedEvents = [...(timeline.items || []), ...(timeline.metrics || [])];
+  state.explorationEvents = [];
+  state.explorationNeedsSync = false;
   state.historyCursor = timeline.next_cursor || ""; state.historyHasMore = Boolean(timeline.has_more);
   replaceTaskMessages(messages);
   // A newly selected thread should open at its latest message. Consume this
@@ -418,11 +444,18 @@ function renderChat() {
   chatBuildQueued = false;
   const requestId = ++chatBuildRequestId;
   const taskId = state.selectedId;
+  const explorationRevision = state.explorationRevision;
+  const explorationSync = !state.explorationPrecomputed && state.explorationNeedsSync && (state.explorationOpen || !state.explorationNodes.length);
   chatWorker.postMessage({
     requestId,
+    taskId,
     events: state.selectedEvents,
+    explorationEvents: explorationSync ? state.explorationEvents : null,
+    explorationRevision,
     messages: state.selectedMessages,
     rawActivity: state.rawActivity,
+    taskRunning: ["running", "retrying", "queued"].includes(state.selectedTask?.status),
+    taskStatus: state.selectedTask?.status || "",
     labels: {
       fileChanged: uiLabel("fileChanged"), contextCompressed: uiLabel("contextCompressed"),
       terminalTurnStarted: uiLabel("terminalTurnStarted"), terminalTurnCompleted: uiLabel("terminalTurnCompleted"),
@@ -440,6 +473,9 @@ function renderChat() {
     const stale = state.selectedId !== taskId;
     if (!event.data.error && !stale) {
       const blocks = event.data.blocks || [];
+      if (!state.explorationPrecomputed) state.explorationNodes = event.data.explorationNodes || [];
+      if (explorationSync && state.explorationRevision === explorationRevision) state.explorationNeedsSync = false;
+      if (typeof renderExplorationMap === "function") renderExplorationMap({ liveUpdate: true });
       if (state.chatSelectionActive) {
         state.deferredChatBlocks = blocks;
         state.chatRenderDeferred = true;
@@ -466,6 +502,14 @@ function isHiddenProtocolNoise(payload) {
   if (type === "codex" && payload?.method) return !isTokenUsageProtocol(payload);
   const compact = type.replace(/[^a-z0-9]/g, "");
   return ["updated", "update", "diff", "output", "delta", "itemupdated", "itemdelta", "turnupdated", "turndiff"].includes(compact);
+}
+
+function isExplorationRelevantPayload(payload) {
+  const type = String(payload?.type || "").toLowerCase();
+  if (["usermessage", "browsermessage", "agentmessage", "plan", "planupdate", "filechange", "turn_completed", "turn_aborted", "externalturnstarted"].includes(type)) return true;
+  if (type.includes("reason")) return /(决定|确认|根因|证明|改用|转向|放弃|不可行|关键是|结论|选择|root cause|decid|confirmed|switch(?:ing)? to|not viable)/i.test(String(payload?.text || payload?.summary || ""));
+  if (type.includes("command") || type.includes("tool") || type.includes("mcp")) return String(payload?.status || "").toLowerCase() === "failed";
+  return false;
 }
 
 function chatIsNearBottom(stream = $("#chat-log")) {
@@ -1304,8 +1348,10 @@ function connectSocket(id, reconnect = false) {
     }
     if ((data.type === "task_patch" || data.type === "task_status") && state.selectedId === id) {
       const patch = data.type === "task_patch" ? (data.patch || {}) : (data.task || {});
+      const previousStatus = state.selectedTask?.status || "";
       state.selectedTask = { ...state.selectedTask, ...patch };
       mergeTask({ id, ...patch });
+      if (patch.status && patch.status !== previousStatus) { if (!state.explorationPrecomputed) { state.explorationRevision += 1; state.explorationNeedsSync = true; } scheduleRenderChat(); }
       renderConversation(false); renderSessionList(); renderSidebarStats();
       return;
     }
@@ -1313,10 +1359,35 @@ function connectSocket(id, reconnect = false) {
       if (!state.workspaceUploading) loadWorkspace(state.workspacePath || "");
       return;
     }
+    if (data.type === "activity_map_ready" && state.selectedId === id) {
+      loadPrecomputedActivityMap(true);
+      return;
+    }
+    if (data.type === "activity_map_failed" && state.selectedId === id) {
+      state.explorationMapStatus = "failed"; state.explorationLoadError = data.error || "活动图预计算失败"; renderExplorationMap();
+      return;
+    }
+    if (data.type === "activity_map_patch" && state.selectedId === id) {
+      const nodes = new Map((state.explorationNodes || []).map(node => [node.id, node]));
+      for (const node of data.upsert_nodes || []) nodes.set(node.id, node);
+      for (const nodeId of data.remove_node_ids || []) nodes.delete(nodeId);
+      state.explorationNodes = [...nodes.values()].sort((left, right) => Number(left.sequence || 0) - Number(right.sequence || 0));
+      state.explorationRevision = Number(data.revision || state.explorationRevision);
+      state.explorationMapStatus = "ready";
+      renderExplorationMap({ liveUpdate: true });
+      return;
+    }
     if (data.type === "event" && state.selectedId === id) {
       const protocolNoise = isHiddenProtocolNoise(data.payload);
       const tokenUsage = isTokenUsageProtocol(data.payload);
-      if (!protocolNoise || tokenUsage) state.selectedEvents.push({ session_id: data.session_id, ts: data.ts, stream: data.stream, payload: JSON.stringify(data.payload) });
+      if (!protocolNoise || tokenUsage) {
+        const timelineEvent = { session_id: data.session_id, ts: data.ts, stream: data.stream, payload: JSON.stringify(data.payload) };
+        state.selectedEvents.push(timelineEvent);
+        if (!state.explorationPrecomputed && !protocolNoise && state.explorationEvents.length) {
+          state.explorationEvents.push(timelineEvent); state.explorationLoadedEventCount = state.explorationEvents.length;
+          if (isExplorationRelevantPayload(data.payload)) { state.explorationRevision += 1; state.explorationNeedsSync = true; }
+        }
+      }
       if (tokenUsage) renderContextUsage();
       if (!protocolNoise) scheduleRuntimeMetricsRefresh();
       const phase = protocolNoise ? "" : activityPhase(data.payload);

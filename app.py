@@ -47,6 +47,7 @@ import pexpect
 from PIL import Image, ImageOps, ImageSequence, UnidentifiedImageError
 
 from codex_partner import APP_NAME, APP_VERSION
+from codex_partner.activity_graph import ActivityGraphStore, PROJECTION_VERSION, project_events, semantic_event
 from codex_partner.commands import SLASH_ALIASES, SLASH_COMMAND_BY_NAME, SLASH_COMMANDS, parse_slash_command
 from codex_partner.database import Database
 from codex_partner.app_server import AppServerClient
@@ -375,6 +376,9 @@ def canonicalize_task_thread_id(task_id: str, thread_id: str) -> str:
         connection.execute("UPDATE sessions SET task_id=? WHERE task_id=?", (thread_id, task_id))
         connection.execute("UPDATE events SET task_id=? WHERE task_id=?", (thread_id, task_id))
         connection.execute("UPDATE task_messages SET task_id=? WHERE task_id=?", (thread_id, task_id))
+        connection.execute("UPDATE activity_graphs SET task_id=? WHERE task_id=?", (thread_id, task_id))
+        connection.execute("UPDATE activity_nodes SET task_id=? WHERE task_id=?", (thread_id, task_id))
+        connection.execute("UPDATE activity_graph_seen SET task_id=? WHERE task_id=?", (thread_id, task_id))
         connection.commit()
     task_id_aliases[task_id] = thread_id
     if task_id in running:
@@ -433,6 +437,7 @@ def is_provider_failure(exc: Exception) -> bool:
 
 
 db = Database(DB_PATH, now)
+activity_graph_store = ActivityGraphStore(db)
 
 
 def reconcile_task_session_ids() -> None:
@@ -510,6 +515,7 @@ async def lifespan(_: FastAPI):
     app_shutting_down = False
     observer_task: Optional[asyncio.Task] = None
     inactive_trash_task: Optional[asyncio.Task] = None
+    activity_graph_task: Optional[asyncio.Task] = None
     reconcile_task_session_ids()
     try:
         await sync_native_threads()
@@ -531,6 +537,8 @@ async def lifespan(_: FastAPI):
     except Exception:
         # Retention cleanup is best effort and must never block the dashboard.
         pass
+    seed_activity_graph_builds()
+    activity_graph_task = asyncio.create_task(activity_graph_worker_loop())
     if AUTO_RESUME:
         await asyncio.sleep(0)
         for row in db.all("SELECT id FROM tasks WHERE status='queued' ORDER BY updated_at"):
@@ -565,6 +573,9 @@ async def lifespan(_: FastAPI):
         if inactive_trash_task:
             inactive_trash_task.cancel()
             await asyncio.gather(inactive_trash_task, return_exceptions=True)
+        if activity_graph_task:
+            activity_graph_task.cancel()
+            await asyncio.gather(activity_graph_task, return_exceptions=True)
         workers = list(task_workers.values())
         for worker in workers:
             worker.cancel()
@@ -588,6 +599,10 @@ overview_client_users: dict[WebSocket, str] = {}
 task_queues: dict[str, asyncio.Queue[str]] = {}
 task_workers: dict[str, asyncio.Task] = {}
 task_message_locks: dict[str, asyncio.Lock] = {}
+activity_graph_queue: asyncio.Queue[str] = asyncio.Queue()
+activity_graph_pending: set[str] = set()
+activity_graph_locks: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Lock]] = {}
+activity_graph_backlog: dict[str, list[dict[str, Any]]] = {}
 app_servers: dict[str, "AppServerClient"] = {}
 app_thread_bindings: dict[str, tuple[str, str, str]] = {}
 turn_waiters: dict[str, asyncio.Future] = {}
@@ -616,7 +631,23 @@ native_import_attempt_at = 0.0
 def appserver_key(provider: Optional[dict], task: Optional[dict] = None) -> str:
     provider_key = (provider or {}).get("id", "default")
     host = (task or {}).get("ssh_host") or ""
-    return f"ssh:{host}:{provider_key}" if host else provider_key
+    base = f"ssh:{host}:{provider_key}" if host else provider_key
+    return f"{base}:task:{task['id']}" if task and task.get("id") else base
+
+
+async def close_task_appserver(provider: Optional[dict], task: Optional[dict], client: Optional[AppServerClient]) -> None:
+    if not task or not client:
+        return
+    async with appserver_lock:
+        keys = [key for key, candidate in app_servers.items() if candidate is client]
+        if not keys:
+            return
+        for key in keys:
+            app_servers.pop(key, None)
+        for task_id, binding in list(app_thread_bindings.items()):
+            if binding and binding[0] in keys:
+                app_thread_bindings.pop(task_id, None)
+    await client.close()
 
 
 async def appserver_for(provider: Optional[dict], task: Optional[dict] = None) -> AppServerClient:
@@ -783,6 +814,21 @@ def native_rollout_rows() -> list[dict[str, str]]:
     except sqlite3.Error:
         return []
     return [{"thread_id": str(row[0]), "path": str(row[1])} for row in rows]
+
+
+def native_rollout_path(thread_id: str) -> str:
+    """Return one thread's rollout path without scanning every native thread."""
+    thread_id = safe_thread_id(thread_id)
+    path = CODEX_HOME / "state_5.sqlite"
+    if not thread_id or not path.is_file():
+        return ""
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        row = conn.execute("SELECT rollout_path FROM threads WHERE id=?", (thread_id,)).fetchone()
+        conn.close()
+    except sqlite3.Error:
+        return ""
+    return str(row[0]) if row and row[0] else ""
 
 
 def rollout_record_phase(record: dict) -> str:
@@ -1139,13 +1185,35 @@ def rollout_writer_pids(path: str, refresh: bool = False) -> set[int]:
     return set(writers)
 
 
+def process_tree_pids(roots: set[int]) -> set[int]:
+    """Return roots and their Linux descendants, tolerating process exits."""
+    found = {int(pid) for pid in roots if pid}
+    pending = list(found)
+    while pending:
+        pid = pending.pop()
+        try:
+            children = Path(f"/proc/{pid}/task/{pid}/children").read_text(encoding="ascii").split()
+        except OSError:
+            continue
+        for value in children:
+            try:
+                child = int(value)
+            except ValueError:
+                continue
+            if child not in found:
+                found.add(child)
+                pending.append(child)
+    return found
+
+
 def native_rollout_writer_pids(path: str, refresh: bool = False) -> set[int]:
     """Return writers outside this dashboard's app-server children."""
-    dashboard_pids = {
+    dashboard_roots = {
         client.process.pid
         for client in app_servers.values()
         if client.process and client.process.returncode is None
     }
+    dashboard_pids = process_tree_pids(dashboard_roots)
     return rollout_writer_pids(path, refresh=refresh) - dashboard_pids - {os.getpid()}
 
 
@@ -1336,6 +1404,12 @@ async def apply_external_turn_boundary(
     if boundary == "task_started":
         stamp = rollout_stamp(record, "started_at")
         task = task_or_404(task_id)
+        tracked = (external_turn_sets.get(task_id) or {}).get(turn_id) if turn_id else None
+        if tracked:
+            if path:
+                tracked["path"] = path
+            persist_external_task_status(task_id)
+            return
         dashboard_turn_id = str(appserver_turn_ids.get(task_id) or "")
         persisted_dashboard_turn = task.get("execution_source") == "dashboard" and str(task.get("execution_turn_id") or "") == turn_id
         persisted_dashboard_turn = persisted_dashboard_turn or has_persisted_dashboard_turn(task_id, turn_id)
@@ -1475,9 +1549,11 @@ async def process_native_rollout_record(task_id: str, thread_id: str, record: di
         return
     if record.get("type") == "event_msg" and payload_type == "thread_goal_updated":
         goal = record_payload.get("goal") or {}
+        stamp = rollout_stamp(record)
         db.execute(
-            "UPDATE tasks SET goal=?,goal_status=?,goal_tokens_used=?,updated_at=? WHERE id=?",
-            (goal.get("objective", ""), goal.get("status", "active"), int(goal.get("tokensUsed", 0) or 0), rollout_stamp(record), task_id),
+            "UPDATE tasks SET goal=?,goal_status=?,goal_tokens_used=?,goal_revision=goal_revision+1,goal_updated_at=?,updated_at=? "
+            "WHERE id=? AND COALESCE(goal_updated_at,'')<=?",
+            (goal.get("objective", ""), goal.get("status", "active"), int(goal.get("tokensUsed", 0) or 0), stamp, stamp, task_id, stamp),
         )
         await broadcast_task(task_id, {"type": "task_status", "task": task_or_404(task_id), "source": {"kind": "external_goal"}})
         return
@@ -1580,6 +1656,29 @@ async def refresh_native_rollouts() -> None:
         native_rollout_offsets.pop(path, None)
         native_rollout_remainders.pop(path, None)
         rollout_writer_cache.pop(os.path.realpath(path), None)
+
+
+async def refresh_live_external_turn(task_id: str) -> bool:
+    """Synchronously close the rollout-observer gap before starting a web turn."""
+    if external_turns.get(task_id):
+        return True
+    task = task_or_404(task_id)
+    if task.get("ssh_host"):
+        return False
+    thread_id = latest_codex_session(task)
+    if not thread_id:
+        return False
+    path = await asyncio.to_thread(native_rollout_path, thread_id)
+    if not path:
+        return False
+    _offset, boundary, phase = await asyncio.to_thread(inspect_rollout_boundary, path)
+    if not boundary or str((boundary.get("payload") or {}).get("type") or "") != "task_started":
+        return False
+    writers = await asyncio.to_thread(native_rollout_writer_pids, path, True)
+    if not writers:
+        return False
+    await apply_external_turn_boundary(task_id, thread_id, boundary, phase, initial=True, path=path)
+    return bool(external_turns.get(task_id))
 
 
 async def native_rollout_watch_loop() -> None:
@@ -2324,7 +2423,11 @@ async def sync_native_threads() -> dict:
             archived = bool(thread.get("archived") or native_settings.get("archived"))
             memory_mode = str(native_settings.get("memory_mode") or "enabled")
             provider_id = providers.get(model_provider)
-            existing = db.one("SELECT id,status,retry_forever,retry_explicit,provider_id,model FROM tasks WHERE codex_session_id=?", (thread_id,))
+            existing = db.one(
+                "SELECT id,name,name_revision,goal,goal_status,goal_tokens_used,goal_revision,status,"
+                "retry_forever,retry_explicit,provider_id,model FROM tasks WHERE codex_session_id=?",
+                (thread_id,),
+            )
             if existing:
                 # Imported native threads may be edited from the dashboard. Do
                 # not let the periodic native index sync erase those dashboard
@@ -2337,11 +2440,16 @@ async def sync_native_threads() -> dict:
                 existing_full = db.one("SELECT trashed FROM tasks WHERE id=?", (existing["id"],)) or {}
                 status = "trashed" if existing_full.get("trashed") else (existing["status"] if existing["status"] in {"running", "retrying", "queued", "stopped"} else ("archived" if archived else "available"))
                 retry_forever = int(existing.get("retry_forever", 0)) if existing.get("retry_explicit") else 0
+                if int(existing.get("goal_revision") or 0) > 0:
+                    objective = existing.get("goal", "")
+                    goal_status = existing.get("goal_status", "none")
+                    goal["tokensUsed"] = existing.get("goal_tokens_used", 0)
+                synced_title = existing.get("name") if int(existing.get("name_revision") or 0) > 0 else title[:160]
                 db.execute(
                     "UPDATE tasks SET name=?,prompt=?,goal=?,workspace=?,model=?,provider_id=?,goal_status=?,goal_tokens_used=?,"
                     "retry_forever=?,yolo=?,native=1,archived=?,memory_mode=?,status=?,updated_at=?,"
                     "last_interaction_at=CASE WHEN COALESCE(last_interaction_at,'')<? THEN ? ELSE last_interaction_at END WHERE id=?",
-                    (title[:160], prompt, objective, workspace, model, provider_id, goal_status, int(goal.get("tokensUsed", 0) or 0),
+                    (synced_title, prompt, objective, workspace, model, provider_id, goal_status, int(goal.get("tokensUsed", 0) or 0),
                      retry_forever, int(yolo), int(archived), memory_mode, status, updated_at, updated_at, updated_at, existing["id"]),
                 )
                 persist_native_thread_model(thread_id, model)
@@ -2521,11 +2629,27 @@ async def handle_appserver_notification(server_key: str, message: dict) -> None:
         goal = params.get("goal") or {}
         payload = {"type": "goal_updated", "goal": goal, "thread_id": thread_id}
         objective = goal.get("objective")
+        current_goal = task_or_404(task_id)
+        stale_objective = (
+            objective is not None
+            and int(current_goal.get("goal_revision") or 0) > 0
+            and str(objective or "") != str(current_goal.get("goal") or "")
+        )
+        if stale_objective:
+            # A running turn may report the objective it started with after a
+            # dashboard edit. Keep the newer durable revision authoritative.
+            payload["ignored_stale"] = True
+            objective = None
+        stamp = now()
         fields = ["goal_status=?", "goal_tokens_used=?", "updated_at=?"]
-        values: list[Any] = [goal.get("status", "active"), goal.get("tokensUsed", 0), now()]
+        values: list[Any] = [
+            current_goal.get("goal_status", "active") if stale_objective else goal.get("status", "active"),
+            current_goal.get("goal_tokens_used", 0) if stale_objective else goal.get("tokensUsed", 0),
+            stamp,
+        ]
         if objective is not None:
-            fields.insert(0, "goal=?")
-            values.insert(0, str(objective or ""))
+            fields[0:0] = ["goal=?", "goal_updated_at=?"]
+            values[0:0] = [str(objective or ""), stamp]
         values.append(task_id)
         db.execute(
             f"UPDATE tasks SET {','.join(fields)} WHERE id=?",
@@ -2936,6 +3060,11 @@ async def supervise_appserver_turn(
             await broadcast_task(task["id"], {"type": "message", "message_id": message_id, "status": "failed", "error": "Stopped by user" if stopped else error, "session_id": session_id})
         await broadcast_task(task["id"], {"type": "session", "session_id": session_id, "status": "stopped" if stopped else "failed", "error": error})
     finally:
+        if thread_id:
+            try:
+                await asyncio.wait_for(client.request("thread/unsubscribe", {"threadId": thread_id}), timeout=3)
+            except Exception:
+                pass
         if thread_id and turn_waiters.get(thread_id) is waiter:
             turn_waiters.pop(thread_id, None)
         if turn_id and appserver_turn_ids.get(task["id"]) == turn_id:
@@ -2951,6 +3080,7 @@ async def supervise_appserver_turn(
         # normal success path.  The worker will wait if another owner is still
         # active and dispatch queued rows as soon as this turn is idle.
         schedule_task_drain(task["id"])
+        await close_task_appserver(provider, task, client)
     await drain_task_messages(task["id"])
 
 
@@ -3703,6 +3833,7 @@ async def broadcast_profile(username: str, profile: Optional[dict] = None) -> No
 async def broadcast_task(task_id: str, payload: dict) -> None:
     """Fan out one canonical task event to every browser attached to the task."""
     overview_source = payload
+    schedule_activity_graph_event(task_id, overview_source)
     if payload.get("type") == "task_status":
         task = payload.get("task") or {}
         mutable_fields = {
@@ -4573,10 +4704,15 @@ async def patch_task(task_id: str, payload: TaskPatch, _: Any = Depends(auth)):
             continue
         sets.append(f"{key}=?")
         args.append(int(value) if key in {"yolo", "retry_forever"} else value)
+    stamp = now()
     if "retry_forever" in values:
         sets.append("retry_explicit=?")
         args.append(1)
-    sets.append("updated_at=?"); args.append(now()); args.append(task_id)
+    if "goal" in values:
+        sets.append("goal_revision=goal_revision+1")
+        sets.append("goal_updated_at=?")
+        args.append(stamp)
+    sets.append("updated_at=?"); args.append(stamp); args.append(task_id)
     db.execute(f"UPDATE tasks SET {','.join(sets)} WHERE id=?", tuple(args))
     result = task_or_404(task_id)
     if "model" in values:
@@ -4634,7 +4770,10 @@ async def patch_goal(task_id: str, payload: GoalPatch, _: Any = Depends(auth)):
         updates["goal_status"] = remote_goal.get("status") or payload.status
     if updates:
         sets = ",".join(f"{key}=?" for key in updates)
-        db.execute(f"UPDATE tasks SET {sets}, updated_at=? WHERE id=?", tuple(updates.values()) + (now(), task_id))
+        stamp = now()
+        revision_update = ",goal_revision=goal_revision+1,goal_updated_at=?" if payload.objective is not None else ""
+        revision_args = (stamp,) if payload.objective is not None else ()
+        db.execute(f"UPDATE tasks SET {sets}{revision_update}, updated_at=? WHERE id=?", tuple(updates.values()) + revision_args + (stamp, task_id))
     result = task_or_404(task_id)
     await broadcast_task(task_id, {"type": "task_status", "task": result, "source": {"kind": "goal"}})
     await broadcast_overview(task_id, {"kind": "goal"})
@@ -4806,6 +4945,153 @@ async def native_timeline_events(task: dict) -> tuple[list[dict], list[dict]]:
     merged = merge_native_with_rollout(native_events, persisted)
     merged.sort(key=history_event_key)
     return merged, metrics
+
+
+def schedule_activity_graph_build(task_id: str) -> None:
+    if not task_id or task_id in activity_graph_pending:
+        return
+    activity_graph_pending.add(task_id)
+    activity_graph_queue.put_nowait(task_id)
+
+
+def seed_activity_graph_builds() -> None:
+    rows = db.all(
+        "SELECT t.id FROM tasks t LEFT JOIN activity_graphs g ON g.task_id=t.id "
+        "WHERE t.trashed=0 AND (g.task_id IS NULL OR g.status!='ready' OR g.projection_version!=?) "
+        "ORDER BY CASE WHEN t.status IN ('running','retrying','queued') THEN 0 ELSE 1 END, t.updated_at DESC",
+        (PROJECTION_VERSION,),
+    )
+    for row in rows:
+        schedule_activity_graph_build(row["id"])
+
+
+async def activity_events_for_task(task: dict) -> list[dict]:
+    if task.get("native"):
+        events, _ = await native_timeline_events(task)
+        return events
+    return await asyncio.to_thread(
+        db.all,
+        "SELECT * FROM events WHERE task_id=? ORDER BY id",
+        (task["id"],),
+    )
+
+
+def activity_graph_lock(task_id: str) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    cached = activity_graph_locks.get(task_id)
+    if not cached or cached[0] is not loop:
+        cached = (loop, asyncio.Lock())
+        activity_graph_locks[task_id] = cached
+    return cached[1]
+
+
+async def apply_activity_graph_event(task_id: str, event: dict[str, Any]) -> None:
+    lock = activity_graph_lock(task_id)
+    async with lock:
+        snapshot = await asyncio.to_thread(activity_graph_store.snapshot, task_id)
+        if snapshot.get("status") != "ready" or int(snapshot.get("projection_version") or 0) != PROJECTION_VERSION:
+            activity_graph_backlog.setdefault(task_id, []).append(event)
+            schedule_activity_graph_build(task_id)
+            return
+        task = task_summary(task_id)
+        if not task:
+            return
+        patch = await asyncio.to_thread(
+            activity_graph_store.apply_event,
+            task_id,
+            event,
+            task.get("status") in {"running", "retrying", "queued"},
+            str(task.get("status") or ""),
+            now(),
+        )
+        if patch and patch.get("upsert_nodes"):
+            await broadcast_task(task_id, {"type": "activity_map_patch", **patch})
+
+
+async def apply_activity_graph_status(task_id: str, task: dict[str, Any]) -> None:
+    lock = activity_graph_lock(task_id)
+    async with lock:
+        patch = await asyncio.to_thread(
+            activity_graph_store.apply_status,
+            task_id,
+            task.get("status") in {"running", "retrying", "queued"},
+            str(task.get("status") or ""),
+            now(),
+        )
+        if patch:
+            await broadcast_task(task_id, {"type": "activity_map_patch", **patch})
+
+
+def schedule_activity_graph_event(task_id: str, payload: dict[str, Any]) -> None:
+    if payload.get("type") in {"task_status", "task_patch"}:
+        task = payload.get("task") or payload.get("patch") or {}
+        if task.get("status"):
+            asyncio.create_task(apply_activity_graph_status(task_id, task))
+        return
+    if payload.get("type") != "event":
+        return
+    event = {
+        "id": payload.get("id", ""),
+        "session_id": payload.get("session_id", ""),
+        "ts": payload.get("ts") or now(),
+        "stream": payload.get("stream") or "app-server",
+        "payload": payload.get("payload") or {},
+    }
+    if not semantic_event(event):
+        return
+    asyncio.create_task(apply_activity_graph_event(task_id, event))
+
+
+async def build_activity_graph(task_id: str) -> None:
+    task = task_summary(task_id)
+    if not task:
+        return
+    stamp = now()
+    await asyncio.to_thread(activity_graph_store.mark_building, task_id, stamp)
+    try:
+        events = await activity_events_for_task(task)
+        nodes, seen = await asyncio.to_thread(
+            project_events,
+            events,
+            task_running=task.get("status") in {"running", "retrying", "queued"},
+            task_status=str(task.get("status") or ""),
+            finalize=True,
+        )
+        revision = await asyncio.to_thread(activity_graph_store.replace, task_id, nodes, seen, len(events), now())
+        await broadcast_task(
+            task_id,
+            {"type": "activity_map_ready", "revision": revision, "node_count": len(nodes), "event_count": len(events)},
+        )
+        backlog = activity_graph_backlog.pop(task_id, [])
+        for event in backlog:
+            await apply_activity_graph_event(task_id, event)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        db.execute(
+            "UPDATE activity_graphs SET status='failed',error=?,updated_at=? WHERE task_id=?",
+            (str(exc)[:1000], now(), task_id),
+        )
+        await broadcast_task(task_id, {"type": "activity_map_failed", "error": str(exc)[:500]})
+
+
+async def activity_graph_worker_loop() -> None:
+    while True:
+        task_id = await activity_graph_queue.get()
+        try:
+            await build_activity_graph(task_id)
+        finally:
+            activity_graph_pending.discard(task_id)
+            activity_graph_queue.task_done()
+
+
+@app.get("/api/tasks/{task_id}/activity-map")
+async def task_activity_map(task_id: str, _: Any = Depends(auth)):
+    task = task_or_404(task_id)
+    snapshot = await asyncio.to_thread(activity_graph_store.snapshot, task["id"])
+    if snapshot.get("status") != "ready" or int(snapshot.get("projection_version") or 0) != PROJECTION_VERSION:
+        schedule_activity_graph_build(task["id"])
+    return snapshot
 
 
 @app.get("/api/tasks/{task_id}/timeline")
@@ -5301,6 +5587,10 @@ async def launch(
         await require_ssh_connection(task["ssh_host"], codex=True)
     else:
         require_codex()
+    if await refresh_live_external_turn(task_id):
+        persist_external_task_status(task_id, dashboard_active=False)
+        raise HTTPException(409, "Task is already running in a terminal Codex client")
+    task = task_or_404(task_id)
     if external_turns.get(task_id):
         persist_external_task_status(task_id, dashboard_active=False)
         raise HTTPException(409, "Task is already running in a terminal Codex client")
@@ -5560,14 +5850,24 @@ async def dispatch_task_message(task_id: str, message_id: str, _: Any = Depends(
         if row["status"] != "queued":
             return row
         current = task_or_404(task_id)
-        if current["status"] == "running" or task_id in running or task_id in appserver_turn_tasks:
-            result = await steer_task_message(
-                task_id,
-                TaskMessageIn(message=row["body"], client_message_id=message_id, delivery="auto"),
-            )
-            if result.get("status") == "queued" and result.get("error"):
-                result = {**result, "dispatch_error": result["error"]}
-            return result
+        task_busy = current["status"] in {"running", "retrying", "queued"} or task_id in running or task_id in appserver_turn_tasks or task_id in external_turns
+        if task_busy:
+            if dashboard_owns_task(task_id):
+                try:
+                    result = await steer_task_message(
+                        task_id,
+                        TaskMessageIn(message=row["body"], client_message_id=message_id, delivery="auto"),
+                    )
+                    if result.get("status") == "queued" and result.get("error"):
+                        result = {**result, "dispatch_error": result["error"]}
+                    return result
+                except HTTPException as exc:
+                    if exc.status_code != 409:
+                        raise
+            db.execute("UPDATE task_messages SET status='queued', started_at=NULL, error='' WHERE id=?", (message_id,))
+            schedule_task_drain(task_id)
+            queued = db.one("SELECT * FROM task_messages WHERE id=?", (message_id,)) or row
+            return {**queued, "waiting_for_turn": True, "execution_source": current.get("execution_source") or ("terminal" if task_id in external_turns else "dashboard")}
 
         stamp = now()
         db.execute("UPDATE task_messages SET status='dispatching', started_at=?, error='' WHERE id=?", (stamp, message_id))
@@ -5876,8 +6176,10 @@ async def run_thread_operation(task: dict, payload: OperationIn) -> dict:
         if not name:
             raise HTTPException(400, "rename requires a name in operation prompt or arguments")
         result = await client.request("thread/name/set", {"threadId": thread_id, "name": name[:160]})
-        db.execute("UPDATE tasks SET name=?,updated_at=? WHERE id=?", (name[:160], now(), task["id"]))
-        return {"ok": True, "operation": operation, "thread_id": thread_id, "result": result}
+        db.execute("UPDATE tasks SET name=?,name_revision=name_revision+1,updated_at=? WHERE id=?", (name[:160], now(), task["id"]))
+        renamed = task_or_404(task["id"])
+        await broadcast_task(task["id"], {"type": "task_status", "task": renamed, "source": {"kind": "thread", "operation": operation}})
+        return {"ok": True, "operation": operation, "thread_id": thread_id, "result": result, "task": renamed}
     if operation == "compact":
         result = await client.request("thread/compact/start", {"threadId": thread_id})
         return {"ok": True, "operation": operation, "thread_id": thread_id, "result": result}
@@ -5897,26 +6199,28 @@ async def run_thread_operation(task: dict, payload: OperationIn) -> dict:
     fork_id = str((result.get("thread") or {}).get("id") or "")
     if not fork_id:
         raise HTTPException(502, "Codex did not return the forked thread id")
-    if task.get("ssh_host"):
-        fork_task_id, stamp = str(uuid.uuid4()), now()
+    forked_task = db.one("SELECT * FROM tasks WHERE codex_session_id=?", (fork_id,))
+    if not forked_task:
+        fork_task_id = fork_id if not db.one("SELECT id FROM tasks WHERE id=?", (fork_id,)) else str(uuid.uuid4())
+        stamp = now()
+        fork_name = f"{task['name']} (fork)"[:160]
         db.execute(
-            "INSERT INTO tasks (id,name,prompt,goal,workspace,status,yolo,max_retries,retry_forever,retry_explicit,provider_id,model,context,codex_session_id,goal_status,created_at,updated_at,native,reasoning_effort,service_tier,personality,collaboration_mode,permission_profile,ssh_host) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (fork_task_id, f"{task['name']} 副本"[:160], task.get("prompt", ""), task.get("goal", ""), task["workspace"], "available",
-             int(task.get("yolo", 1)), int(task.get("max_retries", 3)), int(task.get("retry_forever", 0)), int(task.get("retry_explicit", 0)),
-             task.get("provider_id"), task.get("model", ""), task.get("context", ""), fork_id, task.get("goal_status", "none"), stamp, stamp, 0,
+            "INSERT INTO tasks (id,name,prompt,goal,workspace,status,yolo,max_retries,retry_forever,retry_explicit,provider_id,model,context,codex_session_id,goal_status,goal_tokens_used,goal_revision,goal_updated_at,created_at,updated_at,last_interaction_at,native,reasoning_effort,service_tier,personality,collaboration_mode,permission_profile,ssh_host,name_revision) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (fork_task_id, fork_name, task.get("prompt", ""), task.get("goal", ""), task["workspace"], "available",
+             int(task.get("yolo", 1)), int(task.get("max_retries", 3)), 0, 0,
+             task.get("provider_id"), task.get("model", ""), task.get("context", ""), fork_id, task.get("goal_status", "none"),
+             int(task.get("goal_tokens_used", 0)), 1 if task.get("goal") else 0, stamp if task.get("goal") else "", stamp, stamp, stamp,
+             0 if task.get("ssh_host") else 1,
              task.get("reasoning_effort", ""), task.get("service_tier", ""), task.get("personality", ""), task.get("collaboration_mode", "default"),
-             task.get("permission_profile", ""), task["ssh_host"]),
+             task.get("permission_profile", ""), task.get("ssh_host", ""), 1),
         )
         db.execute(
             "INSERT INTO sessions (id,task_id,status,attempt,provider_id,command,started_at,finished_at,exit_code,summary,codex_session_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (str(uuid.uuid4()), fork_task_id, "imported", 0, task.get("provider_id"), f"ssh {task['ssh_host']} codex thread/fork", stamp, stamp, 0, "Forked remote Codex thread", fork_id),
+            (str(uuid.uuid4()), fork_task_id, "imported", 0, task.get("provider_id"), "codex app-server thread/fork", stamp, stamp, 0, "Forked Codex thread", fork_id),
         )
-        forked_task = db.one("SELECT id,name,status FROM tasks WHERE id=?", (fork_task_id,))
+        forked_task = task_or_404(fork_task_id)
         await broadcast_overview(fork_task_id, {"type": "created", "forked": True})
-    else:
-        await sync_native_threads()
-        forked_task = db.one("SELECT id,name,status FROM tasks WHERE codex_session_id=?", (fork_id,))
     return {"ok": True, "operation": operation, "thread_id": thread_id, "fork_thread_id": fork_id, "task": forked_task}
 
 
@@ -6012,7 +6316,8 @@ async def execute_slash_command(task: dict, command: str, arg_text: str, args: l
         if first == "clear":
             if client and thread_id:
                 await client.request("thread/goal/clear", {"threadId": thread_id})
-            db.execute("UPDATE tasks SET goal='',goal_status='none',goal_tokens_used=0,retry_forever=0,retry_explicit=0,updated_at=? WHERE id=?", (now(), task["id"]))
+            stamp = now()
+            db.execute("UPDATE tasks SET goal='',goal_status='none',goal_tokens_used=0,goal_revision=goal_revision+1,goal_updated_at=?,retry_forever=0,retry_explicit=0,updated_at=? WHERE id=?", (stamp, stamp, task["id"]))
             return result_message(command, "Goal 已清除。")
         if first == "budget":
             if len(args) != 2 or not args[1].isdigit():
@@ -6045,7 +6350,8 @@ async def execute_slash_command(task: dict, command: str, arg_text: str, args: l
         if client and thread_id:
             goal = (await client.request("thread/goal/set", {"threadId": thread_id, "objective": objective, "status": status})).get("goal") or {}
             status = goal.get("status", status)
-        db.execute("UPDATE tasks SET goal=?,goal_status=?,goal_tokens_used=0,updated_at=? WHERE id=?", (objective, status, now(), task["id"]))
+        stamp = now()
+        db.execute("UPDATE tasks SET goal=?,goal_status=?,goal_tokens_used=0,goal_revision=goal_revision+1,goal_updated_at=?,updated_at=? WHERE id=?", (objective, status, stamp, stamp, task["id"]))
         return result_message(command, f"Goal 已设置：\n\n{objective}\n\n状态：`{status}`。", goal={"objective": objective, "status": status})
 
     if command == "status":
@@ -6457,7 +6763,7 @@ async def codex_operation(task_id: str, payload: OperationIn, _: Any = Depends(a
         return await run_thread_operation(task, payload)
     if payload.operation in {"memory-enable", "memory-disable"}:
         return await run_thread_operation(task, payload)
-    if task_id in running or task_id in appserver_turn_tasks or task["status"] == "running":
+    if payload.operation not in {"rename", "fork"} and (task_id in running or task_id in appserver_turn_tasks or task["status"] == "running"):
         raise HTTPException(409, "Task is already running")
     if task.get("ssh_host"):
         await require_ssh_connection(task["ssh_host"], codex=True)
