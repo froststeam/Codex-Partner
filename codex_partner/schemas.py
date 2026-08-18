@@ -121,6 +121,7 @@ class TaskMessageIn(BaseModel):
     message: str = Field(min_length=1, max_length=20000)
     client_message_id: Optional[str] = None
     delivery: Literal["auto", "queue"] = "auto"
+    takeover_terminal: bool = False
 
 
 class TaskMessagePatch(BaseModel):

@@ -371,6 +371,8 @@ const UI_LABELS = {
   approvalSubmit: { zh: "提交选择", en: "Submit", fr: "Envoyer", ja: "送信", ko: "제출" },
   approvalResolved: { zh: "授权选择已执行", en: "Approval choice applied", fr: "Choix appliqué", ja: "承認を反映しました", ko: "승인 선택을 적용했습니다" },
   queuedAfterTurn: { zh: "已加入队列，当前 turn 结束后自动发射", en: "Queued and will run after the current turn", fr: "Ajouté à la file et exécuté après le tour actuel", ja: "キューに追加し、現在のターン完了後に自動実行します", ko: "대기열에 추가되었으며 현재 turn 종료 후 자동 실행됩니다" },
+  terminalTakeoverConfirm: { zh: "Codex 正在终端中运行。停止终端 turn，并由网页发送这条消息？", en: "Codex is running in a terminal. Stop that turn and send this message from the web?", fr: "Codex s’exécute dans un terminal. Arrêter ce tour et envoyer ce message depuis le Web ?", ja: "Codex はターミナルで実行中です。ターミナルのターンを停止し、このメッセージを Web から送信しますか？", ko: "Codex가 터미널에서 실행 중입니다. 터미널 turn을 중지하고 웹에서 이 메시지를 보낼까요?" },
+  terminalTakeoverAction: { zh: "停止终端并发送", en: "Stop terminal and send", fr: "Arrêter et envoyer", ja: "停止して送信", ko: "터미널 중지 후 전송" },
   clearQueue: { zh: "清空所有排队消息", en: "Clear all queued messages", fr: "Vider tous les messages en attente", ja: "待機メッセージをすべて消去", ko: "대기 메시지 모두 지우기" },
   dispatchNow: { zh: "立即执行这条消息", en: "Run this message now", fr: "Exécuter ce message maintenant", ja: "このメッセージを今すぐ実行", ko: "이 메시지 지금 실행" },
   editQueuedAction: { zh: "编辑排队消息", en: "Edit queued message", fr: "Modifier le message en attente", ja: "待機メッセージを編集", ko: "대기 메시지 편집" },
@@ -677,18 +679,27 @@ async function api(path, options = {}, canPrompt = true) {
   if (response.status === 401 && canPrompt) {
     if (await requestSSHLogin()) return api(path, options, false);
   }
-  if (!response.ok) throw Error(await responseErrorMessage(response));
+  if (!response.ok) {
+    const detail = await responseErrorDetail(response);
+    const error = Error(detail.message);
+    error.code = detail.code || "";
+    error.detail = detail.detail;
+    throw error;
+  }
   return response.json();
 }
-async function responseErrorMessage(response) {
+async function responseErrorDetail(response) {
   const text = await response.text().catch(() => "");
   try {
     const payload = JSON.parse(text);
-    if (payload?.detail) return String(payload.detail);
+    if (payload?.detail && typeof payload.detail === "object") return { message: String(payload.detail.message || response.statusText || "Request failed"), code: String(payload.detail.code || ""), detail: payload.detail };
+    if (payload?.detail) return { message: String(payload.detail), code: "", detail: payload.detail };
   } catch (_) { /* Non-JSON server and proxy errors are expected here. */ }
   const plain = text.trim();
-  if (plain && !plain.startsWith("<") && plain.length <= 500) return plain;
-  return `${response.status} ${response.statusText || "Request failed"}`.trim();
+  return { message: plain && !plain.startsWith("<") && plain.length <= 500 ? plain : `${response.status} ${response.statusText || "Request failed"}`.trim(), code: "", detail: null };
+}
+async function responseErrorMessage(response) {
+  return (await responseErrorDetail(response)).message;
 }
 function toast(message) { const node = $("#toast"); node.textContent = message; node.classList.add("show"); setTimeout(() => node.classList.remove("show"), 2600); }
 async function copyText(value) {

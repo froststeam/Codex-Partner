@@ -1646,6 +1646,83 @@ process.stdout.write(JSON.stringify(browserMessages));
 
         asyncio.run(exercise())
 
+    def test_terminal_message_requires_takeover_confirmation_before_queueing(self):
+        task_id = "terminal-confirm-thread"
+        self.make_task(task_id, "running")
+        self.app.register_external_turn(task_id, {"turn_id": "terminal-turn", "path": "/tmp/terminal-turn.jsonl"})
+        try:
+            with mock.patch.object(self.app, "refresh_live_external_turn", new=mock.AsyncMock(return_value=False)):
+                with self.assertRaises(self.app.HTTPException) as raised:
+                    asyncio.run(self.app.post_task_message(
+                        task_id,
+                        self.app.TaskMessageIn(message="take over", client_message_id="terminal-confirm-message"),
+                        None,
+                    ))
+            self.assertEqual(409, raised.exception.status_code)
+            self.assertEqual("terminal_turn_active", raised.exception.detail["code"])
+            self.assertIsNone(self.app.db.one("SELECT id FROM task_messages WHERE id='terminal-confirm-message'"))
+        finally:
+            self.app.clear_external_turns(task_id)
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_confirmed_terminal_takeover_stops_terminal_then_queues_message(self):
+        task_id = "terminal-takeover-thread"
+        self.make_task(task_id, "running")
+        self.app.register_external_turn(task_id, {"turn_id": "terminal-turn", "path": "/tmp/terminal-turn.jsonl"})
+        try:
+            with mock.patch.object(self.app, "refresh_live_external_turn", new=mock.AsyncMock(return_value=False)), \
+                 mock.patch.object(self.app, "stop_terminal_for_web_takeover", new=mock.AsyncMock(return_value=True)) as stop, \
+                 mock.patch.object(self.app, "schedule_task_drain") as drain:
+                result = asyncio.run(self.app.post_task_message(
+                    task_id,
+                    self.app.TaskMessageIn(
+                        message="take over",
+                        client_message_id="terminal-takeover-message",
+                        takeover_terminal=True,
+                    ),
+                    None,
+                ))
+            stop.assert_awaited_once_with(task_id)
+            drain.assert_called_once_with(task_id)
+            self.assertEqual("queued", result["status"])
+        finally:
+            self.app.clear_external_turns(task_id)
+            self.app.db.execute("DELETE FROM task_messages WHERE task_id=?", (task_id,))
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_terminal_takeover_clears_external_owner_without_auto_resume_race(self):
+        task_id = "terminal-takeover-stop-thread"
+        session_id = "external-terminal-takeover-session"
+        self.make_task(task_id, "running")
+        self.app.db.execute(
+            "INSERT INTO sessions (id,task_id,status,attempt,command,started_at,codex_session_id) VALUES (?,?,?,?,?,?,?)",
+            (session_id, task_id, "running", 1, "codex resume", self.app.now(), task_id),
+        )
+        self.app.register_external_turn(task_id, {
+            "turn_id": "terminal-turn",
+            "session_id": session_id,
+            "path": "/tmp/terminal-takeover.jsonl",
+            "started_at": self.app.now(),
+        })
+        try:
+            with mock.patch.object(self.app, "refresh_live_external_turn", new=mock.AsyncMock(return_value=False)), \
+                 mock.patch.object(self.app, "interrupt_browser_terminal", new=mock.AsyncMock()) as browser_interrupt, \
+                 mock.patch.object(self.app, "interrupt_rollout_writers", return_value={900}) as writer_interrupt, \
+                 mock.patch.object(self.app, "schedule_task_drain") as drain:
+                stopped = asyncio.run(self.app.stop_terminal_for_web_takeover(task_id))
+            self.assertTrue(stopped)
+            browser_interrupt.assert_awaited_once_with(task_id)
+            writer_interrupt.assert_called_once_with("/tmp/terminal-takeover.jsonl")
+            drain.assert_not_called()
+            self.assertNotIn(task_id, self.app.external_turns)
+            self.assertEqual("stopped", self.app.task_or_404(task_id)["status"])
+            self.assertEqual("stopped", self.app.db.one("SELECT status FROM sessions WHERE id=?", (session_id,))["status"])
+            event = self.app.db.one("SELECT payload FROM events WHERE session_id=? ORDER BY id DESC LIMIT 1", (session_id,))
+            self.assertEqual("turn_aborted", json.loads(event["payload"])["type"])
+        finally:
+            self.app.clear_external_turns(task_id)
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
     def test_binary_dump_is_rejected_before_queueing(self):
         task_id = "binary-dump-thread"
         self.make_task(task_id, "available")
@@ -2885,7 +2962,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertNotIn('id="stop-generation"', html)
         self.assertIn('$("#composer-model-select")', conversation_js)
         self.assertIn('当前 API ·', (static / "core.js").read_text(encoding="utf-8"))
-        self.assertIn('const delivery = mode === "queue" || activeTurn ? "queue" : "auto"', app_js)
+        self.assertIn('const delivery = mode === "queue" || (activeTurn && !takeoverTerminal) ? "queue" : "auto"', app_js)
         self.assertIn('function toggleGoalRun()', app_js)
         self.assertIn('id="composer-model-select"', html)
         self.assertIn('id="composer-effort-select"', html)
@@ -3104,15 +3181,17 @@ process.stdout.write(JSON.stringify(browserMessages));
         static = Path(__file__).resolve().parents[1] / "static"
         app_js = (static / "app.js").read_text(encoding="utf-8")
         conversation_js = (static / "conversation.js").read_text(encoding="utf-8")
+        core_js = (static / "core.js").read_text(encoding="utf-8")
         self.assertIn("button.dataset.queueDispatch", app_js)
         self.assertIn('button.dataset.dispatching === "1"', app_js)
         self.assertIn("result.dispatch_error", app_js)
-        self.assertIn('const delivery = mode === "queue" || activeTurn ? "queue" : "auto"', app_js)
+        self.assertIn('const delivery = mode === "queue" || (activeTurn && !takeoverTerminal) ? "queue" : "auto"', app_js)
         self.assertIn('toast(uiLabel("queuedAfterTurn"))', app_js)
-        self.assertNotIn('if (mode === "codex" && activeTurn)', app_js)
+        self.assertIn('uiLabel("terminalTakeoverConfirm")', app_js)
+        self.assertIn('takeover_terminal: true', app_js)
+        self.assertIn('error.code = detail.code', core_js)
         self.assertIn("data-queue-dispatch", conversation_js)
         self.assertIn("queued-error", conversation_js)
-        core_js = (static / "core.js").read_text(encoding="utf-8")
         self.assertIn("function taskIsRunningGroup", core_js)
         self.assertIn('["running", "retrying", "queued"].includes', core_js)
         self.assertIn("taskSortName(a).localeCompare", core_js)

@@ -1271,11 +1271,13 @@ def interrupt_rollout_writers(path: str) -> set[int]:
     writers = native_rollout_writer_pids(path, refresh=True)
     for pid in writers:
         try:
-            command = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
-            if b"app-server" in command:
-                continue
+            command_path = Path(f"/proc/{pid}/cmdline")
+            if command_path.is_file():
+                command = command_path.read_bytes().replace(b"\0", b" ")
+                if b"app-server" in command:
+                    continue
             os.kill(pid, signal.SIGINT)
-        except OSError:
+        except (OSError, ValueError):
             continue
     return writers
 
@@ -4305,6 +4307,61 @@ async def enqueue_task_message(task_id: str, body: str, client_message_id: Optio
     return db.one("SELECT * FROM task_messages WHERE id=?", (message_id,)) or {"id": message_id, "status": "queued"}
 
 
+async def terminal_turn_active(task_id: str) -> bool:
+    """Refresh and report a terminal-owned turn without confusing dashboard work."""
+    await refresh_live_external_turn(task_id)
+    return bool(refresh_external_primary(task_id)) and not dashboard_owns_task(task_id)
+
+
+async def interrupt_browser_terminal(task_id: str) -> None:
+    """Send Ctrl+C to the foreground process in every matching browser terminal."""
+    matching = [session for session in terminal_sessions.values() if session.get("task_id") == task_id and not session.get("closed")]
+    for session in matching:
+        try:
+            if process := session.get("windows_pty"):
+                await asyncio.to_thread(process.write, "\x03")
+            elif session.get("fd") is not None:
+                os.write(session["fd"], b"\x03")
+        except (EOFError, OSError):
+            continue
+
+
+async def stop_terminal_for_web_takeover(task_id: str) -> bool:
+    """Stop terminal-owned turns without letting Goal auto-resume race the web message."""
+    await refresh_live_external_turn(task_id)
+    tracked = list((external_turn_sets.get(task_id) or {}).values())
+    if not tracked:
+        return False
+    await interrupt_browser_terminal(task_id)
+    paths = {str(turn.get("path") or "") for turn in tracked} - {""}
+    for path in paths:
+        await asyncio.to_thread(interrupt_rollout_writers, path)
+    clear_external_turns(task_id)
+    stamp = now()
+    for external in tracked:
+        session_id = str(external.get("session_id") or "")
+        if not session_id:
+            continue
+        db.execute(
+            "UPDATE sessions SET status='stopped',finished_at=COALESCE(finished_at,?),exit_code=COALESCE(exit_code,130),summary='Terminal turn stopped for web takeover' WHERE id=?",
+            (stamp, session_id),
+        )
+        payload = {"type": "turn_aborted", "status": "stopped", "reason": "Web session took over the terminal turn"}
+        db.execute(
+            "INSERT INTO events (session_id,ts,stream,payload) VALUES (?,?,?,?)",
+            (session_id, stamp, "rollout", json.dumps(payload, ensure_ascii=False)),
+        )
+        await broadcast_task(task_id, {"type": "event", "session_id": session_id, "stream": "rollout", "payload": payload, "ts": stamp})
+    db.execute(
+        "UPDATE tasks SET status='stopped',active_session_id=NULL,execution_source='',execution_turn_id='',run_mode='',last_error='',updated_at=? WHERE id=?",
+        (stamp, task_id),
+    )
+    result = task_or_404(task_id)
+    await broadcast_task(task_id, {"type": "task_status", "task": result, "source": {"kind": "web_takeover"}})
+    await broadcast_overview(task_id, {"kind": "web_takeover"})
+    return True
+
+
 def command_event_session(task: dict) -> str:
     if task.get("active_session_id") and db.one("SELECT id FROM sessions WHERE id=?", (task["active_session_id"],)):
         return task["active_session_id"]
@@ -5933,6 +5990,16 @@ async def clear_task_messages(task_id: str, _: Any = Depends(auth)):
 
 @app.post("/api/tasks/{task_id}/messages")
 async def post_task_message(task_id: str, payload: TaskMessageIn, _: Any = Depends(auth)):
+    if payload.delivery != "queue" and await terminal_turn_active(task_id):
+        if not payload.takeover_terminal:
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "terminal_turn_active",
+                    "message": "Codex 正在终端中运行。是否停止终端 turn 并由网页接管？",
+                },
+            )
+        await stop_terminal_for_web_takeover(task_id)
     return await enqueue_task_message(task_id, payload.message, payload.client_message_id, payload.delivery)
 
 
