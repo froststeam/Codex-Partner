@@ -1697,6 +1697,30 @@ process.stdout.write(JSON.stringify(browserMessages));
 
         asyncio.run(exercise())
 
+    def test_dispatch_waits_for_external_terminal_turn_instead_of_returning_409(self):
+        task_id = "external-terminal-queue"
+        message_id = "external-terminal-message"
+        self.make_task(task_id, "running")
+        stamp = self.app.now()
+        self.app.db.execute(
+            "INSERT INTO task_messages (id,task_id,body,status,created_at) VALUES (?,?,?,?,?)",
+            (message_id, task_id, "run after terminal", "queued", stamp),
+        )
+        self.app.external_turns[task_id] = {"turn_id": "terminal-turn"}
+        try:
+            with mock.patch.object(self.app, "schedule_task_drain") as drain, \
+                 mock.patch.object(self.app, "steer_task_message", new=mock.AsyncMock()) as steer:
+                result = asyncio.run(self.app.dispatch_task_message(task_id, message_id, None))
+            self.assertTrue(result["waiting_for_turn"])
+            self.assertEqual("queued", result["status"])
+            self.assertEqual("terminal", result["execution_source"])
+            drain.assert_called_once_with(task_id)
+            steer.assert_not_awaited()
+        finally:
+            self.app.external_turns.pop(task_id, None)
+            self.app.db.execute("DELETE FROM task_messages WHERE task_id=?", (task_id,))
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
     def test_goal_retry_defaults_off_and_manual_override_is_preserved(self):
         task_id = "goal-retry-thread"
         self.make_task(task_id, "available")
@@ -2760,7 +2784,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('runOperation("fork", button)', app_js)
         self.assertIn('uiLabel("sessionRenamed")', app_js)
         self.assertIn('uiLabel("sessionDuplicated")', app_js)
-        self.assertIn('/app.js?v=20260818-thread-ops-i18n', html)
+        self.assertIn('/app.js?v=20260818-terminal-queue', html)
         self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
@@ -2996,7 +3020,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('/conversation.js?v=20260818-session-pointer-switch-v2', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
-        self.assertIn('/app.js?v=20260818-thread-ops-i18n', html)
+        self.assertIn('/app.js?v=20260818-terminal-queue', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
         self.assertIn('/styles.css?v=20260818-thread-ops-i18n', html)
         self.assertIn('/vendor/katex/katex.min.css', html)
@@ -3090,7 +3114,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertNotIn("stream.scrollTop = target * state.chatAverageHeight", conversation)
         self.assertIn("function syncPageVisibility", app_js)
         self.assertIn('/styles.css?v=20260818-thread-ops-i18n', html)
-        self.assertIn('/app.js?v=20260818-thread-ops-i18n', html)
+        self.assertIn('/app.js?v=20260818-terminal-queue', html)
 
     def test_optimistic_queue_messages_survive_authoritative_refresh(self):
         static = Path(__file__).resolve().parents[1] / "static"

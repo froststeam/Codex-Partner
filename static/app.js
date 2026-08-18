@@ -65,7 +65,8 @@ document.addEventListener("click", async event => {
       try {
         const result = await api(`/tasks/${state.selectedId}/messages/${button.dataset.queueDispatch}/dispatch`, { method: "POST" });
         upsertTaskMessage(result); renderQueuedMessages(); scheduleRenderChat();
-        if (result.dispatch_error) toast(`立即执行失败，仍在队列：${result.dispatch_error}`);
+        if (result.waiting_for_turn) toast(uiLabel("queuedAfterTurn"));
+        else if (result.dispatch_error) toast(`立即执行失败，仍在队列：${result.dispatch_error}`);
         else toast(result.status === "steered" ? "已插入当前 Codex turn" : "已立即执行");
       } catch (error) {
         button.disabled = false; button.textContent = "▶"; toast(error.message);

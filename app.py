@@ -5758,14 +5758,24 @@ async def dispatch_task_message(task_id: str, message_id: str, _: Any = Depends(
         if row["status"] != "queued":
             return row
         current = task_or_404(task_id)
-        if current["status"] == "running" or task_id in running or task_id in appserver_turn_tasks:
-            result = await steer_task_message(
-                task_id,
-                TaskMessageIn(message=row["body"], client_message_id=message_id, delivery="auto"),
-            )
-            if result.get("status") == "queued" and result.get("error"):
-                result = {**result, "dispatch_error": result["error"]}
-            return result
+        task_busy = current["status"] in {"running", "retrying", "queued"} or task_id in running or task_id in appserver_turn_tasks or task_id in external_turns
+        if task_busy:
+            if dashboard_owns_task(task_id):
+                try:
+                    result = await steer_task_message(
+                        task_id,
+                        TaskMessageIn(message=row["body"], client_message_id=message_id, delivery="auto"),
+                    )
+                    if result.get("status") == "queued" and result.get("error"):
+                        result = {**result, "dispatch_error": result["error"]}
+                    return result
+                except HTTPException as exc:
+                    if exc.status_code != 409:
+                        raise
+            db.execute("UPDATE task_messages SET status='queued', started_at=NULL, error='' WHERE id=?", (message_id,))
+            schedule_task_drain(task_id)
+            queued = db.one("SELECT * FROM task_messages WHERE id=?", (message_id,)) or row
+            return {**queued, "waiting_for_turn": True, "execution_source": current.get("execution_source") or ("terminal" if task_id in external_turns else "dashboard")}
 
         stamp = now()
         db.execute("UPDATE task_messages SET status='dispatching', started_at=?, error='' WHERE id=?", (stamp, message_id))
