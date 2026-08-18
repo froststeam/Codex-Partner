@@ -49,7 +49,7 @@ For access from other devices, set `CODEX_DASHBOARD_HOST=0.0.0.0`. Codex Partner
 ## Docker
 
 ```bash
-docker build -t codex-partner:0.0.4 .
+docker build -t codex-partner:0.0.5 .
 docker run -d --name codex-partner \
   -p 8787:8787 \
   --add-host=host.docker.internal:host-gateway \
@@ -58,7 +58,7 @@ docker run -d --name codex-partner \
   -v codex-partner-data:/var/lib/codex-partner \
   -v codex-home:/home/codex/.codex \
   -v codex-workspace:/workspace \
-  codex-partner:0.0.4
+  codex-partner:0.0.5
 docker exec -it codex-partner codex login
 ```
 

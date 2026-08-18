@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import base64
 import importlib
 import io
@@ -40,6 +41,13 @@ class RunningStateTests(unittest.TestCase):
             "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (task_id, task_id, "prompt", self.temp.name, status, 1, stamp, stamp, 1, task_id, active_session_id),
         )
+
+    def test_python_sources_parse_with_python_310_grammar(self):
+        root = Path(__file__).resolve().parents[1]
+        sources = [root / "app.py", *(root / "codex_partner").rglob("*.py"), *(root / "tests").rglob("*.py")]
+        for source in sources:
+            with self.subTest(source=source.relative_to(root)):
+                ast.parse(source.read_text(encoding="utf-8"), filename=str(source), feature_version=(3, 10))
 
     def test_native_history_accepts_iso_timestamps(self):
         stamp = self.app.native_stamp("2026-08-16T01:27:10.093564Z", "fallback")
@@ -1020,6 +1028,13 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
 
     def test_worker_hides_codex_environment_context_from_user_messages(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
+        hidden_context = json.dumps("<environment_context>\n<current_date>2026-08-18</current_date>\n</environment_context>")
+        mixed_context = json.dumps("keep this request\n<environment_context>\n<timezone>Asia/Shanghai</timezone>\n</environment_context>")
+        internal_context = json.dumps('<codex_internal_context source="system">secret</codex_internal_context>')
+        permissions = json.dumps("<permissions instructions>hidden</permissions instructions>")
+        answer = json.dumps("visible answer\n<oai-mem-citation><rollout_ids>hidden</rollout_ids></oai-mem-citation>")
+        delta_start = json.dumps("after\n<environment_context><current_date>")
+        delta_end = json.dumps("hidden</current_date></environment_context>")
         script = f"""
 const fs = require("fs");
 const vm = require("vm");
@@ -1027,13 +1042,13 @@ const context = {{ self: {{ postMessage() {{}} }} }};
 vm.createContext(context);
 vm.runInContext(fs.readFileSync({json.dumps(str(worker))}, "utf8"), context);
 const blocks = context.buildBlocks([
-  {{ id: "only-hidden", stream: "rollout", payload: JSON.stringify({{ type: "userMessage", text: {json.dumps("<environment_context>\n<current_date>2026-08-18</current_date>\n</environment_context>")} }}) }},
-  {{ id: "mixed", stream: "rollout", payload: JSON.stringify({{ type: "userMessage", text: {json.dumps("keep this request\n<environment_context>\n<timezone>Asia/Shanghai</timezone>\n</environment_context>")} }}) }},
-  {{ id: "internal", stream: "rollout", payload: JSON.stringify({{ type: "userMessage", text: {json.dumps('<codex_internal_context source="system">secret</codex_internal_context>')} }}) }},
-  {{ id: "permissions", stream: "rollout", payload: JSON.stringify({{ type: "userMessage", text: {json.dumps('<permissions instructions>hidden</permissions instructions>')} }}) }},
-  {{ id: "answer", stream: "rollout", payload: JSON.stringify({{ type: "agentMessage", text: {json.dumps('visible answer\n<oai-mem-citation><rollout_ids>hidden</rollout_ids></oai-mem-citation>')} }}) }},
-  {{ id: "delta-1", stream: "rollout", payload: JSON.stringify({{ type: "agent_delta", item_id: "split", delta: {json.dumps('after\n<environment_context><current_date>')} }}) }},
-  {{ id: "delta-2", stream: "rollout", payload: JSON.stringify({{ type: "agent_delta", item_id: "split", delta: {json.dumps('hidden</current_date></environment_context>')} }}) }},
+  {{ id: "only-hidden", stream: "rollout", payload: JSON.stringify({{ type: "userMessage", text: {hidden_context} }}) }},
+  {{ id: "mixed", stream: "rollout", payload: JSON.stringify({{ type: "userMessage", text: {mixed_context} }}) }},
+  {{ id: "internal", stream: "rollout", payload: JSON.stringify({{ type: "userMessage", text: {internal_context} }}) }},
+  {{ id: "permissions", stream: "rollout", payload: JSON.stringify({{ type: "userMessage", text: {permissions} }}) }},
+  {{ id: "answer", stream: "rollout", payload: JSON.stringify({{ type: "agentMessage", text: {answer} }}) }},
+  {{ id: "delta-1", stream: "rollout", payload: JSON.stringify({{ type: "agent_delta", item_id: "split", delta: {delta_start} }}) }},
+  {{ id: "delta-2", stream: "rollout", payload: JSON.stringify({{ type: "agent_delta", item_id: "split", delta: {delta_end} }}) }},
 ], false, {{}});
 process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
 """
