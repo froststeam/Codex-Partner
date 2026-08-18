@@ -2083,6 +2083,42 @@ process.stdout.write(JSON.stringify(browserMessages));
 
         asyncio.run(exercise())
 
+    def test_task_appservers_are_isolated_and_release_only_their_writer(self):
+        provider = {"id": "test-provider"}
+        first = {"id": "thread-one", "ssh_host": ""}
+        second = {"id": "thread-two", "ssh_host": ""}
+        first_key = self.app.appserver_key(provider, first)
+        second_key = self.app.appserver_key(provider, second)
+        self.assertNotEqual(first_key, second_key)
+        self.assertEqual("test-provider", self.app.appserver_key(provider, None))
+
+        class Client:
+            closed = False
+
+            async def close(self):
+                self.closed = True
+
+        async def exercise():
+            first_client, second_client = Client(), Client()
+            self.app.app_servers[first_key] = first_client
+            self.app.app_servers[second_key] = second_client
+            self.app.app_thread_bindings[first["id"]] = (first_key, first["id"], "session-one")
+            self.app.app_thread_bindings[second["id"]] = (second_key, second["id"], "session-two")
+            try:
+                await self.app.close_task_appserver(provider, first, first_client)
+                self.assertTrue(first_client.closed)
+                self.assertNotIn(first_key, self.app.app_servers)
+                self.assertNotIn(first["id"], self.app.app_thread_bindings)
+                self.assertIs(second_client, self.app.app_servers[second_key])
+                self.assertIn(second["id"], self.app.app_thread_bindings)
+            finally:
+                self.app.app_servers.pop(first_key, None)
+                self.app.app_servers.pop(second_key, None)
+                self.app.app_thread_bindings.pop(first["id"], None)
+                self.app.app_thread_bindings.pop(second["id"], None)
+
+        asyncio.run(exercise())
+
     def test_remote_thread_fork_keeps_ssh_host_and_workspace(self):
         task_id = "remote-fork-source"
         self.make_task(task_id, "available")

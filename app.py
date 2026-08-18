@@ -631,7 +631,22 @@ native_import_attempt_at = 0.0
 def appserver_key(provider: Optional[dict], task: Optional[dict] = None) -> str:
     provider_key = (provider or {}).get("id", "default")
     host = (task or {}).get("ssh_host") or ""
-    return f"ssh:{host}:{provider_key}" if host else provider_key
+    base = f"ssh:{host}:{provider_key}" if host else provider_key
+    return f"{base}:task:{task['id']}" if task and task.get("id") else base
+
+
+async def close_task_appserver(provider: Optional[dict], task: Optional[dict], client: Optional[AppServerClient]) -> None:
+    if not task or not client:
+        return
+    key = appserver_key(provider, task)
+    async with appserver_lock:
+        if app_servers.get(key) is not client:
+            return
+        app_servers.pop(key, None)
+        for task_id, binding in list(app_thread_bindings.items()):
+            if binding and binding[0] == key:
+                app_thread_bindings.pop(task_id, None)
+    await client.close()
 
 
 async def appserver_for(provider: Optional[dict], task: Optional[dict] = None) -> AppServerClient:
@@ -2978,6 +2993,11 @@ async def supervise_appserver_turn(
             await broadcast_task(task["id"], {"type": "message", "message_id": message_id, "status": "failed", "error": "Stopped by user" if stopped else error, "session_id": session_id})
         await broadcast_task(task["id"], {"type": "session", "session_id": session_id, "status": "stopped" if stopped else "failed", "error": error})
     finally:
+        if thread_id:
+            try:
+                await asyncio.wait_for(client.request("thread/unsubscribe", {"threadId": thread_id}), timeout=3)
+            except Exception:
+                pass
         if thread_id and turn_waiters.get(thread_id) is waiter:
             turn_waiters.pop(thread_id, None)
         if turn_id and appserver_turn_ids.get(task["id"]) == turn_id:
@@ -2993,6 +3013,7 @@ async def supervise_appserver_turn(
         # normal success path.  The worker will wait if another owner is still
         # active and dispatch queued rows as soon as this turn is idle.
         schedule_task_drain(task["id"])
+        await close_task_appserver(provider, task, client)
     await drain_task_messages(task["id"])
 
 
