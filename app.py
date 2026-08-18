@@ -638,13 +638,14 @@ def appserver_key(provider: Optional[dict], task: Optional[dict] = None) -> str:
 async def close_task_appserver(provider: Optional[dict], task: Optional[dict], client: Optional[AppServerClient]) -> None:
     if not task or not client:
         return
-    key = appserver_key(provider, task)
     async with appserver_lock:
-        if app_servers.get(key) is not client:
+        keys = [key for key, candidate in app_servers.items() if candidate is client]
+        if not keys:
             return
-        app_servers.pop(key, None)
+        for key in keys:
+            app_servers.pop(key, None)
         for task_id, binding in list(app_thread_bindings.items()):
-            if binding and binding[0] == key:
+            if binding and binding[0] in keys:
                 app_thread_bindings.pop(task_id, None)
     await client.close()
 
@@ -813,6 +814,21 @@ def native_rollout_rows() -> list[dict[str, str]]:
     except sqlite3.Error:
         return []
     return [{"thread_id": str(row[0]), "path": str(row[1])} for row in rows]
+
+
+def native_rollout_path(thread_id: str) -> str:
+    """Return one thread's rollout path without scanning every native thread."""
+    thread_id = safe_thread_id(thread_id)
+    path = CODEX_HOME / "state_5.sqlite"
+    if not thread_id or not path.is_file():
+        return ""
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        row = conn.execute("SELECT rollout_path FROM threads WHERE id=?", (thread_id,)).fetchone()
+        conn.close()
+    except sqlite3.Error:
+        return ""
+    return str(row[0]) if row and row[0] else ""
 
 
 def rollout_record_phase(record: dict) -> str:
@@ -1169,13 +1185,35 @@ def rollout_writer_pids(path: str, refresh: bool = False) -> set[int]:
     return set(writers)
 
 
+def process_tree_pids(roots: set[int]) -> set[int]:
+    """Return roots and their Linux descendants, tolerating process exits."""
+    found = {int(pid) for pid in roots if pid}
+    pending = list(found)
+    while pending:
+        pid = pending.pop()
+        try:
+            children = Path(f"/proc/{pid}/task/{pid}/children").read_text(encoding="ascii").split()
+        except OSError:
+            continue
+        for value in children:
+            try:
+                child = int(value)
+            except ValueError:
+                continue
+            if child not in found:
+                found.add(child)
+                pending.append(child)
+    return found
+
+
 def native_rollout_writer_pids(path: str, refresh: bool = False) -> set[int]:
     """Return writers outside this dashboard's app-server children."""
-    dashboard_pids = {
+    dashboard_roots = {
         client.process.pid
         for client in app_servers.values()
         if client.process and client.process.returncode is None
     }
+    dashboard_pids = process_tree_pids(dashboard_roots)
     return rollout_writer_pids(path, refresh=refresh) - dashboard_pids - {os.getpid()}
 
 
@@ -1366,6 +1404,12 @@ async def apply_external_turn_boundary(
     if boundary == "task_started":
         stamp = rollout_stamp(record, "started_at")
         task = task_or_404(task_id)
+        tracked = (external_turn_sets.get(task_id) or {}).get(turn_id) if turn_id else None
+        if tracked:
+            if path:
+                tracked["path"] = path
+            persist_external_task_status(task_id)
+            return
         dashboard_turn_id = str(appserver_turn_ids.get(task_id) or "")
         persisted_dashboard_turn = task.get("execution_source") == "dashboard" and str(task.get("execution_turn_id") or "") == turn_id
         persisted_dashboard_turn = persisted_dashboard_turn or has_persisted_dashboard_turn(task_id, turn_id)
@@ -1612,6 +1656,29 @@ async def refresh_native_rollouts() -> None:
         native_rollout_offsets.pop(path, None)
         native_rollout_remainders.pop(path, None)
         rollout_writer_cache.pop(os.path.realpath(path), None)
+
+
+async def refresh_live_external_turn(task_id: str) -> bool:
+    """Synchronously close the rollout-observer gap before starting a web turn."""
+    if external_turns.get(task_id):
+        return True
+    task = task_or_404(task_id)
+    if task.get("ssh_host"):
+        return False
+    thread_id = latest_codex_session(task)
+    if not thread_id:
+        return False
+    path = await asyncio.to_thread(native_rollout_path, thread_id)
+    if not path:
+        return False
+    _offset, boundary, phase = await asyncio.to_thread(inspect_rollout_boundary, path)
+    if not boundary or str((boundary.get("payload") or {}).get("type") or "") != "task_started":
+        return False
+    writers = await asyncio.to_thread(native_rollout_writer_pids, path, True)
+    if not writers:
+        return False
+    await apply_external_turn_boundary(task_id, thread_id, boundary, phase, initial=True, path=path)
+    return bool(external_turns.get(task_id))
 
 
 async def native_rollout_watch_loop() -> None:
@@ -5520,6 +5587,10 @@ async def launch(
         await require_ssh_connection(task["ssh_host"], codex=True)
     else:
         require_codex()
+    if await refresh_live_external_turn(task_id):
+        persist_external_task_status(task_id, dashboard_active=False)
+        raise HTTPException(409, "Task is already running in a terminal Codex client")
+    task = task_or_404(task_id)
     if external_turns.get(task_id):
         persist_external_task_status(task_id, dashboard_active=False)
         raise HTTPException(409, "Task is already running in a terminal Codex client")

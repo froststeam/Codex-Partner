@@ -499,6 +499,72 @@ class RunningStateTests(unittest.TestCase):
         self.assertFalse(self.app.rollout_writer_pids(str(path), refresh=True))
         self.assertFalse(self.app.rollout_is_live(str(path)))
 
+    def test_dashboard_appserver_descendant_is_not_an_external_writer(self):
+        client = SimpleNamespace(process=SimpleNamespace(pid=110, returncode=None))
+        self.app.app_servers["writer-tree-test"] = client
+        try:
+            with mock.patch.object(self.app, "rollout_writer_pids", return_value={110, 111, 900}), \
+                 mock.patch.object(self.app, "process_tree_pids", return_value={110, 111}):
+                writers = self.app.native_rollout_writer_pids("/tmp/dashboard-writer", refresh=True)
+            self.assertEqual({900}, writers)
+        finally:
+            self.app.app_servers.pop("writer-tree-test", None)
+
+    def test_task_appserver_closes_after_task_id_is_canonicalized(self):
+        old_id = "provisional-appserver-task"
+        new_id = "canonical-appserver-thread"
+        client = SimpleNamespace(close=mock.AsyncMock())
+        key = f"default:task:{old_id}"
+        self.app.app_servers[key] = client
+        self.app.app_thread_bindings[new_id] = (key, new_id, "session-id")
+        try:
+            asyncio.run(self.app.close_task_appserver(None, {"id": new_id}, client))
+            self.assertNotIn(key, self.app.app_servers)
+            self.assertNotIn(new_id, self.app.app_thread_bindings)
+            client.close.assert_awaited_once()
+        finally:
+            self.app.app_servers.pop(key, None)
+            self.app.app_thread_bindings.pop(new_id, None)
+
+    def test_launch_refreshes_terminal_owner_before_reserving_dashboard(self):
+        task_id = "launch-terminal-race"
+        self.make_task(task_id, "available")
+        try:
+            with mock.patch.object(self.app, "require_codex"), \
+                 mock.patch.object(self.app, "refresh_live_external_turn", new=mock.AsyncMock(return_value=True)), \
+                 mock.patch.object(self.app, "launch_appserver", new=mock.AsyncMock()) as launch_appserver:
+                with self.assertRaises(self.app.HTTPException) as raised:
+                    asyncio.run(self.app.launch(task_id, "message", "wait for terminal", "message-race"))
+            self.assertEqual(409, raised.exception.status_code)
+            launch_appserver.assert_not_awaited()
+            self.assertEqual("available", self.app.task_or_404(task_id)["status"])
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_refresh_live_external_turn_closes_observer_polling_gap(self):
+        task_id = "refresh-terminal-race"
+        turn_id = "terminal-race-turn"
+        self.make_task(task_id, "available")
+        boundary = {
+            "timestamp": self.app.now(),
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": turn_id},
+        }
+        try:
+            with mock.patch.object(self.app, "native_rollout_path", return_value="/tmp/terminal-race.jsonl"), \
+                 mock.patch.object(self.app, "inspect_rollout_boundary", return_value=(100, boundary, "running command")), \
+                 mock.patch.object(self.app, "native_rollout_writer_pids", return_value={900}):
+                detected = asyncio.run(self.app.refresh_live_external_turn(task_id))
+            self.assertTrue(detected)
+            self.assertEqual("terminal", self.app.task_or_404(task_id)["execution_source"])
+            self.assertEqual(turn_id, self.app.task_or_404(task_id)["execution_turn_id"])
+            self.assertIn(turn_id, self.app.external_turn_sets[task_id])
+        finally:
+            self.app.clear_external_turns(task_id)
+            self.app.db.execute("DELETE FROM events WHERE task_id=?", (task_id,))
+            self.app.db.execute("DELETE FROM sessions WHERE task_id=?", (task_id,))
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
     def test_stale_started_turn_becomes_stopped(self):
         task_id = "stale-thread"
         self.make_task(task_id)
