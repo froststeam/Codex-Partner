@@ -77,13 +77,19 @@ function explorationLayout(nodes) {
   return { positions, maxRow, width: Math.max(760, 90 + nodes.length * 244), height: Math.max(430, 80 + (maxRow + 1) * 126) };
 }
 
-function explorationEventKey(event) {
-  if (event?.id != null && event.id !== "") return `${event.stream || "event"}:${event.id}`;
-  const payload = typeof event?.payload === "string" ? event.payload : JSON.stringify(event?.payload || {});
-  return `${event?.stream || "event"}:${event?.session_id || ""}:${event?.ts || event?.created_at || ""}:${payload}`;
+function applyActivityMapSnapshot(snapshot = {}) {
+  state.explorationPrecomputed = true;
+  state.explorationNodes = Array.isArray(snapshot.nodes) ? snapshot.nodes : [];
+  state.explorationMapStatus = snapshot.status || "pending";
+  state.explorationHistoryComplete = snapshot.status === "ready";
+  state.explorationLoadedEventCount = Number(snapshot.event_count || 0);
+  state.explorationProcessedEvents = Number(snapshot.processed_events || 0);
+  state.explorationRevision = Number(snapshot.revision || 0);
+  state.explorationLoadError = snapshot.error || "";
+  renderExplorationMap();
 }
 
-async function loadFullExplorationHistory(force = false) {
+async function loadPrecomputedActivityMap(force = false) {
   if (!state.selectedId || state.explorationLoading || (state.explorationHistoryComplete && !force)) return;
   const taskId = state.selectedId;
   const requestId = ++state.explorationRequestId;
@@ -91,34 +97,9 @@ async function loadFullExplorationHistory(force = false) {
   state.explorationLoadError = "";
   renderExplorationMap();
   try {
-    let page = await api(`/tasks/${encodeURIComponent(taskId)}/timeline?limit=500`);
-    let events = [...(page.items || [])];
-    state.explorationLoadedEventCount = events.length;
-    let cursor = String(page.next_cursor || "");
-    let hasMore = Boolean(page.has_more && cursor);
-    const seenCursors = new Set();
-    while (hasMore && state.selectedId === taskId && requestId === state.explorationRequestId) {
-      if (seenCursors.has(cursor)) throw new Error("完整会话游标没有继续前进");
-      seenCursors.add(cursor);
-      page = await api(`/tasks/${encodeURIComponent(taskId)}/timeline?limit=500&before=${encodeURIComponent(cursor)}`);
-      events = [...(page.items || []), ...events];
-      state.explorationLoadedEventCount = events.length;
-      const nextCursor = String(page.next_cursor || "");
-      hasMore = Boolean(page.has_more && nextCursor);
-      cursor = nextCursor;
-      renderExplorationMap();
-      await new Promise(resolve => setTimeout(resolve, 0));
-    }
     if (state.selectedId !== taskId || requestId !== state.explorationRequestId) return;
-    const combined = [...events, ...(state.explorationEvents || [])];
-    const unique = new Map();
-    combined.forEach(event => unique.set(explorationEventKey(event), event));
-    state.explorationEvents = [...unique.values()];
-    state.explorationLoadedEventCount = state.explorationEvents.length;
-    state.explorationHistoryComplete = !hasMore;
-    state.explorationRevision += 1;
-    state.explorationNeedsSync = true;
-    scheduleRenderChat();
+    const snapshot = await api(`/tasks/${encodeURIComponent(taskId)}/activity-map`);
+    applyActivityMapSnapshot(snapshot);
   } catch (error) {
     if (state.selectedId === taskId && requestId === state.explorationRequestId) state.explorationLoadError = error.message || String(error);
   } finally {
@@ -183,7 +164,7 @@ function renderExplorationMap(options = {}) {
   }
   if (historyStatus) {
     historyStatus.className = state.explorationLoadError ? "error" : state.explorationLoading ? "loading" : state.explorationHistoryComplete ? "complete" : "";
-    historyStatus.textContent = state.explorationLoadError ? `全量加载失败 · ${state.explorationLoadError}` : state.explorationLoading ? `正在加载完整会话 · ${state.explorationLoadedEventCount} 条事件` : state.explorationHistoryComplete ? `全量对话 · ${state.explorationEvents.length} 条事件` : `最近路径 · ${state.explorationEvents.length} 条事件`;
+    historyStatus.textContent = state.explorationLoadError ? `活动图失败 · ${state.explorationLoadError}` : state.explorationLoading ? "正在读取活动图索引" : state.explorationMapStatus === "building" ? `后台预计算中 · ${state.explorationProcessedEvents} 条事件` : state.explorationHistoryComplete ? `活动图已预计算 · ${state.explorationLoadedEventCount} 条事件` : "活动图等待预计算";
   }
   if (!nodes.length) {
     canvas.style.width = "100%";
@@ -243,7 +224,7 @@ function openExplorationMap() {
   document.body.classList.add("exploration-map-visible");
   renderExplorationMap({ reveal: true });
   if (state.explorationNeedsSync) scheduleRenderChat();
-  loadFullExplorationHistory();
+  loadPrecomputedActivityMap();
 }
 
 function closeExplorationMap() {
@@ -329,7 +310,7 @@ $("#exploration-map-detail")?.addEventListener("click", event => {
   if (button) jumpToExplorationNode(button.dataset.explorationJump);
 });
 $("#exploration-load-older")?.addEventListener("click", async () => {
-  await loadFullExplorationHistory(true);
+  await loadPrecomputedActivityMap(true);
 });
 document.addEventListener("keydown", event => {
   if (event.key === "Escape" && state.explorationOpen) { event.preventDefault(); closeExplorationMap(); }

@@ -47,6 +47,7 @@ import pexpect
 from PIL import Image, ImageOps, ImageSequence, UnidentifiedImageError
 
 from codex_partner import APP_NAME, APP_VERSION
+from codex_partner.activity_graph import ActivityGraphStore, PROJECTION_VERSION, project_events, semantic_event
 from codex_partner.commands import SLASH_ALIASES, SLASH_COMMAND_BY_NAME, SLASH_COMMANDS, parse_slash_command
 from codex_partner.database import Database
 from codex_partner.app_server import AppServerClient
@@ -375,6 +376,9 @@ def canonicalize_task_thread_id(task_id: str, thread_id: str) -> str:
         connection.execute("UPDATE sessions SET task_id=? WHERE task_id=?", (thread_id, task_id))
         connection.execute("UPDATE events SET task_id=? WHERE task_id=?", (thread_id, task_id))
         connection.execute("UPDATE task_messages SET task_id=? WHERE task_id=?", (thread_id, task_id))
+        connection.execute("UPDATE activity_graphs SET task_id=? WHERE task_id=?", (thread_id, task_id))
+        connection.execute("UPDATE activity_nodes SET task_id=? WHERE task_id=?", (thread_id, task_id))
+        connection.execute("UPDATE activity_graph_seen SET task_id=? WHERE task_id=?", (thread_id, task_id))
         connection.commit()
     task_id_aliases[task_id] = thread_id
     if task_id in running:
@@ -433,6 +437,7 @@ def is_provider_failure(exc: Exception) -> bool:
 
 
 db = Database(DB_PATH, now)
+activity_graph_store = ActivityGraphStore(db)
 
 
 def reconcile_task_session_ids() -> None:
@@ -510,6 +515,7 @@ async def lifespan(_: FastAPI):
     app_shutting_down = False
     observer_task: Optional[asyncio.Task] = None
     inactive_trash_task: Optional[asyncio.Task] = None
+    activity_graph_task: Optional[asyncio.Task] = None
     reconcile_task_session_ids()
     try:
         await sync_native_threads()
@@ -531,6 +537,8 @@ async def lifespan(_: FastAPI):
     except Exception:
         # Retention cleanup is best effort and must never block the dashboard.
         pass
+    seed_activity_graph_builds()
+    activity_graph_task = asyncio.create_task(activity_graph_worker_loop())
     if AUTO_RESUME:
         await asyncio.sleep(0)
         for row in db.all("SELECT id FROM tasks WHERE status='queued' ORDER BY updated_at"):
@@ -565,6 +573,9 @@ async def lifespan(_: FastAPI):
         if inactive_trash_task:
             inactive_trash_task.cancel()
             await asyncio.gather(inactive_trash_task, return_exceptions=True)
+        if activity_graph_task:
+            activity_graph_task.cancel()
+            await asyncio.gather(activity_graph_task, return_exceptions=True)
         workers = list(task_workers.values())
         for worker in workers:
             worker.cancel()
@@ -588,6 +599,10 @@ overview_client_users: dict[WebSocket, str] = {}
 task_queues: dict[str, asyncio.Queue[str]] = {}
 task_workers: dict[str, asyncio.Task] = {}
 task_message_locks: dict[str, asyncio.Lock] = {}
+activity_graph_queue: asyncio.Queue[str] = asyncio.Queue()
+activity_graph_pending: set[str] = set()
+activity_graph_locks: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Lock]] = {}
+activity_graph_backlog: dict[str, list[dict[str, Any]]] = {}
 app_servers: dict[str, "AppServerClient"] = {}
 app_thread_bindings: dict[str, tuple[str, str, str]] = {}
 turn_waiters: dict[str, asyncio.Future] = {}
@@ -3703,6 +3718,7 @@ async def broadcast_profile(username: str, profile: Optional[dict] = None) -> No
 async def broadcast_task(task_id: str, payload: dict) -> None:
     """Fan out one canonical task event to every browser attached to the task."""
     overview_source = payload
+    schedule_activity_graph_event(task_id, overview_source)
     if payload.get("type") == "task_status":
         task = payload.get("task") or {}
         mutable_fields = {
@@ -4806,6 +4822,153 @@ async def native_timeline_events(task: dict) -> tuple[list[dict], list[dict]]:
     merged = merge_native_with_rollout(native_events, persisted)
     merged.sort(key=history_event_key)
     return merged, metrics
+
+
+def schedule_activity_graph_build(task_id: str) -> None:
+    if not task_id or task_id in activity_graph_pending:
+        return
+    activity_graph_pending.add(task_id)
+    activity_graph_queue.put_nowait(task_id)
+
+
+def seed_activity_graph_builds() -> None:
+    rows = db.all(
+        "SELECT t.id FROM tasks t LEFT JOIN activity_graphs g ON g.task_id=t.id "
+        "WHERE t.trashed=0 AND (g.task_id IS NULL OR g.status!='ready' OR g.projection_version!=?) "
+        "ORDER BY CASE WHEN t.status IN ('running','retrying','queued') THEN 0 ELSE 1 END, t.updated_at DESC",
+        (PROJECTION_VERSION,),
+    )
+    for row in rows:
+        schedule_activity_graph_build(row["id"])
+
+
+async def activity_events_for_task(task: dict) -> list[dict]:
+    if task.get("native"):
+        events, _ = await native_timeline_events(task)
+        return events
+    return await asyncio.to_thread(
+        db.all,
+        "SELECT * FROM events WHERE task_id=? ORDER BY id",
+        (task["id"],),
+    )
+
+
+def activity_graph_lock(task_id: str) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    cached = activity_graph_locks.get(task_id)
+    if not cached or cached[0] is not loop:
+        cached = (loop, asyncio.Lock())
+        activity_graph_locks[task_id] = cached
+    return cached[1]
+
+
+async def apply_activity_graph_event(task_id: str, event: dict[str, Any]) -> None:
+    lock = activity_graph_lock(task_id)
+    async with lock:
+        snapshot = await asyncio.to_thread(activity_graph_store.snapshot, task_id)
+        if snapshot.get("status") != "ready" or int(snapshot.get("projection_version") or 0) != PROJECTION_VERSION:
+            activity_graph_backlog.setdefault(task_id, []).append(event)
+            schedule_activity_graph_build(task_id)
+            return
+        task = task_summary(task_id)
+        if not task:
+            return
+        patch = await asyncio.to_thread(
+            activity_graph_store.apply_event,
+            task_id,
+            event,
+            task.get("status") in {"running", "retrying", "queued"},
+            str(task.get("status") or ""),
+            now(),
+        )
+        if patch and patch.get("upsert_nodes"):
+            await broadcast_task(task_id, {"type": "activity_map_patch", **patch})
+
+
+async def apply_activity_graph_status(task_id: str, task: dict[str, Any]) -> None:
+    lock = activity_graph_lock(task_id)
+    async with lock:
+        patch = await asyncio.to_thread(
+            activity_graph_store.apply_status,
+            task_id,
+            task.get("status") in {"running", "retrying", "queued"},
+            str(task.get("status") or ""),
+            now(),
+        )
+        if patch:
+            await broadcast_task(task_id, {"type": "activity_map_patch", **patch})
+
+
+def schedule_activity_graph_event(task_id: str, payload: dict[str, Any]) -> None:
+    if payload.get("type") in {"task_status", "task_patch"}:
+        task = payload.get("task") or payload.get("patch") or {}
+        if task.get("status"):
+            asyncio.create_task(apply_activity_graph_status(task_id, task))
+        return
+    if payload.get("type") != "event":
+        return
+    event = {
+        "id": payload.get("id", ""),
+        "session_id": payload.get("session_id", ""),
+        "ts": payload.get("ts") or now(),
+        "stream": payload.get("stream") or "app-server",
+        "payload": payload.get("payload") or {},
+    }
+    if not semantic_event(event):
+        return
+    asyncio.create_task(apply_activity_graph_event(task_id, event))
+
+
+async def build_activity_graph(task_id: str) -> None:
+    task = task_summary(task_id)
+    if not task:
+        return
+    stamp = now()
+    await asyncio.to_thread(activity_graph_store.mark_building, task_id, stamp)
+    try:
+        events = await activity_events_for_task(task)
+        nodes, seen = await asyncio.to_thread(
+            project_events,
+            events,
+            task_running=task.get("status") in {"running", "retrying", "queued"},
+            task_status=str(task.get("status") or ""),
+            finalize=True,
+        )
+        revision = await asyncio.to_thread(activity_graph_store.replace, task_id, nodes, seen, len(events), now())
+        await broadcast_task(
+            task_id,
+            {"type": "activity_map_ready", "revision": revision, "node_count": len(nodes), "event_count": len(events)},
+        )
+        backlog = activity_graph_backlog.pop(task_id, [])
+        for event in backlog:
+            await apply_activity_graph_event(task_id, event)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        db.execute(
+            "UPDATE activity_graphs SET status='failed',error=?,updated_at=? WHERE task_id=?",
+            (str(exc)[:1000], now(), task_id),
+        )
+        await broadcast_task(task_id, {"type": "activity_map_failed", "error": str(exc)[:500]})
+
+
+async def activity_graph_worker_loop() -> None:
+    while True:
+        task_id = await activity_graph_queue.get()
+        try:
+            await build_activity_graph(task_id)
+        finally:
+            activity_graph_pending.discard(task_id)
+            activity_graph_queue.task_done()
+
+
+@app.get("/api/tasks/{task_id}/activity-map")
+async def task_activity_map(task_id: str, _: Any = Depends(auth)):
+    task = task_or_404(task_id)
+    snapshot = await asyncio.to_thread(activity_graph_store.snapshot, task["id"])
+    if snapshot.get("status") != "ready" or int(snapshot.get("projection_version") or 0) != PROJECTION_VERSION:
+        schedule_activity_graph_build(task["id"])
+    return snapshot
 
 
 @app.get("/api/tasks/{task_id}/timeline")

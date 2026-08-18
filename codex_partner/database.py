@@ -86,6 +86,26 @@ class Database:
                   started_at TEXT, finished_at TEXT, session_id TEXT, error TEXT DEFAULT '',
                   FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS activity_graphs (
+                  task_id TEXT PRIMARY KEY, projection_version INTEGER NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'pending', processed_events INTEGER NOT NULL DEFAULT 0,
+                  event_count INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0,
+                  started_at TEXT, updated_at TEXT NOT NULL, error TEXT DEFAULT '',
+                  FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS activity_nodes (
+                  task_id TEXT NOT NULL, node_id TEXT NOT NULL, sequence INTEGER NOT NULL,
+                  parent_id TEXT, kind TEXT NOT NULL, status TEXT NOT NULL, title TEXT NOT NULL,
+                  summary TEXT DEFAULT '', evidence_json TEXT DEFAULT '[]', files_json TEXT DEFAULT '[]',
+                  commands_json TEXT DEFAULT '[]', failures INTEGER NOT NULL DEFAULT 0,
+                  score INTEGER NOT NULL DEFAULT 0, turn_id TEXT DEFAULT '', item_id TEXT DEFAULT '',
+                  source_event_id TEXT DEFAULT '', event_time TEXT DEFAULT '',
+                  PRIMARY KEY(task_id,node_id), FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS activity_graph_seen (
+                  task_id TEXT NOT NULL, event_key TEXT NOT NULL,
+                  PRIMARY KEY(task_id,event_key), FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+                );
                 CREATE TABLE IF NOT EXISTS ssh_saved_hosts (
                   alias TEXT PRIMARY KEY, created_at TEXT NOT NULL
                 );
@@ -95,6 +115,7 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_events_session_ts_id ON events(session_id, ts DESC, id DESC);
                 CREATE INDEX IF NOT EXISTS idx_events_stream_id_session ON events(stream, id DESC, session_id);
                 CREATE INDEX IF NOT EXISTS idx_task_messages_task_status ON task_messages(task_id, status, created_at);
+                CREATE INDEX IF NOT EXISTS idx_activity_nodes_task_sequence ON activity_nodes(task_id, sequence);
                 """
             )
             self._migrate(connection)

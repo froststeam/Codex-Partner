@@ -924,7 +924,7 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
         conversation = (worker.parent / "conversation.js").read_text(encoding="utf-8")
         html = (worker.parent / "index.html").read_text(encoding="utf-8")
         self.assertIn('/chat-worker.js?v=20260818-full-exploration-graph', conversation)
-        self.assertIn('/conversation.js?v=20260818-full-exploration-graph', html)
+        self.assertIn('/conversation.js?v=20260818-activity-index', html)
 
     def test_worker_hides_native_media_tags(self):
         script = f"""
@@ -1116,15 +1116,15 @@ process.stdout.write(JSON.stringify({{ visibleBlocks, nodes: context.buildExplor
         styles = (static / "styles.css").read_text(encoding="utf-8")
         self.assertIn('id="exploration-map-open"', html)
         self.assertIn('id="exploration-map"', html)
-        self.assertIn('/exploration-tree.js?v=20260818-exploration-zoom', html)
+        self.assertIn('/exploration-tree.js?v=20260818-activity-index', html)
         self.assertIn("explorationNodes: []", (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn("event.data.explorationNodes", conversation)
-        self.assertIn("explorationEvents: explorationSync ? state.explorationEvents : null", conversation)
+        self.assertIn("!state.explorationPrecomputed && state.explorationNeedsSync", conversation)
         self.assertIn("const explorationCache = new Map()", (static / "chat-worker.js").read_text(encoding="utf-8"))
         self.assertIn("function explorationLayout", tree)
-        self.assertIn("function loadFullExplorationHistory", tree)
-        self.assertIn("timeline?limit=500", tree)
-        self.assertIn("while (hasMore", tree)
+        self.assertIn("function loadPrecomputedActivityMap", tree)
+        self.assertIn("/activity-map", tree)
+        self.assertNotIn("timeline?limit=500", tree)
         self.assertIn("position.column * 244", tree)
         self.assertIn("data-exploration-jump", tree)
         self.assertIn('addEventListener("wheel"', tree)
@@ -1157,6 +1157,50 @@ process.stdout.write(JSON.stringify(posts));
         self.assertEqual(2, len(posts))
         self.assertEqual(posts[0]["explorationNodes"], posts[1]["explorationNodes"])
         self.assertEqual("direction", posts[1]["explorationNodes"][0]["kind"])
+
+    def test_activity_graph_is_persisted_and_incremental_events_are_idempotent(self):
+        from codex_partner.activity_graph import project_events
+
+        task_id = f"activity-graph-{time.time_ns()}"
+        self.make_task(task_id)
+        initial = [{
+            "id": "user-1", "ts": "2026-08-18T01:00:00+00:00", "stream": "native",
+            "payload": {"type": "userMessage", "text": "帮我实现持久化活动图索引", "item_id": "user-1", "turn_id": "turn-1"},
+        }]
+        nodes, seen = project_events(initial, task_running=True, task_status="running")
+        self.assertEqual(["direction"], [node["kind"] for node in nodes])
+        self.app.activity_graph_store.mark_building(task_id, self.app.now())
+        self.app.activity_graph_store.replace(task_id, nodes, seen, len(initial), self.app.now())
+
+        failed_command = {
+            "id": "command-1", "ts": "2026-08-18T01:01:00+00:00", "stream": "app-server",
+            "payload": {"type": "commandExecution", "command": "false", "status": "failed", "exit_code": 1, "item_id": "command-1", "turn_id": "turn-1"},
+        }
+        first = self.app.activity_graph_store.apply_event(task_id, failed_command, True, "running", self.app.now())
+        second = self.app.activity_graph_store.apply_event(task_id, failed_command, True, "running", self.app.now())
+        snapshot = self.app.activity_graph_store.snapshot(task_id)
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+        self.assertEqual("ready", snapshot["status"])
+        self.assertEqual(["false"], snapshot["nodes"][0]["commands"])
+        self.assertEqual(1, snapshot["nodes"][0]["failures"])
+
+        status_patch = self.app.activity_graph_store.apply_status(task_id, False, "available", self.app.now())
+        self.assertEqual("completed", status_patch["upsert_nodes"][0]["status"])
+        api_snapshot = asyncio.run(self.app.task_activity_map(task_id, _=None))
+        self.assertEqual("completed", api_snapshot["nodes"][0]["status"])
+
+    def test_activity_graph_frontend_never_scans_full_timeline(self):
+        root = Path(__file__).resolve().parents[1]
+        app_source = (root / "app.py").read_text(encoding="utf-8")
+        tree = (root / "static" / "exploration-tree.js").read_text(encoding="utf-8")
+        conversation = (root / "static" / "conversation.js").read_text(encoding="utf-8")
+        self.assertIn('"/api/tasks/{task_id}/activity-map"', app_source)
+        self.assertIn("seed_activity_graph_builds()", app_source)
+        self.assertIn("schedule_activity_graph_event(task_id, overview_source)", app_source)
+        self.assertNotIn("timeline?limit=500", tree)
+        self.assertIn("activity_map_patch", conversation)
+        self.assertIn("applyActivityMapSnapshot(activityMap)", conversation)
 
     def test_activity_history_expands_independently_from_message_history(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -1211,7 +1255,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn('data-activity-output-key="${esc(outputKey)}"', conversation)
         self.assertIn("Object.prototype.hasOwnProperty.call(state.activityOutputOpen, outputKey)", conversation)
         self.assertIn("state.activityOutputOpen[output.dataset.activityOutputKey] = output.open", conversation)
-        self.assertIn('/conversation.js?v=20260818-full-exploration-graph', html)
+        self.assertIn('/conversation.js?v=20260818-activity-index', html)
 
     def test_message_history_skips_activity_only_pages(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -1267,7 +1311,7 @@ const cursors = [];
         self.assertIn("HistoryPagination.fetchEarlierTimelinePages", conversation)
         self.assertIn("messageTarget: 12, maxPages: 8", conversation)
         self.assertIn('/history-pagination.js?v=20260817-message-history', html)
-        self.assertIn('/conversation.js?v=20260818-full-exploration-graph', html)
+        self.assertIn('/conversation.js?v=20260818-activity-index', html)
 
     def test_sent_browser_messages_follow_the_loaded_timeline_boundary(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -2551,7 +2595,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('/core.js?v=20260818-chat-performance', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260818-full-exploration-graph', html)
+        self.assertIn('/conversation.js?v=20260818-activity-index', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -2780,7 +2824,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260818-full-exploration-graph', html)
+        self.assertIn('/conversation.js?v=20260818-activity-index', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260818-chat-performance', html)
@@ -2841,7 +2885,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         clear_start = conversation.index("clearChatSelectionForSessionSwitch()", select_start)
         self.assertLess(clear_start, request_start)
         self.assertIn("if (state.selectedId !== id)", conversation[select_start:request_start])
-        self.assertIn('/conversation.js?v=20260818-full-exploration-graph', html)
+        self.assertIn('/conversation.js?v=20260818-activity-index', html)
 
     def test_live_chat_rendering_coalesces_expensive_work(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -2860,7 +2904,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("if (current !== previous) scheduleRenderChat()", conversation)
         self.assertIn("renderConversation(false)", conversation)
         self.assertIn('/core.js?v=20260818-chat-performance', html)
-        self.assertIn('/conversation.js?v=20260818-full-exploration-graph', html)
+        self.assertIn('/conversation.js?v=20260818-activity-index', html)
         styles = (static / "styles.css").read_text(encoding="utf-8")
         app_js = (static / "app.js").read_text(encoding="utf-8")
         self.assertNotIn("content-visibility: auto", styles)
