@@ -1116,7 +1116,7 @@ process.stdout.write(JSON.stringify({{ visibleBlocks, nodes: context.buildExplor
         styles = (static / "styles.css").read_text(encoding="utf-8")
         self.assertIn('id="exploration-map-open"', html)
         self.assertIn('id="exploration-map"', html)
-        self.assertIn('/exploration-tree.js?v=20260818-activity-index', html)
+        self.assertIn('/exploration-tree.js?v=20260818-activity-node-click', html)
         self.assertIn("explorationNodes: []", (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn("event.data.explorationNodes", conversation)
         self.assertIn("!state.explorationPrecomputed && state.explorationNeedsSync", conversation)
@@ -1130,6 +1130,9 @@ process.stdout.write(JSON.stringify({{ visibleBlocks, nodes: context.buildExplor
         self.assertIn('addEventListener("wheel"', tree)
         self.assertIn('addEventListener("pointermove"', tree)
         self.assertIn("suppressExplorationClick", tree)
+        pointer_down = tree.split('addEventListener("pointerdown"', 1)[1].split('addEventListener("pointermove"', 1)[0]
+        self.assertNotIn("setPointerCapture", pointer_down)
+        self.assertGreater(tree.index("setPointerCapture"), tree.index("Math.hypot(dx, dy) < 4"))
         self.assertIn("updateExplorationZoom", tree)
         self.assertIn('id="exploration-zoom-reset"', html)
         self.assertIn(".exploration-map-world", styles)

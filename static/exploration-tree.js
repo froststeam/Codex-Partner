@@ -264,7 +264,6 @@ $("#exploration-map-viewport")?.addEventListener("pointerdown", event => {
   if (event.button !== 0 || !state.explorationOpen) return;
   const viewport = event.currentTarget;
   explorationDrag = { id: event.pointerId, x: event.clientX, y: event.clientY, left: viewport.scrollLeft, top: viewport.scrollTop, moved: false };
-  viewport.setPointerCapture(event.pointerId);
 });
 $("#exploration-map-viewport")?.addEventListener("pointermove", event => {
   const drag = explorationDrag;
@@ -272,7 +271,10 @@ $("#exploration-map-viewport")?.addEventListener("pointermove", event => {
   const dx = event.clientX - drag.x;
   const dy = event.clientY - drag.y;
   if (!drag.moved && Math.hypot(dx, dy) < 4) return;
-  drag.moved = true;
+  if (!drag.moved) {
+    drag.moved = true;
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
   event.currentTarget.classList.add("dragging");
   event.currentTarget.scrollLeft = drag.left - dx;
   event.currentTarget.scrollTop = drag.top - dy;
@@ -288,6 +290,9 @@ const finishExplorationDrag = event => {
 };
 $("#exploration-map-viewport")?.addEventListener("pointerup", finishExplorationDrag);
 $("#exploration-map-viewport")?.addEventListener("pointercancel", finishExplorationDrag);
+$("#exploration-map-viewport")?.addEventListener("pointerleave", () => {
+  if (explorationDrag && !explorationDrag.moved) explorationDrag = null;
+});
 $("#exploration-map-viewport")?.addEventListener("click", event => {
   if (!suppressExplorationClick) return;
   suppressExplorationClick = false;
