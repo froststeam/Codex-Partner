@@ -1116,7 +1116,7 @@ process.stdout.write(JSON.stringify({{ visibleBlocks, nodes: context.buildExplor
         styles = (static / "styles.css").read_text(encoding="utf-8")
         self.assertIn('id="exploration-map-open"', html)
         self.assertIn('id="exploration-map"', html)
-        self.assertIn('/exploration-tree.js?v=20260818-activity-node-click', html)
+        self.assertIn('/exploration-tree.js?v=20260818-activity-tree-branches', html)
         self.assertIn("explorationNodes: []", (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn("event.data.explorationNodes", conversation)
         self.assertIn("!state.explorationPrecomputed && state.explorationNeedsSync", conversation)
@@ -1125,7 +1125,9 @@ process.stdout.write(JSON.stringify({{ visibleBlocks, nodes: context.buildExplor
         self.assertIn("function loadPrecomputedActivityMap", tree)
         self.assertIn("/activity-map", tree)
         self.assertNotIn("timeline?limit=500", tree)
-        self.assertIn("position.column * 244", tree)
+        self.assertIn("position.depth * 244", tree)
+        self.assertIn("layout.maxDepth * 244", tree)
+        self.assertIn("V ${endY} H ${endX}", tree)
         self.assertIn("data-exploration-jump", tree)
         self.assertIn('addEventListener("wheel"', tree)
         self.assertIn('addEventListener("pointermove"', tree)
@@ -1135,6 +1137,10 @@ process.stdout.write(JSON.stringify({{ visibleBlocks, nodes: context.buildExplor
         self.assertGreater(tree.index("setPointerCapture"), tree.index("Math.hypot(dx, dy) < 4"))
         self.assertIn("updateExplorationZoom", tree)
         self.assertIn('id="exploration-zoom-reset"', html)
+        self.assertIn('id="exploration-zoom-fit"', html)
+        self.assertIn("function frameExplorationBranch", tree)
+        self.assertIn("frameExplorationNodes([parent.id", tree)
+        self.assertIn("explorationFramePending = true", tree)
         self.assertIn(".exploration-map-world", styles)
         self.assertIn(".exploration-map-viewport", styles)
         self.assertIn(".exploration-node-time", styles)
@@ -1204,6 +1210,58 @@ process.stdout.write(JSON.stringify(posts));
         self.assertNotIn("timeline?limit=500", tree)
         self.assertIn("activity_map_patch", conversation)
         self.assertIn("applyActivityMapSnapshot(activityMap)", conversation)
+
+    def test_activity_graph_plans_form_semantic_branches(self):
+        from codex_partner.activity_graph import project_events
+
+        events = [
+            {"id": "u1", "ts": 1, "stream": "native", "payload": {"type": "userMessage", "text": "帮我实现完整活动树", "item_id": "u1", "turn_id": "t1"}},
+            {"id": "p1", "ts": 2, "stream": "native", "payload": {"type": "plan", "turn_id": "t1", "plan": [
+                {"step": "分析数据模型", "status": "completed"},
+                {"step": "实现树形布局", "status": "in_progress"},
+                {"step": "验证分支交互", "status": "pending"},
+            ]}},
+            {"id": "u2", "ts": 3, "stream": "native", "payload": {"type": "userMessage", "text": "继续增加节点搜索和状态筛选", "item_id": "u2", "turn_id": "t2"}},
+            {"id": "p2", "ts": 4, "stream": "native", "payload": {"type": "plan", "turn_id": "t2", "plan": [
+                {"step": "增加节点搜索", "status": "in_progress"},
+                {"step": "增加状态筛选", "status": "pending"},
+            ]}},
+            {"id": "u3", "ts": 5, "stream": "native", "payload": {"type": "userMessage", "text": "不是这个方向，改成先优化树的分叉逻辑", "item_id": "u3", "turn_id": "t3"}},
+        ]
+        nodes, _ = project_events(events, task_running=True, task_status="running")
+        directions = [node for node in nodes if node["kind"] in {"direction", "steering"}]
+        first, second, steering = directions
+        children = {}
+        for node in nodes:
+            children.setdefault(node.get("parentId"), []).append(node)
+        self.assertEqual(first["id"], second["parentId"])
+        self.assertEqual(first["id"], steering["parentId"])
+        first_phase = next(node for node in nodes if node["kind"] == "phase" and node["turnId"] == "t1")
+        second_phase = next(node for node in nodes if node["kind"] == "phase" and node["turnId"] == "t2")
+        self.assertEqual(3, len(children[first["id"]]))
+        self.assertEqual([second_phase], children[second["id"]])
+        self.assertEqual(3, len(children[first_phase["id"]]))
+        self.assertEqual(2, len(children[second_phase["id"]]))
+
+    def test_activity_graph_reconnects_related_topics_instead_of_flattening_time(self):
+        from codex_partner.activity_graph import project_events
+
+        def user(event_id, text):
+            return {"id": event_id, "ts": event_id, "stream": "native", "payload": {
+                "type": "userMessage", "text": text, "item_id": event_id, "turn_id": event_id,
+            }}
+
+        nodes, _ = project_events([
+            user("u1", "帮我修复会话消息分页缓存"),
+            user("u2", "继续排查消息分页游标和缓存恢复"),
+            user("u3", "增加 MUSA kernel 性能分析和寄存器检查"),
+            user("u4", "消息分页缓存恢复仍然失败，检查分页游标"),
+        ], task_running=True, task_status="running")
+        directions = [node for node in nodes if node["kind"] == "direction"]
+        first, pagination, musa, pagination_return = directions
+        self.assertEqual(first["id"], pagination["parentId"])
+        self.assertEqual(first["id"], musa["parentId"])
+        self.assertEqual(pagination["id"], pagination_return["parentId"])
 
     def test_activity_history_expands_independently_from_message_history(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -2039,7 +2097,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('disabled title="${esc(uiLabel("protectedSkillDelete"))}"', settings)
         self.assertIn(".panel-item button.danger-text:not(:disabled)", styles)
         self.assertNotIn(".panel-item button:last-child", styles)
-        self.assertIn('/styles.css?v=20260818-exploration-zoom', html)
+        self.assertIn('/styles.css?v=20260818-activity-tree-branches-v2', html)
         self.assertIn('/core.js?v=20260818-chat-performance', html)
         self.assertIn('/settings.js?v=20260817-skill-actions', html)
 
@@ -2832,7 +2890,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260818-chat-performance', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
-        self.assertIn('/styles.css?v=20260818-exploration-zoom', html)
+        self.assertIn('/styles.css?v=20260818-activity-tree-branches-v2', html)
         self.assertIn('/vendor/katex/katex.min.css', html)
         self.assertIn('<span id="goal-run-label">暂停</span>', html)
         self.assertNotIn('id="goal-run-label" class="sr-only"', html)
@@ -2919,7 +2977,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("if (chatIsNearBottom(stream))", conversation)
         self.assertNotIn("stream.scrollTop = target * state.chatAverageHeight", conversation)
         self.assertIn("function syncPageVisibility", app_js)
-        self.assertIn('/styles.css?v=20260818-exploration-zoom', html)
+        self.assertIn('/styles.css?v=20260818-activity-tree-branches-v2', html)
         self.assertIn('/app.js?v=20260818-chat-performance', html)
 
     def test_optimistic_queue_messages_survive_authoritative_refresh(self):

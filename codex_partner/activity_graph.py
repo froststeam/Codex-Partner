@@ -10,7 +10,7 @@ from typing import Any, Iterable, Optional
 from codex_partner.database import Database
 
 
-PROJECTION_VERSION = 1
+PROJECTION_VERSION = 4
 ACTIVE_STATUSES = {"active", "planned"}
 TERMINAL_NODE_STATUSES = {"failed", "rolledback", "abandoned"}
 CORRECTION_RE = re.compile(r"改成|换成|重新|不是|只要|不要再|范围|回退|撤销|instead|rather|revert|rollback", re.I)
@@ -22,6 +22,12 @@ DIRECTION_RE = re.compile(
 )
 DECISION_RE = re.compile(r"决定|确认|根因|证明|改用|转向|放弃|不可行|关键是|结论|选择|root cause|decid|confirmed|switch(?:ing)? to|not viable", re.I)
 SWITCH_RE = re.compile(r"改用|转向|放弃|不可行|switch(?:ing)? to|not viable", re.I)
+CONTINUE_RE = re.compile(r"^\s*(继续|接着|然后|下一步|再|also\b|continue\b|next\b)", re.I)
+SEMANTIC_STOP_WORDS = {
+    "这个", "那个", "我们", "你们", "帮我", "看看", "一下", "需要", "应该", "可以", "还是", "现在", "之前",
+    "问题", "实现", "修复", "修改", "增加", "添加", "优化", "检查", "继续", "支持", "功能", "相关", "进行",
+    "the", "and", "for", "with", "this", "that", "from", "into", "please", "fix", "add", "check",
+}
 HIDDEN_CONTEXT_RE = re.compile(
     r"<(environment_context|codex_internal_context|skills_instructions|plugins_instructions|system_reminder|memory_context|turn_context|oai-mem-citation)\b[^>]*>[\s\S]*?</\1\s*>",
     re.I,
@@ -74,6 +80,48 @@ def substantive_direction(value: Any) -> bool:
     return score >= 5
 
 
+def semantic_terms(value: Any) -> set[str]:
+    text = clean_text(value).lower()
+    terms = {
+        token for token in re.findall(r"[a-z][a-z0-9_.+-]{2,}", text)
+        if token not in SEMANTIC_STOP_WORDS
+    }
+    for phrase in re.findall(r"[\u3400-\u9fff]+", text):
+        for stop in SEMANTIC_STOP_WORDS:
+            phrase = phrase.replace(stop, " ")
+        for segment in phrase.split():
+            terms.update(segment[index:index + 2] for index in range(len(segment) - 1))
+    return terms
+
+
+def related_direction_parent(text: Any, directions: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    if not directions:
+        return None
+    previous = directions[-1]
+    if CONTINUE_RE.search(clean_text(text)):
+        return previous
+    terms = semantic_terms(text)
+    if not terms:
+        return previous
+
+    ranked: list[tuple[float, int, dict[str, Any]]] = []
+    for index, candidate in enumerate(directions):
+        candidate_terms = semantic_terms(candidate.get("title"))
+        overlap = terms & candidate_terms
+        if not overlap:
+            score = 0.0
+        else:
+            score = (2 * len(overlap)) / max(3, len(terms) + len(candidate_terms))
+        ranked.append((score, index, candidate))
+    best_score, _, best = max(ranked, key=lambda item: (item[0], item[1]))
+    previous_score = ranked[-1][0]
+    if best_score >= 0.16 and (best is previous or best_score >= previous_score + 0.08):
+        return best
+    if previous_score >= 0.12:
+        return previous
+    return directions[0]
+
+
 def event_key(event: dict[str, Any]) -> str:
     payload = payload_of(event)
     event_id = event.get("id")
@@ -111,7 +159,7 @@ def project_events(
     consumed: list[str] = []
     latest_node = nodes[-1] if nodes else None
     latest_direction = next((node for node in reversed(nodes) if node.get("kind") in {"direction", "steering", "rollback"}), None)
-    plan_tail = next((node for node in reversed(nodes) if node.get("kind") == "plan"), None)
+    phases_by_turn = {node.get("turnId"): node for node in nodes if node.get("kind") == "phase" and node.get("turnId")}
 
     def add_node(node: dict[str, Any]) -> dict[str, Any]:
         nonlocal latest_node
@@ -150,10 +198,12 @@ def project_events(
                 continue
             correction = bool(CORRECTION_RE.search(str(text)))
             rollback = bool(ROLLBACK_RE.search(str(text)))
-            previous = latest_node
+            previous = latest_direction
+            directions = [node for node in nodes if node.get("kind") in {"direction", "steering", "rollback"}]
             if correction and previous and previous.get("status") in ACTIVE_STATUSES:
                 previous["status"] = "rolledback" if rollback else "abandoned"
-            parent_id = previous.get("parentId") if correction and previous else (previous or {}).get("id")
+            parent = previous if correction else related_direction_parent(text, directions)
+            parent_id = previous.get("parentId") if correction and previous else (parent or {}).get("id")
             source = item_id or source_id or f"{turn_id}:{event_time}"
             latest_direction = add_node({
                 "id": f"direction-{fingerprint(source or text)}",
@@ -168,7 +218,6 @@ def project_events(
                 "score": 8 if correction else 6,
             })
             latest_node = latest_direction
-            plan_tail = None
             continue
 
         detail = str(payload.get("text") or payload.get("summary") or "").strip()
@@ -176,7 +225,12 @@ def project_events(
             title = short_title(detail, "形成关键结论")
             node_id = f"decision-{fingerprint(f'{turn_id or item_id or source_id}:decision:{title}')}"
             switches = bool(SWITCH_RE.search(detail))
-            previous = latest_node
+            active_plan = next((
+                node for node in reversed(nodes)
+                if node.get("kind") == "plan" and node.get("status") == "active"
+                and (not turn_id or node.get("turnId") == turn_id)
+            ), None)
+            previous = active_plan or latest_direction or latest_node
             if switches and previous and previous.get("status") in ACTIVE_STATUSES:
                 previous["status"] = "abandoned"
             decision = add_node({
@@ -194,6 +248,34 @@ def project_events(
             add_unique(decision, "evidence", detail, 4)
 
         plans = payload.get("plan") if isinstance(payload.get("plan"), list) else []
+        phase = None
+        valid_plans = [plan for plan in plans if isinstance(plan, dict)]
+        if valid_plans:
+            phase_key = turn_id or item_id or source_id
+            phase = phases_by_turn.get(phase_key)
+            active_step = next((plan for plan in valid_plans if plan.get("status") == "in_progress"), None)
+            representative = active_step or next((plan for plan in valid_plans if plan.get("status") != "completed"), None) or valid_plans[-1]
+            phase_title = short_title(representative.get("step") or representative.get("text"), "执行计划")
+            plan_states = {str(plan.get("status") or "pending").lower() for plan in valid_plans}
+            phase_status = "failed" if "failed" in plan_states else "active" if "in_progress" in plan_states else "planned" if "pending" in plan_states else "completed"
+            if not phase:
+                phase = add_node({
+                    "id": f"phase-{fingerprint(phase_key)}",
+                    "parentId": (latest_direction or {}).get("id"),
+                    "kind": "phase",
+                    "title": f"执行阶段：{phase_title}",
+                    "status": phase_status,
+                    "turnId": turn_id,
+                    "itemId": item_id,
+                    "sourceEventId": source_id,
+                    "time": event_time,
+                    "score": 7,
+                })
+                phases_by_turn[phase_key] = phase
+            else:
+                phase["title"] = f"执行阶段：{phase_title}"
+                phase["status"] = phase_status
+                phase["time"] = event_time or phase.get("time", "")
         for plan in plans:
             if not isinstance(plan, dict):
                 continue
@@ -207,7 +289,7 @@ def project_events(
             if not node:
                 node = add_node({
                     "id": node_id,
-                    "parentId": (plan_tail or latest_node or latest_direction or {}).get("id"),
+                    "parentId": (phase or latest_direction or {}).get("id"),
                     "kind": "plan",
                     "title": title,
                     "status": status,
@@ -217,7 +299,6 @@ def project_events(
                     "time": event_time,
                     "score": 7,
                 })
-                plan_tail = node
             else:
                 node["status"] = status
                 node["time"] = event_time or node.get("time", "")

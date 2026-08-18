@@ -647,7 +647,7 @@ body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56p
 .exploration-map-head h2 { margin: 1px 0 0; color: #edf3f4; font-size: 18px; }
 .exploration-map-head p { margin: 3px 0 0; color: #7f8d93; font-size: 10px; }
 .exploration-map-head-actions { display: flex; align-items: center; gap: 12px; flex: 0 0 auto; }
-.exploration-zoom { height: 27px; display: grid; grid-template-columns: 27px 52px 27px; overflow: hidden; border: 1px solid #3a484e; border-radius: 5px; background: #0e1518; }
+.exploration-zoom { height: 27px; display: grid; grid-template-columns: 27px 52px 27px 38px; overflow: hidden; border: 1px solid #3a484e; border-radius: 5px; background: #0e1518; }
 .exploration-zoom button { min-width: 0; border: 0; border-right: 1px solid #334047; border-radius: 0; padding: 0; background: transparent; color: #aab8bd; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
 .exploration-zoom button:last-child { border-right: 0; }.exploration-zoom button:hover { background: #263238; color: #e5edef; }.exploration-zoom button:nth-child(2) { font-size: 9px; }
 .exploration-follow { display: inline-flex; align-items: center; gap: 6px; color: #91a0a6; font-size: 10px; cursor: pointer; }
@@ -659,10 +659,16 @@ body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56p
 .exploration-map-world { position: absolute; inset: 0 auto auto 0; transform-origin: 0 0; will-change: transform; }
 .exploration-edges { position: absolute; inset: 0; overflow: visible; pointer-events: none; }
 .exploration-edge { fill: none; stroke: #3d4a50; stroke-width: 2; }
+.exploration-edge.kind-direction, .exploration-edge.kind-steering, .exploration-edge.kind-rollback { stroke-width: 3; }
+.exploration-edge.kind-phase { stroke: #52747a; stroke-width: 2.5; }
+.exploration-edge.kind-plan { stroke-width: 1.5; }
 .exploration-edge.active { stroke: #55bcc7; stroke-dasharray: 7 6; animation: exploration-flow 1.2s linear infinite; }
 .exploration-edge.completed { stroke: #679b62; }.exploration-edge.failed { stroke: #c96358; }.exploration-edge.rolledback { stroke: #aa83ca; }.exploration-edge.abandoned { stroke: #b39850; stroke-dasharray: 4 5; }
 @keyframes exploration-flow { to { stroke-dashoffset: -13; } }
 .exploration-node { position: absolute; width: 194px; height: 86px; display: grid; grid-template-columns: 31px minmax(0, 1fr); align-items: stretch; gap: 9px; overflow: hidden; border: 1px solid #46535a; border-left: 3px solid #68767c; border-radius: 6px; padding: 0 11px 0 0; background: #182126; color: #d5dfe2; text-align: left; box-shadow: 0 8px 22px #0007; transition: border-color .14s, transform .14s, box-shadow .14s; }
+.exploration-node.kind-direction, .exploration-node.kind-steering, .exploration-node.kind-rollback { border-width: 2px; border-left-width: 5px; background: #202a2f; box-shadow: 0 10px 26px #0009; }
+.exploration-node.kind-phase { border-color: #52747a; border-left-width: 4px; background: #14282d; }
+.exploration-node.kind-plan { background: #151c20; box-shadow: 0 5px 14px #0006; }
 .exploration-node-time { position: absolute; width: 194px; color: #65767c; font: 8px ui-monospace, SFMono-Regular, Consolas, monospace; text-align: center; white-space: nowrap; }
 .exploration-node-time::before { content: ""; display: inline-block; width: 20px; height: 1px; margin-right: 6px; background: #3e5056; vertical-align: middle; }
 .exploration-node:hover { border-color: #819097; transform: translateY(-2px); box-shadow: 0 12px 26px #0009; }
@@ -673,6 +679,7 @@ body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56p
 .exploration-node-copy { min-width: 0; display: flex; flex-direction: column; justify-content: center; gap: 7px; }
 .exploration-node-copy strong { display: -webkit-box; overflow: hidden; color: #e1e8ea; font-size: 11px; line-height: 1.45; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .exploration-node-copy small { overflow: hidden; color: #83949a; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.exploration-node-copy small b { color: #b5c5c9; font-size: 8px; letter-spacing: 0; }
 .exploration-node.active .exploration-node-copy small { color: #84dbe3; }
 .exploration-map-detail { min-width: 0; min-height: 0; overflow: auto; border-left: 1px solid #2b373d; padding: 18px; background: #12191d; }
 .exploration-detail-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }

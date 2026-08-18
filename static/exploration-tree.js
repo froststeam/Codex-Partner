@@ -7,10 +7,11 @@ const explorationStatusMeta = {
   rolledback: { label: "已回退", symbol: "↶" },
   abandoned: { label: "已转向", symbol: "↗" },
 };
-const explorationZoomBounds = { min: .35, max: 1.8 };
+const explorationZoomBounds = { min: .1, max: 1.8 };
 let explorationZoom = 1;
 let explorationDrag = null;
 let suppressExplorationClick = false;
+let explorationFramePending = false;
 
 function clampExplorationZoom(value) {
   return Math.min(explorationZoomBounds.max, Math.max(explorationZoomBounds.min, value));
@@ -72,9 +73,9 @@ function explorationLayout(nodes) {
   };
   roots.forEach(root => place(root, 0));
   nodes.forEach(node => { if (!positions.has(node.id)) place(node, 0); });
-  nodes.forEach((node, column) => { positions.get(node.id).column = column; });
   const maxRow = Math.max(0, ...[...positions.values()].map(position => position.row));
-  return { positions, maxRow, width: Math.max(760, 90 + nodes.length * 244), height: Math.max(430, 80 + (maxRow + 1) * 126) };
+  const maxDepth = Math.max(0, ...[...positions.values()].map(position => position.depth));
+  return { positions, maxRow, maxDepth, width: Math.max(760, 90 + (maxDepth + 1) * 244), height: Math.max(430, 80 + (maxRow + 1) * 126) };
 }
 
 function applyActivityMapSnapshot(snapshot = {}) {
@@ -115,8 +116,8 @@ function explorationEdgePath(parent, child) {
   const startY = parent.y + 43;
   const endX = child.x;
   const endY = child.y + 43;
-  const curve = Math.max(24, (endX - startX) * .48);
-  return `M ${startX} ${startY} C ${startX + curve} ${startY}, ${endX - curve} ${endY}, ${endX} ${endY}`;
+  const junctionX = startX + Math.max(24, (endX - startX) * .45);
+  return `M ${startX} ${startY} H ${junctionX} V ${endY} H ${endX}`;
 }
 
 function renderExplorationDetail(node) {
@@ -130,7 +131,7 @@ function renderExplorationDetail(node) {
   const evidence = (node.evidence || []).map(value => `<li>${esc(value)}</li>`).join("");
   const files = (node.files || []).map(value => `<li><code>${esc(value)}</code></li>`).join("");
   const commands = (node.commands || []).map(value => `<li><code>${esc(value)}</code></li>`).join("");
-  const typeLabel = node.kind === "plan" ? "计划方向" : node.kind === "decision" ? "关键结论" : node.kind === "steering" ? "方向调整" : node.kind === "rollback" ? "回退决策" : "用户目标";
+  const typeLabel = node.kind === "plan" ? "计划步骤" : node.kind === "phase" ? "执行阶段" : node.kind === "decision" ? "关键结论" : node.kind === "steering" ? "方向调整" : node.kind === "rollback" ? "回退决策" : "用户目标";
   detail.innerHTML = `<div class="exploration-detail-head"><span class="exploration-node-state ${esc(node.status)}">${meta.symbol} ${meta.label}</span><small>${esc(typeLabel)}</small></div><h3>${esc(node.title)}</h3>${node.summary ? `<p class="exploration-detail-summary">${esc(node.summary)}</p>` : ""}<dl class="exploration-detail-facts"><div><dt>时间</dt><dd>${node.time ? esc(shortDate(node.time)) : "当前会话"}</dd></div><div><dt>关键度</dt><dd>${Number(node.score) || 0} / 10</dd></div><div><dt>执行异常</dt><dd>${Number(node.failures) || 0}</dd></div></dl>${evidence ? `<section><h4>方向证据</h4><ul>${evidence}</ul></section>` : ""}${files ? `<section><h4>相关文件</h4><ul>${files}</ul></section>` : ""}${commands ? `<details><summary>核心命令 · ${(node.commands || []).length}</summary><ul>${commands}</ul></details>` : ""}<div class="exploration-detail-actions"><button type="button" class="primary" data-exploration-jump="${esc(node.id)}">在对话中查看</button></div>`;
 }
 
@@ -143,6 +144,47 @@ function revealExplorationNode(id, smooth = false) {
     top: (node.offsetTop + node.offsetHeight / 2) * explorationZoom - viewport.clientHeight / 2,
     behavior: smooth ? "smooth" : "auto",
   });
+}
+
+function frameExplorationNodes(ids, maxZoom = .95) {
+  const viewport = $("#exploration-map-viewport");
+  const canvas = $("#exploration-map-canvas");
+  const world = canvas?.querySelector(".exploration-map-world");
+  if (!viewport || !canvas || !world) return;
+  const elements = ids.map(id => world.querySelector(`[data-exploration-node="${CSS.escape(id)}"]`)).filter(Boolean);
+  if (!elements.length) return;
+  const left = Math.min(...elements.map(element => element.offsetLeft));
+  const top = Math.min(...elements.map(element => element.offsetTop));
+  const right = Math.max(...elements.map(element => element.offsetLeft + element.offsetWidth));
+  const bottom = Math.max(...elements.map(element => element.offsetTop + element.offsetHeight));
+  const padding = 28;
+  const zoom = clampExplorationZoom(Math.min(maxZoom, (viewport.clientWidth - padding * 2) / Math.max(1, right - left), (viewport.clientHeight - padding * 2) / Math.max(1, bottom - top)));
+  explorationZoom = zoom;
+  const width = Number(world.dataset.width) || world.offsetWidth;
+  const height = Number(world.dataset.height) || world.offsetHeight;
+  canvas.style.width = `${width * zoom}px`;
+  canvas.style.height = `${height * zoom}px`;
+  world.style.transform = `scale(${zoom})`;
+  const label = $("#exploration-zoom-reset");
+  if (label) label.textContent = `${Math.round(zoom * 100)}%`;
+  viewport.scrollLeft = ((left + right) / 2) * zoom - viewport.clientWidth / 2;
+  viewport.scrollTop = ((top + bottom) / 2) * zoom - viewport.clientHeight / 2;
+}
+
+function frameExplorationBranch(id) {
+  const node = explorationNodeById(id);
+  if (!node) return;
+  const parent = explorationNodeById(node.parentId);
+  if (!parent) {
+    frameExplorationNodes([node.id]);
+    return;
+  }
+  const siblings = (state.explorationNodes || []).filter(candidate => candidate.parentId === parent.id);
+  frameExplorationNodes([parent.id, ...siblings.map(candidate => candidate.id)]);
+}
+
+function fitExplorationTree() {
+  frameExplorationNodes((state.explorationNodes || []).map(node => node.id), 1);
 }
 
 function renderExplorationMap(options = {}) {
@@ -180,25 +222,26 @@ function renderExplorationMap(options = {}) {
   const viewportWidth = viewport?.clientWidth || 0;
   const verticalOffset = Math.max(40, (viewportHeight - 86) / 2);
   const horizontalOffset = Math.max(48, (viewportWidth - 194) / 2);
-  layout.width = Math.max(layout.width, horizontalOffset * 2 + Math.max(0, nodes.length - 1) * 244 + 194);
+  layout.width = Math.max(layout.width, horizontalOffset * 2 + layout.maxDepth * 244 + 194);
   layout.height = Math.max(layout.height, verticalOffset * 2 + layout.maxRow * 126 + 86);
   const coordinates = new Map();
   for (const node of nodes) {
     const position = layout.positions.get(node.id);
-    coordinates.set(node.id, { x: horizontalOffset + position.column * 244, y: verticalOffset + position.row * 126 });
+    coordinates.set(node.id, { x: horizontalOffset + position.depth * 244, y: verticalOffset + position.row * 126 });
   }
   const edges = nodes.map(node => {
     const parent = coordinates.get(node.parentId);
     const child = coordinates.get(node.id);
     if (!parent || !child) return "";
-    return `<path class="exploration-edge ${esc(node.status)}" d="${explorationEdgePath(parent, child)}" />`;
+    return `<path class="exploration-edge kind-${esc(node.kind)} ${esc(node.status)}" d="${explorationEdgePath(parent, child)}" />`;
   }).join("");
   const cards = nodes.map((node, index) => {
     const point = coordinates.get(node.id);
     const meta = explorationStatusMeta[node.status] || explorationStatusMeta.planned;
     const selected = node.id === state.explorationSelectedNodeId;
     const time = node.time ? `<span class="exploration-node-time" style="left:${point.x}px;top:${Math.max(8, point.y - 22)}px">${esc(shortDate(node.time))}</span>` : "";
-    return `${time}<button type="button" class="exploration-node ${esc(node.status)}${selected ? " selected" : ""}" style="left:${point.x}px;top:${point.y}px" data-exploration-node="${esc(node.id)}" aria-pressed="${selected}"><span class="exploration-node-index">${String(index + 1).padStart(2, "0")}</span><span class="exploration-node-copy"><strong>${esc(node.title)}</strong><small>${meta.symbol} ${meta.label}${node.files?.length ? ` · ${node.files.length} 文件` : ""}</small></span></button>`;
+    const kindLabel = node.kind === "plan" ? "步骤" : node.kind === "phase" ? "阶段" : node.kind === "decision" ? "结论" : node.kind === "steering" ? "转向" : node.kind === "rollback" ? "回退" : "方向";
+    return `${time}<button type="button" class="exploration-node kind-${esc(node.kind)} ${esc(node.status)}${selected ? " selected" : ""}" style="left:${point.x}px;top:${point.y}px" data-exploration-node="${esc(node.id)}" aria-pressed="${selected}"><span class="exploration-node-index">${String(index + 1).padStart(2, "0")}</span><span class="exploration-node-copy"><strong>${esc(node.title)}</strong><small><b>${kindLabel}</b> · ${meta.symbol} ${meta.label}${node.files?.length ? ` · ${node.files.length} 文件` : ""}</small></span></button>`;
   }).join("");
   canvas.style.width = `${layout.width * explorationZoom}px`;
   canvas.style.height = `${layout.height * explorationZoom}px`;
@@ -212,17 +255,22 @@ function renderExplorationMap(options = {}) {
     state.explorationSelectedNodeId = selected?.id || "";
   }
   renderExplorationDetail(selected);
-  if (options.reveal || ($("#exploration-follow-current")?.checked && options.liveUpdate)) requestAnimationFrame(() => revealExplorationNode(selected?.id || "", Boolean(options.liveUpdate)));
+  if (options.frameBranch || explorationFramePending) {
+    explorationFramePending = false;
+    requestAnimationFrame(() => frameExplorationBranch(selected?.id || ""));
+  }
+  else if (options.reveal || ($("#exploration-follow-current")?.checked && options.liveUpdate)) requestAnimationFrame(() => revealExplorationNode(selected?.id || "", Boolean(options.liveUpdate)));
 }
 
 function openExplorationMap() {
   state.explorationOpen = true;
+  explorationFramePending = true;
   state.explorationSelectedNodeId = explorationCurrentNode()?.id || "";
   const map = $("#exploration-map");
   map.classList.add("open");
   map.setAttribute("aria-hidden", "false");
   document.body.classList.add("exploration-map-visible");
-  renderExplorationMap({ reveal: true });
+  renderExplorationMap({ frameBranch: true });
   if (state.explorationNeedsSync) scheduleRenderChat();
   loadPrecomputedActivityMap();
 }
@@ -302,6 +350,7 @@ $("#exploration-map-viewport")?.addEventListener("click", event => {
 $("#exploration-zoom-out")?.addEventListener("click", () => updateExplorationZoom(null, null, explorationZoom - .1));
 $("#exploration-zoom-reset")?.addEventListener("click", () => updateExplorationZoom(null, null, 1));
 $("#exploration-zoom-in")?.addEventListener("click", () => updateExplorationZoom(null, null, explorationZoom + .1));
+$("#exploration-zoom-fit")?.addEventListener("click", fitExplorationTree);
 $("#exploration-map-canvas")?.addEventListener("click", event => {
   const button = event.target.closest("[data-exploration-node]");
   if (!button) return;
