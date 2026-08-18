@@ -339,7 +339,8 @@ class RunningStateTests(unittest.TestCase):
         )
         self.assertEqual("original", inputs[1]["detail"])
         self.assertEqual("notes.pdf", inputs[2]["name"])
-        self.assertTrue(all(str(workspace) in item["path"] for item in inputs[1:]))
+        resolved_workspace = workspace.resolve()
+        self.assertTrue(all(resolved_workspace in Path(item["path"]).resolve().parents for item in inputs[1:]))
 
     def test_attachment_frontend_uses_structured_appserver_inputs(self):
         static = Path(__file__).resolve().parents[1] / "static"
