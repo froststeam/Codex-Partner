@@ -132,7 +132,8 @@ def event_key(event: dict[str, Any]) -> str:
         for key in ("type", "turn_id", "turnId", "item_id", "id", "status", "phase")
     )
     body = payload.get("text") or payload.get("command") or payload.get("tool") or ""
-    return f"live:{fingerprint(f'{event.get("ts", "")}:{identity}:{body}') }"
+    source = f"{event.get('ts', '')}:{identity}:{body}"
+    return f"live:{fingerprint(source)}"
 
 
 def semantic_event(event: dict[str, Any]) -> bool:
