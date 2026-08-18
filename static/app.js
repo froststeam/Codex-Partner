@@ -270,6 +270,8 @@ async function submitMessage(mode = "codex") {
     } catch (error) { input.value = message; resizeComposerInput(input); renderCommandPalette(); toast(error.message); }
     return;
   }
+  const draftMessage = message;
+  const draftAttachments = [...pendingAttachments];
   if (pendingAttachments.length) {
     message += pendingAttachments.map((file, index) => {
       const prefix = message || index ? "\n\n" : "";
@@ -277,15 +279,36 @@ async function submitMessage(mode = "codex") {
       return `${prefix}[${uiLabel("attachments")}：${file.name}]\n\n\`\`\`\n${file.content}\n\`\`\``;
     }).join("");
   }
-  // Enter never interrupts an active turn. The server owns the durable FIFO
-  // and dispatches this message as a new turn once the current owner exits.
+  let takeoverTerminal = false;
+  const terminalActive = Boolean(state.selectedTask?.external_running) && state.selectedTask?.execution_source === "terminal";
+  if (mode === "codex" && terminalActive) {
+    takeoverTerminal = await appConfirm(uiLabel("terminalTakeoverConfirm"), { danger: true, confirmLabel: uiLabel("terminalTakeoverAction") });
+    if (!takeoverTerminal) return;
+  }
+  // Dashboard-owned turns stay FIFO. A terminal-owned turn requires an
+  // explicit takeover confirmation; Alt+Enter always remains queue-only.
   const clientMessageId = crypto.randomUUID ? crypto.randomUUID() : String(Date.now());
-  const delivery = mode === "queue" || activeTurn ? "queue" : "auto";
+  const delivery = mode === "queue" || (activeTurn && !takeoverTerminal) ? "queue" : "auto";
   const optimisticStatus = delivery === "queue" ? "queued" : "sending";
   const optimistic = { id: clientMessageId, body: message, status: optimisticStatus, created_at: new Date().toISOString(), _optimistic: true };
   upsertTaskMessage(optimistic); state.historyIndex = -1; input.value = ""; resizeComposerInput(input); pendingAttachments = []; $("#composer-context").textContent = ""; $("#attach-file").value = ""; $("#command-palette").hidden = true; renderGoalBar(); scheduleRenderChat(); input.focus();
   try {
-    const delivered = await api(`/tasks/${taskId}/messages`, { method: "POST", body: JSON.stringify({ message, client_message_id: clientMessageId, delivery }) });
+    let delivered;
+    try {
+      delivered = await api(`/tasks/${taskId}/messages`, { method: "POST", body: JSON.stringify({ message, client_message_id: clientMessageId, delivery, takeover_terminal: takeoverTerminal }) });
+    } catch (error) {
+      if (mode !== "codex" || error.code !== "terminal_turn_active" || takeoverTerminal) throw error;
+      const confirmed = await appConfirm(uiLabel("terminalTakeoverConfirm"), { danger: true, confirmLabel: uiLabel("terminalTakeoverAction") });
+      if (!confirmed) {
+        if (state.selectedId === taskId) {
+          removeTaskMessage(clientMessageId); input.value = draftMessage; pendingAttachments = draftAttachments;
+          resizeComposerInput(input); renderComposerAttachments(); renderGoalBar(); scheduleRenderChat(); input.focus();
+        }
+        return;
+      }
+      takeoverTerminal = true;
+      delivered = await api(`/tasks/${taskId}/messages`, { method: "POST", body: JSON.stringify({ message, client_message_id: clientMessageId, delivery: "auto", takeover_terminal: true }) });
+    }
     if (state.selectedId === taskId) { upsertTaskMessage(delivered); renderQueuedMessages(); refreshComposerHistory(); renderGoalBar(); scheduleRenderChat(); }
     if (activeTurn && delivered.status === "queued") toast(uiLabel("queuedAfterTurn"));
   } catch (error) {

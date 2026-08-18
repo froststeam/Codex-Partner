@@ -20,6 +20,7 @@ Codex Partner is a self-hosted control panel for long-running Codex work. It kee
 - Model and API provider management with health checks and failover
 - Codex memories, Skills, archive, recycle bin, and SSH workspace support
 - Default YOLO mode for newly created sessions
+- Safe terminal-to-web takeover: normal web sends ask before stopping a terminal turn; `Alt+Enter` keeps the message queued without interruption
 
 ## Platform support
 
@@ -98,7 +99,7 @@ py -m codex_partner
 ## Docker
 
 ```bash
-docker build -t codex-partner:0.0.6 .
+docker build -t codex-partner:0.0.7 .
 docker run -d --name codex-partner \
   -p 8787:8787 \
   --add-host=host.docker.internal:host-gateway \
@@ -107,7 +108,7 @@ docker run -d --name codex-partner \
   -v codex-partner-data:/var/lib/codex-partner \
   -v codex-home:/home/codex/.codex \
   -v codex-workspace:/workspace \
-  codex-partner:0.0.6
+  codex-partner:0.0.7
 docker exec -it codex-partner codex login
 ```
 
