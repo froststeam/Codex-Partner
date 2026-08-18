@@ -522,6 +522,13 @@ function copyChatBlock(blockIndex, itemIndex = -1) {
   return String(block.text || "").trim();
 }
 
+function activityEventIsVisible(item, active = false) {
+  const kind = String(item?.kind || "").toLowerCase();
+  const tool = String(item?.tool || "").toLowerCase();
+  if (kind !== "commandexecution" || !["exec", "exec_command", "functions.exec"].includes(tool)) return true;
+  return active || Boolean(String(item?.command || "").trim() || String(item?.output || "").trim() || String(item?.detail || "").trim());
+}
+
 function renderActivityEvent(item, active = false, blockIndex = -1, itemIndex = -1, outputKey = "") {
   const status = String(item.status || "").toLowerCase();
   const statusText = status === "failed" ? "失败" : active ? "执行中" : "";
@@ -534,7 +541,7 @@ function renderActivityEvent(item, active = false, blockIndex = -1, itemIndex = 
   const plan = Array.isArray(item.plan) ? item.plan.filter(step => step && (step.step || step.text)) : [];
   const isWait = kind.includes("wait") || /(?:^|[._])wait$/.test(String(item.tool || ""));
   const toolName = String(item.tool || "").toLowerCase();
-  if (!command && !plan.length && ["exec", "functions.exec"].includes(toolName)) return "";
+  if (!activityEventIsVisible(item, active)) return "";
   const action = plan.length || kind.includes("plan") ? "Planned" : isWait ? "Waited" : changes.length || kind.includes("file") ? "Edited" : kind.includes("mcp") || (!command && item.tool) ? "Called" : kind.includes("search") || kind.includes("explor") ? "Explored" : kind.includes("reason") ? "Reasoned" : command ? "Ran" : item.label || uiLabel("activityWorking");
   const inlineArgs = args ? args.replace(/\s+/g, " ") : "";
   const completedPlanSteps = plan.filter(step => step.status === "completed").length;
@@ -567,14 +574,15 @@ function renderChatBlock(block, blockIndex, liveActivity = false) {
   const blockAttribute = ` data-chat-block-index="${blockIndex}"`;
   if (block.role === "activities") {
     const activityKey = String(block.activityKey || `activity-${blockIndex}`);
+    const displayItems = block.items.filter((item, index) => activityEventIsVisible(item, liveActivity && index === block.items.length - 1));
+    if (!displayItems.length) return "";
     const visibleCount = Math.max(16, Number(state.activityVisibleCounts[activityKey]) || 16);
-    const items = block.items.slice(-visibleCount);
+    const items = displayItems.slice(-visibleCount);
     const latest = items[items.length - 1] || {};
-    const itemOffset = block.items.length - items.length;
     const current = liveActivity ? `<span class="activity-current">${esc(latest.text || uiLabel("activityWorking"))}</span>` : "";
-    const hiddenCount = block.items.length - items.length;
+    const hiddenCount = displayItems.length - items.length;
     const older = hiddenCount ? `<button type="button" class="activity-load-older" data-activity-key="${esc(activityKey)}">${uiLabel("loadEarlierActivity", { count: hiddenCount })}</button>` : "";
-    return `<details class="activity-group${liveActivity ? " live" : ""}"${blockAttribute}${liveActivity ? ' data-live="true" open' : ""}><summary><span class="activity-pulse" aria-hidden="true"><i></i></span><strong>${uiLabel("activity")}</strong>${current}<small>${block.items.length}</small></summary><div class="activity-events">${older}${items.map((item, index) => { const itemIndex = itemOffset + index; const outputKey = `activity-output:${activityKey}:${item.itemId || itemIndex}`; return renderActivityEvent(item, liveActivity && index === items.length - 1, blockIndex, itemIndex, outputKey); }).join("")}</div></details>`;
+    return `<details class="activity-group${liveActivity ? " live" : ""}"${blockAttribute}${liveActivity ? ' data-live="true" open' : ""}><summary><span class="activity-pulse" aria-hidden="true"><i></i></span><strong>${uiLabel("activity")}</strong>${current}<small>${displayItems.length}</small></summary><div class="activity-events">${older}${items.map(item => { const itemIndex = block.items.indexOf(item); const outputKey = `activity-output:${activityKey}:${item.itemId || itemIndex}`; return renderActivityEvent(item, liveActivity && itemIndex === block.items.length - 1, blockIndex, itemIndex, outputKey); }).join("")}</div></details>`;
   }
   const deliveryLabels = { sending: uiLabel("sending"), steering: uiLabel("steering"), steered: uiLabel("steering"), queued: uiLabel("queued"), running: `${statusLabel("running")} · Codex`, failed: uiLabel("failedSend") };
   const label = block.role === "user" ? (block.commandBlock ? uiLabel("commandLabel") : "") : (block.commandBlock ? uiLabel("commandResult") : uiLabel("codexPartner"));
@@ -584,8 +592,9 @@ function renderChatBlock(block, blockIndex, liveActivity = false) {
 function loadEarlierActivity(activityKey) {
   const block = (state.chatBlocks || []).find(item => item.role === "activities" && String(item.activityKey || "") === activityKey);
   if (!block) return;
+  const displayCount = block.items.filter(item => activityEventIsVisible(item)).length;
   const visibleCount = Math.max(16, Number(state.activityVisibleCounts[activityKey]) || 16);
-  state.activityVisibleCounts[activityKey] = Math.min(block.items.length, visibleCount + 16);
+  state.activityVisibleCounts[activityKey] = Math.min(displayCount, visibleCount + 16);
   paintVirtualChat(false);
 }
 
