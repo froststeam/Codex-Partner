@@ -647,11 +647,16 @@ body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56p
 .exploration-map-head h2 { margin: 1px 0 0; color: #edf3f4; font-size: 18px; }
 .exploration-map-head p { margin: 3px 0 0; color: #7f8d93; font-size: 10px; }
 .exploration-map-head-actions { display: flex; align-items: center; gap: 12px; flex: 0 0 auto; }
+.exploration-zoom { height: 27px; display: grid; grid-template-columns: 27px 52px 27px; overflow: hidden; border: 1px solid #3a484e; border-radius: 5px; background: #0e1518; }
+.exploration-zoom button { min-width: 0; border: 0; border-right: 1px solid #334047; border-radius: 0; padding: 0; background: transparent; color: #aab8bd; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.exploration-zoom button:last-child { border-right: 0; }.exploration-zoom button:hover { background: #263238; color: #e5edef; }.exploration-zoom button:nth-child(2) { font-size: 9px; }
 .exploration-follow { display: inline-flex; align-items: center; gap: 6px; color: #91a0a6; font-size: 10px; cursor: pointer; }
 .exploration-follow input { accent-color: #62c5cf; }
 .exploration-map-body { min-width: 0; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 318px; }
-.exploration-map-viewport { position: relative; min-width: 0; min-height: 0; overflow: auto; background-color: #0a1013; background-image: linear-gradient(#1c292e 1px, transparent 1px), linear-gradient(90deg, #1c292e 1px, transparent 1px); background-size: 28px 28px; }
+.exploration-map-viewport { position: relative; min-width: 0; min-height: 0; overflow: auto; background-color: #0a1013; background-image: linear-gradient(#1c292e 1px, transparent 1px), linear-gradient(90deg, #1c292e 1px, transparent 1px); background-size: 28px 28px; cursor: grab; touch-action: none; user-select: none; }
+.exploration-map-viewport.dragging { cursor: grabbing; }
 .exploration-map-canvas { position: relative; min-width: 100%; min-height: 100%; }
+.exploration-map-world { position: absolute; inset: 0 auto auto 0; transform-origin: 0 0; will-change: transform; }
 .exploration-edges { position: absolute; inset: 0; overflow: visible; pointer-events: none; }
 .exploration-edge { fill: none; stroke: #3d4a50; stroke-width: 2; }
 .exploration-edge.active { stroke: #55bcc7; stroke-dasharray: 7 6; animation: exploration-flow 1.2s linear infinite; }

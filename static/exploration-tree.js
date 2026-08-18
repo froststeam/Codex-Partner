@@ -7,6 +7,38 @@ const explorationStatusMeta = {
   rolledback: { label: "已回退", symbol: "↶" },
   abandoned: { label: "已转向", symbol: "↗" },
 };
+const explorationZoomBounds = { min: .35, max: 1.8 };
+let explorationZoom = 1;
+let explorationDrag = null;
+let suppressExplorationClick = false;
+
+function clampExplorationZoom(value) {
+  return Math.min(explorationZoomBounds.max, Math.max(explorationZoomBounds.min, value));
+}
+
+function updateExplorationZoom(anchorX, anchorY, nextZoom) {
+  const viewport = $("#exploration-map-viewport");
+  const canvas = $("#exploration-map-canvas");
+  const world = canvas?.querySelector(".exploration-map-world");
+  if (!viewport || !canvas || !world) return;
+  const oldZoom = explorationZoom;
+  const zoom = clampExplorationZoom(nextZoom);
+  if (Math.abs(zoom - oldZoom) < .001) return;
+  const pointerX = Number.isFinite(anchorX) ? anchorX : viewport.clientWidth / 2;
+  const pointerY = Number.isFinite(anchorY) ? anchorY : viewport.clientHeight / 2;
+  const worldX = (viewport.scrollLeft + pointerX) / oldZoom;
+  const worldY = (viewport.scrollTop + pointerY) / oldZoom;
+  explorationZoom = zoom;
+  const width = Number(world.dataset.width) || world.offsetWidth;
+  const height = Number(world.dataset.height) || world.offsetHeight;
+  canvas.style.width = `${width * zoom}px`;
+  canvas.style.height = `${height * zoom}px`;
+  world.style.transform = `scale(${zoom})`;
+  viewport.scrollLeft = worldX * zoom - pointerX;
+  viewport.scrollTop = worldY * zoom - pointerY;
+  const label = $("#exploration-zoom-reset");
+  if (label) label.textContent = `${Math.round(zoom * 100)}%`;
+}
 
 function explorationNodeById(id) {
   return (state.explorationNodes || []).find(node => node.id === id) || null;
@@ -124,7 +156,12 @@ function renderExplorationDetail(node) {
 function revealExplorationNode(id, smooth = false) {
   const viewport = $("#exploration-map-viewport");
   const node = viewport?.querySelector(`[data-exploration-node="${CSS.escape(id)}"]`);
-  node?.scrollIntoView({ behavior: smooth ? "smooth" : "auto", block: "center", inline: "center" });
+  if (!viewport || !node) return;
+  viewport.scrollTo({
+    left: (node.offsetLeft + node.offsetWidth / 2) * explorationZoom - viewport.clientWidth / 2,
+    top: (node.offsetTop + node.offsetHeight / 2) * explorationZoom - viewport.clientHeight / 2,
+    behavior: smooth ? "smooth" : "auto",
+  });
 }
 
 function renderExplorationMap(options = {}) {
@@ -182,9 +219,11 @@ function renderExplorationMap(options = {}) {
     const time = node.time ? `<span class="exploration-node-time" style="left:${point.x}px;top:${Math.max(8, point.y - 22)}px">${esc(shortDate(node.time))}</span>` : "";
     return `${time}<button type="button" class="exploration-node ${esc(node.status)}${selected ? " selected" : ""}" style="left:${point.x}px;top:${point.y}px" data-exploration-node="${esc(node.id)}" aria-pressed="${selected}"><span class="exploration-node-index">${String(index + 1).padStart(2, "0")}</span><span class="exploration-node-copy"><strong>${esc(node.title)}</strong><small>${meta.symbol} ${meta.label}${node.files?.length ? ` · ${node.files.length} 文件` : ""}</small></span></button>`;
   }).join("");
-  canvas.style.width = `${layout.width}px`;
-  canvas.style.height = `${layout.height}px`;
-  canvas.innerHTML = `<svg class="exploration-edges" width="${layout.width}" height="${layout.height}" aria-hidden="true">${edges}</svg>${cards}`;
+  canvas.style.width = `${layout.width * explorationZoom}px`;
+  canvas.style.height = `${layout.height * explorationZoom}px`;
+  canvas.innerHTML = `<div class="exploration-map-world" data-width="${layout.width}" data-height="${layout.height}" style="width:${layout.width}px;height:${layout.height}px;transform:scale(${explorationZoom})"><svg class="exploration-edges" width="${layout.width}" height="${layout.height}" aria-hidden="true">${edges}</svg>${cards}</div>`;
+  const zoomLabel = $("#exploration-zoom-reset");
+  if (zoomLabel) zoomLabel.textContent = `${Math.round(explorationZoom * 100)}%`;
 
   let selected = explorationNodeById(state.explorationSelectedNodeId);
   if (!selected) {
@@ -233,6 +272,50 @@ function jumpToExplorationNode(id) {
 $("#exploration-map-open")?.addEventListener("click", openExplorationMap);
 $("#exploration-map-close")?.addEventListener("click", closeExplorationMap);
 $("#exploration-map")?.addEventListener("click", event => { if (event.target === event.currentTarget) closeExplorationMap(); });
+$("#exploration-map-viewport")?.addEventListener("wheel", event => {
+  if (!state.explorationOpen || !state.explorationNodes?.length) return;
+  event.preventDefault();
+  const rect = event.currentTarget.getBoundingClientRect();
+  const intensity = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? .045 : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? .35 : .0015;
+  updateExplorationZoom(event.clientX - rect.left, event.clientY - rect.top, explorationZoom * Math.exp(-event.deltaY * intensity));
+}, { passive: false });
+$("#exploration-map-viewport")?.addEventListener("pointerdown", event => {
+  if (event.button !== 0 || !state.explorationOpen) return;
+  const viewport = event.currentTarget;
+  explorationDrag = { id: event.pointerId, x: event.clientX, y: event.clientY, left: viewport.scrollLeft, top: viewport.scrollTop, moved: false };
+  viewport.setPointerCapture(event.pointerId);
+});
+$("#exploration-map-viewport")?.addEventListener("pointermove", event => {
+  const drag = explorationDrag;
+  if (!drag || drag.id !== event.pointerId) return;
+  const dx = event.clientX - drag.x;
+  const dy = event.clientY - drag.y;
+  if (!drag.moved && Math.hypot(dx, dy) < 4) return;
+  drag.moved = true;
+  event.currentTarget.classList.add("dragging");
+  event.currentTarget.scrollLeft = drag.left - dx;
+  event.currentTarget.scrollTop = drag.top - dy;
+  event.preventDefault();
+});
+const finishExplorationDrag = event => {
+  if (!explorationDrag || explorationDrag.id !== event.pointerId) return;
+  suppressExplorationClick = explorationDrag.moved;
+  if (suppressExplorationClick) setTimeout(() => { suppressExplorationClick = false; }, 0);
+  explorationDrag = null;
+  event.currentTarget.classList.remove("dragging");
+  if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+};
+$("#exploration-map-viewport")?.addEventListener("pointerup", finishExplorationDrag);
+$("#exploration-map-viewport")?.addEventListener("pointercancel", finishExplorationDrag);
+$("#exploration-map-viewport")?.addEventListener("click", event => {
+  if (!suppressExplorationClick) return;
+  suppressExplorationClick = false;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+}, true);
+$("#exploration-zoom-out")?.addEventListener("click", () => updateExplorationZoom(null, null, explorationZoom - .1));
+$("#exploration-zoom-reset")?.addEventListener("click", () => updateExplorationZoom(null, null, 1));
+$("#exploration-zoom-in")?.addEventListener("click", () => updateExplorationZoom(null, null, explorationZoom + .1));
 $("#exploration-map-canvas")?.addEventListener("click", event => {
   const button = event.target.closest("[data-exploration-node]");
   if (!button) return;
