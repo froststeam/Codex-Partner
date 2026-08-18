@@ -111,7 +111,7 @@ body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56p
 @keyframes live-pulse { 0%, 100% { box-shadow: 0 0 0 0 #d6f77f55; } 50% { box-shadow: 0 0 0 4px #d6f77f00; } }
 .session-list { min-height: 0; flex: 1; overflow: auto; padding: 0 8px 12px; }
 .session-card { position: relative; width: 100%; height: 36px; min-height: 36px; display: flex; align-items: center; gap: 7px; padding: 4px 7px 4px 17px; margin: 2px 0; text-align: left; border: 1px solid #354046; border-radius: 5px; color: var(--text); background: #151d21; }
-.session-card.running { border-color: #7da45b; background: #1b2b1d; box-shadow: inset 3px 0 #9bcf70; }.session-card.paused { border-color: #3a454a; }
+.session-card.running::after { content: ""; position: absolute; left: 7px; top: 50%; width: 6px; height: 6px; border-radius: 50%; background: #8bdc62; box-shadow: 0 0 5px #8bdc6299; transform: translateY(-50%); }.session-card.selected.running::before { display: none; }.session-card.paused { border-color: #3a454a; }
 .session-card:hover { background: #202b2d; border-color: #768d64; }.session-card.selected { border-color: #d6f77f; background: #26362a; box-shadow: inset 3px 0 #d6f77f, 0 0 0 1px #d6f77f33; }.session-card.selected::before { content: ""; position: absolute; left: 6px; top: 50%; width: 0; height: 0; border-top: 5px solid transparent; border-bottom: 5px solid transparent; border-left: 7px solid var(--lime); transform: translateY(-50%); filter: drop-shadow(0 0 5px #d6f77f66); }.session-card.selected.running { border-color: #d6f77f; background: #263b25; }.session-card.selected.paused { border-color: #d6f77f; }
 .session-card-icon { display: grid; place-items: center; flex: 0 0 auto; width: 23px; height: 23px; border-radius: 5px; background: #293237; color: #c8d2d5; font-size: 11px; font-weight: 800; }
 .session-card-icon .mascot-inline { box-shadow: none; }
@@ -120,10 +120,8 @@ body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56p
 .session-card-body { min-width: 0; flex: 1 1 auto; display: flex; align-items: center; gap: 6px; overflow: hidden; }
 .session-card-body strong { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; line-height: 1.2; }
 .session-card-body strong em { flex: 0 0 auto; font-size: 9px; padding: 1px 3px; border: 1px solid #546a3e; border-radius: 3px; color: var(--lime); font-style: normal; font-weight: 600; }
-.session-card-live { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px; min-width: 0; padding: 2px 4px; border: 1px solid #78995d; border-radius: 3px; background: #243a22; color: #d7f5ad; font-size: 9px; font-weight: 800; line-height: 1; white-space: nowrap; }
-.session-card-live i { width: 5px; height: 5px; flex: 0 0 auto; border-radius: 50%; background: #b8ed82; box-shadow: 0 0 0 0 #b8ed8270; animation: live-pulse 1.7s infinite; }
 .session-card-time { flex: 0 0 auto; color: #718087; font: 9px ui-monospace, monospace; white-space: nowrap; }
-.session-card-body > span:not(.session-card-live), .session-card-body small, .session-card-status { display: none; }
+.session-card-body span, .session-card-body small, .session-card-status { display: none; }
 .session-card.live .session-card-status { color: #cce69a; }
 .session-card-status.status-succeeded { color: #76d6a3; }.session-card-status.status-failed { color: #ef8d76; }.session-card-status.status-stopped { color: #bf9ce6; }
 .sidebar-bottom { display: flex; align-items: center; gap: 4px; padding: 12px; border-top: 1px solid var(--line); }
@@ -882,7 +880,7 @@ body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56p
 [data-theme="light"] .connection-popover { border-color: #cbd5d8; background: #ffffffed; box-shadow: 0 8px 22px #53646d2e; }[data-theme="light"] .connection-popover.live { border-color: #a9bd96; background: #f4f9f0ed; }[data-theme="light"] .connection-copy strong { color: #26363b; }[data-theme="light"] .connection-popover.live .connection-copy strong { color: #3f592d; }[data-theme="light"] .connection-popover.reconnecting .connection-copy strong { color: #725f24; }
 [data-theme="light"] .connection-overview { border-color: #d6dde0; background: #f8fafa; }[data-theme="light"] .connection-server, [data-theme="light"] .connection-facts > div, [data-theme="light"] .connection-server-meta, [data-theme="light"] .connection-provider-actions { border-color: #dce3e5; }[data-theme="light"] .connection-server strong, [data-theme="light"] .connection-section-head h3, [data-theme="light"] .connection-provider-name strong { color: #24343a; }[data-theme="light"] .connection-provider-item { border-color: #d8e0e2; background: #f8fafa; }[data-theme="light"] .connection-provider-item.current { border-color: #a9bd96; background: #f3f8ef; }[data-theme="light"] .connection-provider-actions button { border-color: #ccd6d9; background: #fff; color: #44555b; }
 [data-theme="light"] .codex-install-notice { border-color: #d1b779; background: #fffaf0f5; box-shadow: 0 8px 22px #6b57252e; }[data-theme="light"] .codex-install-copy strong { color: #6e551d; }[data-theme="light"] .codex-install-copy small { color: #7b6d4d; }
-[data-theme="light"] .session-card.running { border-color: #719550; background: #edf6e8; box-shadow: inset 3px 0 #719f4d; }[data-theme="light"] .session-card-live { border-color: #789b5b; background: #dcebd2; color: #34531f; }[data-theme="light"] .session-card-time { color: #647278; }
+[data-theme="light"] .session-card.running::after { background: #4e8d30; box-shadow: 0 0 0 1px #fff, 0 0 4px #4e8d3066; }[data-theme="light"] .session-card-time { color: #647278; }
 
 /* Retro terminal mode keeps the product structure while changing its visual language. */
 [data-theme="wasteland"] {
@@ -912,10 +910,7 @@ body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56p
 [data-theme="wasteland"] .new-session:hover, [data-theme="wasteland"] .send-codex-button:hover, [data-theme="wasteland"] .primary:hover { background: #235c2b; }
 [data-theme="wasteland"] .session-card { border-color: #214728; border-radius: 1px; background: #07150c; }
 [data-theme="wasteland"] .session-card:hover, [data-theme="wasteland"] .session-card.selected { border-color: #79da61; background: #102819; box-shadow: inset 4px 0 #8cff72; }
-[data-theme="wasteland"] .session-card.running { border-color: #9dff82; background: #102e18; box-shadow: inset 4px 0 #8cff72, 0 0 12px #72ff5538; }
-[data-theme="wasteland"] .session-card.running .session-card-body strong { color: #d5ffc6; text-shadow: 0 0 6px #8cff7255; }
-[data-theme="wasteland"] .session-card-live { border-color: #a6ff8d; border-radius: 1px; background: #173c20; color: #dcffcf; box-shadow: inset 0 0 7px #8cff7230; }
-[data-theme="wasteland"] .session-card-live i { background: #d0ff80; box-shadow: 0 0 7px #8cff72; }
+[data-theme="wasteland"] .session-card.running::after { background: #9dff82; box-shadow: 0 0 7px #8cff72; }
 [data-theme="wasteland"] .filter.active, [data-theme="wasteland"] .tool-button.active, [data-theme="wasteland"] .composer-yolo.active { border-color: #83e66b; background: #183b1d; color: #aaff91; }
 [data-theme="wasteland"] .shortcut-hints, [data-theme="wasteland"] .shortcut-hint kbd { border-color: #315a35; background: #061009; color: #91d784; }
 [data-theme="wasteland"] .connection-popover, [data-theme="wasteland"] .connection-popover.live { border-color: #67bb59; border-radius: 2px; background: #07150cf5; box-shadow: 0 0 18px #72ff5540; }
@@ -950,7 +945,6 @@ body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56p
 [data-theme="wasteland"] .chat-image-attachment img { filter: sepia(.12) saturate(.9) contrast(1.05); }
 
 @media (prefers-reduced-motion: reduce) {
-  .session-card-live i { animation: none; }
   [data-theme="wasteland"] body::after { display: none; }
   [data-theme="wasteland"] .mascot, [data-theme="wasteland"] .mascot::before, [data-theme="wasteland"] .mascot i, [data-theme="wasteland"] .mascot b, [data-theme="wasteland"] .codex-working-mark > i::after { animation: none !important; }
   .live-dot, .composer-live-state i, .stream-cursor, .message.streaming .message-avatar, .codex-working-mark, .codex-working-mark::before, .codex-working-mark::after, .codex-working-mark > i, .working-dots i, .turn-progress-rail::after, .turn-progress-copy .phase-change, .connection-popover, .connection-signal::before, .activity-pulse, .activity-pulse i, .activity-event.current .activity-event-dot, .activity-event.current::after, .exploration-edge.active, .exploration-chat-target { animation: none !important; }

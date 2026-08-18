@@ -1043,7 +1043,7 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
         conversation = (worker.parent / "conversation.js").read_text(encoding="utf-8")
         html = (worker.parent / "index.html").read_text(encoding="utf-8")
         self.assertIn('/chat-worker.js?v=20260818-full-exploration-graph', conversation)
-        self.assertIn('/conversation.js?v=20260818-running-session-signal', html)
+        self.assertIn('/conversation.js?v=20260818-running-session-dot', html)
 
     def test_worker_hides_native_media_tags(self):
         script = f"""
@@ -1440,7 +1440,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn('data-activity-output-key="${esc(outputKey)}"', conversation)
         self.assertIn("Object.prototype.hasOwnProperty.call(state.activityOutputOpen, outputKey)", conversation)
         self.assertIn("state.activityOutputOpen[output.dataset.activityOutputKey] = output.open", conversation)
-        self.assertIn('/conversation.js?v=20260818-running-session-signal', html)
+        self.assertIn('/conversation.js?v=20260818-running-session-dot', html)
 
     def test_message_history_skips_activity_only_pages(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -1496,7 +1496,7 @@ const cursors = [];
         self.assertIn("HistoryPagination.fetchEarlierTimelinePages", conversation)
         self.assertIn("messageTarget: 12, maxPages: 8", conversation)
         self.assertIn('/history-pagination.js?v=20260817-message-history', html)
-        self.assertIn('/conversation.js?v=20260818-running-session-signal', html)
+        self.assertIn('/conversation.js?v=20260818-running-session-dot', html)
 
     def test_sent_browser_messages_follow_the_loaded_timeline_boundary(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -2327,7 +2327,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('disabled title="${esc(uiLabel("protectedSkillDelete"))}"', settings)
         self.assertIn(".panel-item button.danger-text:not(:disabled)", styles)
         self.assertNotIn(".panel-item button:last-child", styles)
-        self.assertIn('/styles.css?v=20260818-running-session-signal', html)
+        self.assertIn('/styles.css?v=20260818-running-session-dot', html)
         self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
         self.assertIn('/settings.js?v=20260817-skill-actions', html)
 
@@ -2890,7 +2890,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260818-running-session-signal', html)
+        self.assertIn('/conversation.js?v=20260818-running-session-dot', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -3044,11 +3044,11 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("white-space: nowrap", (static / "styles.css").read_text(encoding="utf-8"))
         self.assertIn('class="session-card-time"', conversation_js)
         self.assertNotIn('class="session-card-icon"', conversation_js)
-        self.assertIn('class="session-card-live"', conversation_js)
+        self.assertNotIn('class="session-card-live"', conversation_js)
         self.assertIn("statusLabel(task.status)", conversation_js)
         styles = (static / "styles.css").read_text(encoding="utf-8")
-        self.assertIn('[data-theme="wasteland"] .session-card.running', styles)
-        self.assertIn('[data-theme="wasteland"] .session-card-live', styles)
+        self.assertIn('.session-card.running::after', styles)
+        self.assertIn('[data-theme="wasteland"] .session-card.running::after', styles)
 
     def test_workspace_inspector_close_can_collapse_desktop_column(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -3124,12 +3124,12 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260818-running-session-signal', html)
+        self.assertIn('/conversation.js?v=20260818-running-session-dot', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260818-terminal-queue', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
-        self.assertIn('/styles.css?v=20260818-running-session-signal', html)
+        self.assertIn('/styles.css?v=20260818-running-session-dot', html)
         self.assertIn('/vendor/katex/katex.min.css', html)
         self.assertIn('<span id="goal-run-label">暂停</span>', html)
         self.assertNotIn('id="goal-run-label" class="sr-only"', html)
@@ -3189,7 +3189,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('const sessionList = $("#task-list")', conversation)
         self.assertIn("void selectSession(pointerSelectedSessionId)", conversation)
         self.assertIn('aria-current="${selected ? "true" : "false"}"', conversation)
-        self.assertIn('/conversation.js?v=20260818-running-session-signal', html)
+        self.assertIn('/conversation.js?v=20260818-running-session-dot', html)
 
     def test_live_chat_rendering_coalesces_expensive_work(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -3208,7 +3208,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("if (current !== previous) scheduleRenderChat()", conversation)
         self.assertIn("renderConversation(false)", conversation)
         self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
-        self.assertIn('/conversation.js?v=20260818-running-session-signal', html)
+        self.assertIn('/conversation.js?v=20260818-running-session-dot', html)
         styles = (static / "styles.css").read_text(encoding="utf-8")
         app_js = (static / "app.js").read_text(encoding="utf-8")
         self.assertNotIn("content-visibility: auto", styles)
@@ -3220,7 +3220,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("if (chatIsNearBottom(stream))", conversation)
         self.assertNotIn("stream.scrollTop = target * state.chatAverageHeight", conversation)
         self.assertIn("function syncPageVisibility", app_js)
-        self.assertIn('/styles.css?v=20260818-running-session-signal', html)
+        self.assertIn('/styles.css?v=20260818-running-session-dot', html)
         self.assertIn('/app.js?v=20260818-terminal-queue', html)
 
     def test_optimistic_queue_messages_survive_authoritative_refresh(self):
