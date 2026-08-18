@@ -1,11 +1,11 @@
 // Read-only projection of the Codex timeline into a compact decision tree.
 const explorationStatusMeta = {
-  planned: { label: "未进行", symbol: "○" },
-  active: { label: "进行中", symbol: "●" },
-  completed: { label: "完成", symbol: "✓" },
-  failed: { label: "失败", symbol: "!" },
-  rolledback: { label: "已回退", symbol: "↶" },
-  abandoned: { label: "已转向", symbol: "↗" },
+  planned: { labelKey: "explorationStatusPlanned", symbol: "○" },
+  active: { labelKey: "explorationStatusActive", symbol: "●" },
+  completed: { labelKey: "explorationStatusCompleted", symbol: "✓" },
+  failed: { labelKey: "explorationStatusFailed", symbol: "!" },
+  rolledback: { labelKey: "explorationStatusRolledBack", symbol: "↶" },
+  abandoned: { labelKey: "explorationStatusAbandoned", symbol: "↗" },
 };
 const explorationZoomBounds = { min: .1, max: 1.8 };
 let explorationZoom = 1;
@@ -48,6 +48,20 @@ function explorationNodeById(id) {
 function explorationCurrentNode() {
   const nodes = state.explorationNodes || [];
   return [...nodes].reverse().find(node => node.status === "active") || nodes[nodes.length - 1] || null;
+}
+
+function explorationMeta(status) {
+  const meta = explorationStatusMeta[status] || explorationStatusMeta.planned;
+  return { ...meta, label: uiLabel(meta.labelKey) };
+}
+
+function explorationKindKey(kind) {
+  return kind === "plan" ? "explorationKindPlan" : kind === "phase" ? "explorationKindPhase" : kind === "decision" ? "explorationKindDecision" : kind === "steering" ? "explorationKindSteering" : kind === "rollback" ? "explorationKindRollback" : "explorationKindDirection";
+}
+
+function explorationTitle(node) {
+  const title = String(node?.title || "");
+  return node?.kind === "phase" ? title.replace(/^执行阶段[：:]\s*/, "") : title;
 }
 
 function explorationLayout(nodes) {
@@ -124,15 +138,15 @@ function renderExplorationDetail(node) {
   const detail = $("#exploration-map-detail");
   if (!detail) return;
   if (!node) {
-    detail.innerHTML = `<div class="exploration-detail-empty"><span class="exploration-map-symbol large" aria-hidden="true"><i></i><i></i><i></i></span><strong>选择一个关键节点</strong><p>查看它为什么出现、相关修改以及执行证据。</p></div>`;
+    detail.innerHTML = `<div class="exploration-detail-empty"><span class="exploration-map-symbol large" aria-hidden="true"><i></i><i></i><i></i></span><strong>${esc(uiLabel("explorationSelectNode"))}</strong><p>${esc(uiLabel("explorationSelectNodeDescription"))}</p></div>`;
     return;
   }
-  const meta = explorationStatusMeta[node.status] || explorationStatusMeta.planned;
+  const meta = explorationMeta(node.status);
   const evidence = (node.evidence || []).map(value => `<li>${esc(value)}</li>`).join("");
   const files = (node.files || []).map(value => `<li><code>${esc(value)}</code></li>`).join("");
   const commands = (node.commands || []).map(value => `<li><code>${esc(value)}</code></li>`).join("");
-  const typeLabel = node.kind === "plan" ? "计划步骤" : node.kind === "phase" ? "执行阶段" : node.kind === "decision" ? "关键结论" : node.kind === "steering" ? "方向调整" : node.kind === "rollback" ? "回退决策" : "用户目标";
-  detail.innerHTML = `<div class="exploration-detail-head"><span class="exploration-node-state ${esc(node.status)}">${meta.symbol} ${meta.label}</span><small>${esc(typeLabel)}</small></div><h3>${esc(node.title)}</h3>${node.summary ? `<p class="exploration-detail-summary">${esc(node.summary)}</p>` : ""}<dl class="exploration-detail-facts"><div><dt>时间</dt><dd>${node.time ? esc(shortDate(node.time)) : "当前会话"}</dd></div><div><dt>关键度</dt><dd>${Number(node.score) || 0} / 10</dd></div><div><dt>执行异常</dt><dd>${Number(node.failures) || 0}</dd></div></dl>${evidence ? `<section><h4>方向证据</h4><ul>${evidence}</ul></section>` : ""}${files ? `<section><h4>相关文件</h4><ul>${files}</ul></section>` : ""}${commands ? `<details><summary>核心命令 · ${(node.commands || []).length}</summary><ul>${commands}</ul></details>` : ""}<div class="exploration-detail-actions"><button type="button" class="primary" data-exploration-jump="${esc(node.id)}">在对话中查看</button></div>`;
+  const typeLabel = uiLabel(explorationKindKey(node.kind));
+  detail.innerHTML = `<div class="exploration-detail-head"><span class="exploration-node-state ${esc(node.status)}">${meta.symbol} ${esc(meta.label)}</span><small>${esc(typeLabel)}</small></div><h3>${esc(explorationTitle(node))}</h3>${node.summary ? `<p class="exploration-detail-summary">${esc(node.summary)}</p>` : ""}<dl class="exploration-detail-facts"><div><dt>${esc(uiLabel("explorationTime"))}</dt><dd>${node.time ? esc(shortDate(node.time)) : esc(uiLabel("explorationCurrentSession"))}</dd></div><div><dt>${esc(uiLabel("explorationImportance"))}</dt><dd>${Number(node.score) || 0} / 10</dd></div><div><dt>${esc(uiLabel("explorationErrors"))}</dt><dd>${Number(node.failures) || 0}</dd></div></dl>${evidence ? `<section><h4>${esc(uiLabel("explorationEvidence"))}</h4><ul>${evidence}</ul></section>` : ""}${files ? `<section><h4>${esc(uiLabel("explorationFiles"))}</h4><ul>${files}</ul></section>` : ""}${commands ? `<details><summary>${esc(uiLabel("explorationCommands", { count: (node.commands || []).length }))}</summary><ul>${commands}</ul></details>` : ""}<div class="exploration-detail-actions"><button type="button" class="primary" data-exploration-jump="${esc(node.id)}">${esc(uiLabel("explorationJump"))}</button></div>`;
 }
 
 function revealExplorationNode(id, smooth = false) {
@@ -189,6 +203,8 @@ function fitExplorationTree() {
 
 function renderExplorationMap(options = {}) {
   const nodes = state.explorationNodes || [];
+  const legend = $("#exploration-map-legend");
+  if (legend) legend.textContent = uiLabel("explorationLegend");
   const count = $("#exploration-map-count");
   if (count) count.textContent = String(nodes.length);
   const openButton = $("#exploration-map-open");
@@ -206,12 +222,12 @@ function renderExplorationMap(options = {}) {
   }
   if (historyStatus) {
     historyStatus.className = state.explorationLoadError ? "error" : state.explorationLoading ? "loading" : state.explorationHistoryComplete ? "complete" : "";
-    historyStatus.textContent = state.explorationLoadError ? `活动图失败 · ${state.explorationLoadError}` : state.explorationLoading ? "正在读取活动图索引" : state.explorationMapStatus === "building" ? `后台预计算中 · ${state.explorationProcessedEvents} 条事件` : state.explorationHistoryComplete ? `活动图已预计算 · ${state.explorationLoadedEventCount} 条事件` : "活动图等待预计算";
+    historyStatus.textContent = state.explorationLoadError ? uiLabel("explorationIndexFailed", { error: state.explorationLoadError }) : state.explorationLoading ? uiLabel("explorationIndexLoading") : state.explorationMapStatus === "building" ? uiLabel("explorationIndexBuilding", { count: state.explorationProcessedEvents }) : state.explorationHistoryComplete ? uiLabel("explorationIndexReady", { count: state.explorationLoadedEventCount }) : uiLabel("explorationIndexWaiting");
   }
   if (!nodes.length) {
     canvas.style.width = "100%";
     canvas.style.height = "100%";
-    canvas.innerHTML = `<div class="exploration-empty"><span class="exploration-map-symbol large" aria-hidden="true"><i></i><i></i><i></i></span><strong>还没有形成关键路径</strong><p>出现明确目标、计划步骤或方向调整后，地图会自动生长。</p></div>`;
+    canvas.innerHTML = `<div class="exploration-empty"><span class="exploration-map-symbol large" aria-hidden="true"><i></i><i></i><i></i></span><strong>${esc(uiLabel("explorationNoPath"))}</strong><p>${esc(uiLabel("explorationNoPathDescription"))}</p></div>`;
     renderExplorationDetail(null);
     return;
   }
@@ -237,11 +253,12 @@ function renderExplorationMap(options = {}) {
   }).join("");
   const cards = nodes.map((node, index) => {
     const point = coordinates.get(node.id);
-    const meta = explorationStatusMeta[node.status] || explorationStatusMeta.planned;
+    const meta = explorationMeta(node.status);
     const selected = node.id === state.explorationSelectedNodeId;
     const time = node.time ? `<span class="exploration-node-time" style="left:${point.x}px;top:${Math.max(8, point.y - 22)}px">${esc(shortDate(node.time))}</span>` : "";
-    const kindLabel = node.kind === "plan" ? "步骤" : node.kind === "phase" ? "阶段" : node.kind === "decision" ? "结论" : node.kind === "steering" ? "转向" : node.kind === "rollback" ? "回退" : "方向";
-    return `${time}<button type="button" class="exploration-node kind-${esc(node.kind)} ${esc(node.status)}${selected ? " selected" : ""}" style="left:${point.x}px;top:${point.y}px" data-exploration-node="${esc(node.id)}" aria-pressed="${selected}"><span class="exploration-node-index">${String(index + 1).padStart(2, "0")}</span><span class="exploration-node-copy"><strong>${esc(node.title)}</strong><small><b>${kindLabel}</b> · ${meta.symbol} ${meta.label}${node.files?.length ? ` · ${node.files.length} 文件` : ""}</small></span></button>`;
+    const kindLabel = uiLabel(explorationKindKey(node.kind));
+    const fileCount = node.files?.length ? ` · ${node.files.length} ${uiLabel("explorationFiles")}` : "";
+    return `${time}<button type="button" class="exploration-node kind-${esc(node.kind)} ${esc(node.status)}${selected ? " selected" : ""}" style="left:${point.x}px;top:${point.y}px" data-exploration-node="${esc(node.id)}" aria-pressed="${selected}"><span class="exploration-node-index">${String(index + 1).padStart(2, "0")}</span><span class="exploration-node-copy"><strong>${esc(explorationTitle(node))}</strong><small><b>${esc(kindLabel)}</b> · ${meta.symbol} ${esc(meta.label)}${esc(fileCount)}</small></span></button>`;
   }).join("");
   canvas.style.width = `${layout.width * explorationZoom}px`;
   canvas.style.height = `${layout.height * explorationZoom}px`;
@@ -368,4 +385,7 @@ $("#exploration-load-older")?.addEventListener("click", async () => {
 });
 document.addEventListener("keydown", event => {
   if (event.key === "Escape" && state.explorationOpen) { event.preventDefault(); closeExplorationMap(); }
+});
+window.addEventListener("languagechange", () => {
+  if (state.explorationOpen) renderExplorationMap();
 });

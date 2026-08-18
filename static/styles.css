@@ -701,7 +701,7 @@ body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56p
 .exploration-empty { position: absolute; inset: 0; }
 .exploration-map-foot { min-height: 45px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 14px; border-top: 1px solid #29353b; background: #151d21; }
 .exploration-map-legend { display: flex; flex-wrap: wrap; gap: 11px; color: #77868c; font-size: 9px; }
-.exploration-map-legend::before { content: "● 进行中   ✓ 完成   ○ 未进行   ! 失败   ↶ 已回退   ↗ 已转向"; white-space: pre; }
+.exploration-map-legend { white-space: pre-wrap; }
 .exploration-map-foot .secondary { padding: 6px 9px; font-size: 9px; }
 .exploration-history-state { min-width: 0; display: flex; align-items: center; gap: 8px; }
 .exploration-history-state > span { max-width: min(420px, 38vw); overflow: hidden; color: #78878d; font: 9px ui-monospace, SFMono-Regular, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }

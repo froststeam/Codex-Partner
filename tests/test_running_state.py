@@ -218,7 +218,7 @@ class RunningStateTests(unittest.TestCase):
             self.assertEqual((282, 320), image.size)
         self.assertIn('const DEFAULT_USER_AVATAR = "/default-user-avatar.webp?v=20260818"', core)
         self.assertIn('profile?.avatar_url || DEFAULT_USER_AVATAR', core)
-        self.assertIn('/core.js?v=20260818-chat-performance', html)
+        self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
 
     def test_app_server_reads_large_json_messages_in_chunks(self):
         async def collect():
@@ -242,7 +242,7 @@ class RunningStateTests(unittest.TestCase):
         self.assertEqual(1, len(lines))
         self.assertEqual(2 * 1024 * 1024, len(json.loads(lines[0])["result"]["text"]))
 
-    def test_native_sync_preserves_dashboard_model_override(self):
+    def test_native_sync_preserves_dashboard_model_and_name_overrides(self):
         task_id = f"native-model-{time.time_ns()}"
         thread_id = f"thread-{time.time_ns()}"
         stamp = self.app.now()
@@ -259,9 +259,9 @@ class RunningStateTests(unittest.TestCase):
             )
             conn.commit()
         self.app.db.execute(
-            "INSERT INTO tasks (id,name,prompt,workspace,status,yolo,provider_id,model,codex_session_id,created_at,updated_at,native) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (task_id, task_id, "prompt", str(workspace), "available", 1, "dashboard-provider", "gpt-5.6", thread_id, stamp, stamp, 1),
+            "INSERT INTO tasks (id,name,prompt,workspace,status,yolo,provider_id,model,codex_session_id,created_at,updated_at,native,name_revision) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (task_id, "Dashboard title", "prompt", str(workspace), "available", 1, "dashboard-provider", "gpt-5.6", thread_id, stamp, stamp, 1, 1),
         )
 
         class Client:
@@ -296,6 +296,7 @@ class RunningStateTests(unittest.TestCase):
         self.assertEqual(thread_id, Path(task["workspace"]).name)
         self.assertEqual("gpt-5.6", task["model"])
         self.assertEqual("dashboard-provider", task["provider_id"])
+        self.assertEqual("Dashboard title", task["name"])
         with sqlite3.connect(state_db) as conn:
             row = conn.execute("SELECT model FROM threads WHERE id=?", (thread_id,)).fetchone()
         self.assertEqual("gpt-5.6", row[0])
@@ -1168,7 +1169,7 @@ process.stdout.write(JSON.stringify({{ visibleBlocks, nodes: context.buildExplor
         styles = (static / "styles.css").read_text(encoding="utf-8")
         self.assertIn('id="exploration-map-open"', html)
         self.assertIn('id="exploration-map"', html)
-        self.assertIn('/exploration-tree.js?v=20260818-activity-tree-branches', html)
+        self.assertIn('/exploration-tree.js?v=20260818-thread-ops-i18n', html)
         self.assertIn("explorationNodes: []", (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn("event.data.explorationNodes", conversation)
         self.assertIn("!state.explorationPrecomputed && state.explorationNeedsSync", conversation)
@@ -1193,10 +1194,15 @@ process.stdout.write(JSON.stringify({{ visibleBlocks, nodes: context.buildExplor
         self.assertIn("function frameExplorationBranch", tree)
         self.assertIn("frameExplorationNodes([parent.id", tree)
         self.assertIn("explorationFramePending = true", tree)
+        self.assertIn("explorationStatusActive:", (static / "core.js").read_text(encoding="utf-8"))
+        self.assertIn('uiLabel("explorationLegend")', tree)
+        self.assertIn('window.addEventListener("languagechange"', tree)
+        self.assertIn('id="exploration-map-open-label"', html)
+        self.assertNotIn('content: "● 进行中', styles)
         self.assertIn(".exploration-map-world", styles)
         self.assertIn(".exploration-map-viewport", styles)
         self.assertIn(".exploration-node-time", styles)
-        self.assertIn("FULL CONVERSATION GRAPH", html)
+        self.assertIn('id="exploration-map-eyebrow"', html)
         self.assertNotIn("setInterval", tree)
 
     def test_exploration_worker_reuses_full_history_projection(self):
@@ -2077,9 +2083,54 @@ process.stdout.write(JSON.stringify(browserMessages));
             self.assertEqual("build-box", forked["ssh_host"])
             self.assertEqual("/srv/project", forked["workspace"])
             self.assertEqual("remote-forked-thread", forked["codex_session_id"])
+            self.assertEqual("remote-forked-thread", forked["id"])
+            self.assertFalse(forked["retry_forever"])
             self.app.db.execute("DELETE FROM tasks WHERE id IN (?,?)", (task_id, forked["id"]))
 
         asyncio.run(exercise())
+
+    def test_running_thread_allows_rename_and_fork_metadata_operations(self):
+        task_id = "running-thread-metadata-operations"
+        self.make_task(task_id, "running")
+
+        async def exercise():
+            with mock.patch.object(self.app, "require_codex"), \
+                 mock.patch.object(self.app, "USE_APP_SERVER", True), \
+                 mock.patch.object(self.app, "run_thread_operation", new=mock.AsyncMock(return_value={"ok": True})) as operation:
+                for name in ("rename", "fork"):
+                    result = await self.app.codex_operation(task_id, self.app.OperationIn(operation=name), None)
+                    self.assertTrue(result["ok"])
+                self.assertEqual(["rename", "fork"], [call.args[1].operation for call in operation.await_args_list])
+        try:
+            asyncio.run(exercise())
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_thread_rename_is_persisted_with_a_local_revision(self):
+        task_id = "rename-thread-revision"
+        self.make_task(task_id, "available")
+        self.app.db.execute("UPDATE tasks SET codex_session_id=? WHERE id=?", (task_id, task_id))
+
+        class FakeClient:
+            async def request(self, method, params):
+                if method == "thread/read":
+                    return {"thread": {"id": task_id}}
+                if method == "thread/name/set":
+                    self.name = params["name"]
+                    return {}
+                raise AssertionError(method)
+
+        try:
+            with mock.patch.object(self.app, "appserver_for", new=mock.AsyncMock(return_value=FakeClient())):
+                result = asyncio.run(self.app.run_thread_operation(
+                    self.app.task_or_404(task_id), self.app.OperationIn(operation="rename", args=["New dashboard name"]),
+                ))
+            renamed = self.app.task_or_404(task_id)
+            self.assertEqual("New dashboard name", renamed["name"])
+            self.assertEqual(1, renamed["name_revision"])
+            self.assertEqual("New dashboard name", result["task"]["name"])
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
     def test_installed_skills_are_discovered_and_personal_skills_are_managed(self):
         codex_root = self.app.CODEX_HOME / "skills"
@@ -2150,8 +2201,8 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('disabled title="${esc(uiLabel("protectedSkillDelete"))}"', settings)
         self.assertIn(".panel-item button.danger-text:not(:disabled)", styles)
         self.assertNotIn(".panel-item button:last-child", styles)
-        self.assertIn('/styles.css?v=20260818-activity-tree-branches-v2', html)
-        self.assertIn('/core.js?v=20260818-chat-performance', html)
+        self.assertIn('/styles.css?v=20260818-thread-ops-i18n', html)
+        self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
         self.assertIn('/settings.js?v=20260817-skill-actions', html)
 
     def test_provider_probe_status_and_endpoint_refresh(self):
@@ -2705,8 +2756,12 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("attachmentUploadName", app_js)
         self.assertIn("new File([file]", app_js)
         self.assertIn('uiLabel("binaryAttachment"', app_js)
-        self.assertIn('/app.js?v=20260818-chat-performance', html)
-        self.assertIn('/core.js?v=20260818-chat-performance', html)
+        self.assertIn("let threadOperationInFlight = false", app_js)
+        self.assertIn('runOperation("fork", button)', app_js)
+        self.assertIn('uiLabel("sessionRenamed")', app_js)
+        self.assertIn('uiLabel("sessionDuplicated")', app_js)
+        self.assertIn('/app.js?v=20260818-thread-ops-i18n', html)
+        self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
         self.assertIn('/conversation.js?v=20260818-activity-index', html)
@@ -2941,9 +2996,9 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('/conversation.js?v=20260818-activity-index', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
-        self.assertIn('/app.js?v=20260818-chat-performance', html)
+        self.assertIn('/app.js?v=20260818-thread-ops-i18n', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
-        self.assertIn('/styles.css?v=20260818-activity-tree-branches-v2', html)
+        self.assertIn('/styles.css?v=20260818-thread-ops-i18n', html)
         self.assertIn('/vendor/katex/katex.min.css', html)
         self.assertIn('<span id="goal-run-label">暂停</span>', html)
         self.assertNotIn('id="goal-run-label" class="sr-only"', html)
@@ -3017,7 +3072,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("state.explorationNeedsSync && (state.explorationOpen || !state.explorationNodes.length)", conversation)
         self.assertIn("if (current !== previous) scheduleRenderChat()", conversation)
         self.assertIn("renderConversation(false)", conversation)
-        self.assertIn('/core.js?v=20260818-chat-performance', html)
+        self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
         self.assertIn('/conversation.js?v=20260818-activity-index', html)
         styles = (static / "styles.css").read_text(encoding="utf-8")
         app_js = (static / "app.js").read_text(encoding="utf-8")
@@ -3030,8 +3085,8 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("if (chatIsNearBottom(stream))", conversation)
         self.assertNotIn("stream.scrollTop = target * state.chatAverageHeight", conversation)
         self.assertIn("function syncPageVisibility", app_js)
-        self.assertIn('/styles.css?v=20260818-activity-tree-branches-v2', html)
-        self.assertIn('/app.js?v=20260818-chat-performance', html)
+        self.assertIn('/styles.css?v=20260818-thread-ops-i18n', html)
+        self.assertIn('/app.js?v=20260818-thread-ops-i18n', html)
 
     def test_optimistic_queue_messages_survive_authoritative_refresh(self):
         static = Path(__file__).resolve().parents[1] / "static"

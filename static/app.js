@@ -101,14 +101,14 @@ document.addEventListener("click", async event => {
     if (button.dataset.pickerBrowse !== undefined) return loadWorkspacePicker(button.dataset.pickerBrowse);
     if (button.id === "workspace-picker-select") return selectWorkspaceDirectory();
     if (button.dataset.browse !== undefined) return loadWorkspace(button.dataset.browse);
-    if (button.id === "conversation-rename") return openRename();
-    if (button.id === "conversation-fork") return runOperation("fork");
+    if (button.id === "conversation-rename") return openRename(button);
+    if (button.id === "conversation-fork") return runOperation("fork", button);
     if (button.id === "conversation-more") {
       const inspector = $("#inspector");
       const shouldOpen = inspector.classList.contains("closed") || !inspector.classList.contains("open");
       state.inspectorClosed = !shouldOpen; setInspectorOpen(shouldOpen); return;
     }
-    if (button.dataset.threadAction) return runOperation(button.dataset.threadAction);
+    if (button.dataset.threadAction) return runOperation(button.dataset.threadAction, button);
     if (button.id === "new-memory") return memoryForm();
     if (button.dataset.memoryView) return memoryView(button.dataset.memoryView);
     if (button.dataset.memoryEdit) return memoryForm(button.dataset.memoryEdit);
@@ -151,7 +151,24 @@ $("#language-select").onchange = event => {
 $("#terminal-window").addEventListener("click", event => { if (event.target.id === "terminal-window") closeTerminal(); });
 $("#panel").addEventListener("click", event => { if (event.target === event.currentTarget) closePanel(); });
 $("#drawer").addEventListener("click", event => { if (event.target === event.currentTarget) closeDrawer(); });
-async function openRename() { const name = await appPrompt({ title: uiLabel("renameSessionTitle"), label: uiLabel("sessionName"), value: state.selectedTask?.name || "", confirmLabel: uiLabel("save"), required: true }); if (!name?.trim()) return; await api(`/tasks/${state.selectedId}/operation`, { method: "POST", body: JSON.stringify({ operation: "rename", args: [name.trim()] }) }); await refresh(); toast("会话已重命名"); }
+let threadOperationInFlight = false;
+async function openRename(trigger = null) {
+  if (threadOperationInFlight || !state.selectedId) return;
+  const taskId = state.selectedId;
+  const name = await appPrompt({ title: uiLabel("renameSessionTitle"), label: uiLabel("sessionName"), value: state.selectedTask?.name || "", confirmLabel: uiLabel("save"), required: true });
+  if (!name?.trim() || taskId !== state.selectedId) return;
+  threadOperationInFlight = true;
+  if (trigger) trigger.disabled = true;
+  try {
+    const result = await api(`/tasks/${taskId}/operation`, { method: "POST", body: JSON.stringify({ operation: "rename", args: [name.trim()] }) });
+    if (result.task && taskId === state.selectedId) { state.selectedTask = { ...state.selectedTask, ...result.task }; mergeTask(result.task); renderConversation(); }
+    await refresh(false);
+    toast(uiLabel("sessionRenamed"));
+  } finally {
+    threadOperationInFlight = false;
+    if (trigger) trigger.disabled = false;
+  }
+}
 function switchSession(step) {
   const tasks = sortTasks(state.tasks);
   if (!tasks.length) return toast("还没有可切换的会话");
@@ -171,12 +188,15 @@ function toggleTerminalShortcut() {
   if ($("#terminal-window")?.classList.contains("open")) closeTerminal();
   else openTerminal();
 }
-async function runOperation(operation) {
-  if (!state.selectedId) return;
+async function runOperation(operation, trigger = null) {
+  if (!state.selectedId || threadOperationInFlight) return;
   if (["archive", "delete"].includes(operation)) {
     const message = uiLabel(operation === "delete" ? "trashSessionConfirm" : "archiveSessionConfirm");
     if (!await appConfirm(message, { danger: operation === "delete" })) return;
   }
+  threadOperationInFlight = true;
+  if (trigger) trigger.disabled = true;
+  try {
   const result = await api(`/tasks/${state.selectedId}/operation`, { method: "POST", body: JSON.stringify({ operation, args: [] }) });
   if (result.memory_mode && state.selectedTask) {
     // Reflect the acknowledged mode immediately while the authoritative
@@ -198,8 +218,12 @@ async function runOperation(operation) {
     await refresh(true);
     if (result.task?.id && result.task.id !== state.selectedId) await selectSession(result.task.id);
   }
-  const message = operation === "fork" ? "会话已复制" : result.trashed ? "会话已移到回收站" : operation === "unarchive" ? "会话已取消归档" : operation === "memory-enable" ? "记忆已打开" : operation === "memory-disable" ? "记忆已关闭" : "操作已完成";
+  const message = operation === "fork" ? uiLabel("sessionDuplicated") : result.trashed ? "会话已移到回收站" : operation === "unarchive" ? "会话已取消归档" : operation === "memory-enable" ? "记忆已打开" : operation === "memory-disable" ? "记忆已关闭" : uiLabel("operationComplete");
   toast(message);
+  } finally {
+    threadOperationInFlight = false;
+    if (trigger) trigger.disabled = false;
+  }
 }
 
 async function submitMessage(mode = "codex") {

@@ -2341,7 +2341,11 @@ async def sync_native_threads() -> dict:
             archived = bool(thread.get("archived") or native_settings.get("archived"))
             memory_mode = str(native_settings.get("memory_mode") or "enabled")
             provider_id = providers.get(model_provider)
-            existing = db.one("SELECT id,status,retry_forever,retry_explicit,provider_id,model FROM tasks WHERE codex_session_id=?", (thread_id,))
+            existing = db.one(
+                "SELECT id,name,name_revision,goal,goal_status,goal_tokens_used,goal_revision,status,"
+                "retry_forever,retry_explicit,provider_id,model FROM tasks WHERE codex_session_id=?",
+                (thread_id,),
+            )
             if existing:
                 # Imported native threads may be edited from the dashboard. Do
                 # not let the periodic native index sync erase those dashboard
@@ -2354,11 +2358,16 @@ async def sync_native_threads() -> dict:
                 existing_full = db.one("SELECT trashed FROM tasks WHERE id=?", (existing["id"],)) or {}
                 status = "trashed" if existing_full.get("trashed") else (existing["status"] if existing["status"] in {"running", "retrying", "queued", "stopped"} else ("archived" if archived else "available"))
                 retry_forever = int(existing.get("retry_forever", 0)) if existing.get("retry_explicit") else 0
+                if int(existing.get("goal_revision") or 0) > 0:
+                    objective = existing.get("goal", "")
+                    goal_status = existing.get("goal_status", "none")
+                    goal["tokensUsed"] = existing.get("goal_tokens_used", 0)
+                synced_title = existing.get("name") if int(existing.get("name_revision") or 0) > 0 else title[:160]
                 db.execute(
                     "UPDATE tasks SET name=?,prompt=?,goal=?,workspace=?,model=?,provider_id=?,goal_status=?,goal_tokens_used=?,"
                     "retry_forever=?,yolo=?,native=1,archived=?,memory_mode=?,status=?,updated_at=?,"
                     "last_interaction_at=CASE WHEN COALESCE(last_interaction_at,'')<? THEN ? ELSE last_interaction_at END WHERE id=?",
-                    (title[:160], prompt, objective, workspace, model, provider_id, goal_status, int(goal.get("tokensUsed", 0) or 0),
+                    (synced_title, prompt, objective, workspace, model, provider_id, goal_status, int(goal.get("tokensUsed", 0) or 0),
                      retry_forever, int(yolo), int(archived), memory_mode, status, updated_at, updated_at, updated_at, existing["id"]),
                 )
                 persist_native_thread_model(thread_id, model)
@@ -6065,8 +6074,10 @@ async def run_thread_operation(task: dict, payload: OperationIn) -> dict:
         if not name:
             raise HTTPException(400, "rename requires a name in operation prompt or arguments")
         result = await client.request("thread/name/set", {"threadId": thread_id, "name": name[:160]})
-        db.execute("UPDATE tasks SET name=?,updated_at=? WHERE id=?", (name[:160], now(), task["id"]))
-        return {"ok": True, "operation": operation, "thread_id": thread_id, "result": result}
+        db.execute("UPDATE tasks SET name=?,name_revision=name_revision+1,updated_at=? WHERE id=?", (name[:160], now(), task["id"]))
+        renamed = task_or_404(task["id"])
+        await broadcast_task(task["id"], {"type": "task_status", "task": renamed, "source": {"kind": "thread", "operation": operation}})
+        return {"ok": True, "operation": operation, "thread_id": thread_id, "result": result, "task": renamed}
     if operation == "compact":
         result = await client.request("thread/compact/start", {"threadId": thread_id})
         return {"ok": True, "operation": operation, "thread_id": thread_id, "result": result}
@@ -6086,26 +6097,28 @@ async def run_thread_operation(task: dict, payload: OperationIn) -> dict:
     fork_id = str((result.get("thread") or {}).get("id") or "")
     if not fork_id:
         raise HTTPException(502, "Codex did not return the forked thread id")
-    if task.get("ssh_host"):
-        fork_task_id, stamp = str(uuid.uuid4()), now()
+    forked_task = db.one("SELECT * FROM tasks WHERE codex_session_id=?", (fork_id,))
+    if not forked_task:
+        fork_task_id = fork_id if not db.one("SELECT id FROM tasks WHERE id=?", (fork_id,)) else str(uuid.uuid4())
+        stamp = now()
+        fork_name = f"{task['name']} (fork)"[:160]
         db.execute(
-            "INSERT INTO tasks (id,name,prompt,goal,workspace,status,yolo,max_retries,retry_forever,retry_explicit,provider_id,model,context,codex_session_id,goal_status,created_at,updated_at,native,reasoning_effort,service_tier,personality,collaboration_mode,permission_profile,ssh_host) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (fork_task_id, f"{task['name']} 副本"[:160], task.get("prompt", ""), task.get("goal", ""), task["workspace"], "available",
-             int(task.get("yolo", 1)), int(task.get("max_retries", 3)), int(task.get("retry_forever", 0)), int(task.get("retry_explicit", 0)),
-             task.get("provider_id"), task.get("model", ""), task.get("context", ""), fork_id, task.get("goal_status", "none"), stamp, stamp, 0,
+            "INSERT INTO tasks (id,name,prompt,goal,workspace,status,yolo,max_retries,retry_forever,retry_explicit,provider_id,model,context,codex_session_id,goal_status,goal_tokens_used,goal_revision,goal_updated_at,created_at,updated_at,last_interaction_at,native,reasoning_effort,service_tier,personality,collaboration_mode,permission_profile,ssh_host,name_revision) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (fork_task_id, fork_name, task.get("prompt", ""), task.get("goal", ""), task["workspace"], "available",
+             int(task.get("yolo", 1)), int(task.get("max_retries", 3)), 0, 0,
+             task.get("provider_id"), task.get("model", ""), task.get("context", ""), fork_id, task.get("goal_status", "none"),
+             int(task.get("goal_tokens_used", 0)), 1 if task.get("goal") else 0, stamp if task.get("goal") else "", stamp, stamp, stamp,
+             0 if task.get("ssh_host") else 1,
              task.get("reasoning_effort", ""), task.get("service_tier", ""), task.get("personality", ""), task.get("collaboration_mode", "default"),
-             task.get("permission_profile", ""), task["ssh_host"]),
+             task.get("permission_profile", ""), task.get("ssh_host", ""), 1),
         )
         db.execute(
             "INSERT INTO sessions (id,task_id,status,attempt,provider_id,command,started_at,finished_at,exit_code,summary,codex_session_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (str(uuid.uuid4()), fork_task_id, "imported", 0, task.get("provider_id"), f"ssh {task['ssh_host']} codex thread/fork", stamp, stamp, 0, "Forked remote Codex thread", fork_id),
+            (str(uuid.uuid4()), fork_task_id, "imported", 0, task.get("provider_id"), "codex app-server thread/fork", stamp, stamp, 0, "Forked Codex thread", fork_id),
         )
-        forked_task = db.one("SELECT id,name,status FROM tasks WHERE id=?", (fork_task_id,))
+        forked_task = task_or_404(fork_task_id)
         await broadcast_overview(fork_task_id, {"type": "created", "forked": True})
-    else:
-        await sync_native_threads()
-        forked_task = db.one("SELECT id,name,status FROM tasks WHERE codex_session_id=?", (fork_id,))
     return {"ok": True, "operation": operation, "thread_id": thread_id, "fork_thread_id": fork_id, "task": forked_task}
 
 
@@ -6648,7 +6661,7 @@ async def codex_operation(task_id: str, payload: OperationIn, _: Any = Depends(a
         return await run_thread_operation(task, payload)
     if payload.operation in {"memory-enable", "memory-disable"}:
         return await run_thread_operation(task, payload)
-    if task_id in running or task_id in appserver_turn_tasks or task["status"] == "running":
+    if payload.operation not in {"rename", "fork"} and (task_id in running or task_id in appserver_turn_tasks or task["status"] == "running"):
         raise HTTPException(409, "Task is already running")
     if task.get("ssh_host"):
         await require_ssh_connection(task["ssh_host"], codex=True)
