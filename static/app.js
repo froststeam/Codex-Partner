@@ -191,6 +191,8 @@ function toggleTerminalShortcut() {
 }
 async function runOperation(operation, trigger = null) {
   if (!state.selectedId || threadOperationInFlight) return;
+  const taskId = state.selectedId;
+  let forkCreated = false;
   if (["archive", "delete"].includes(operation)) {
     const message = uiLabel(operation === "delete" ? "trashSessionConfirm" : "archiveSessionConfirm");
     if (!await appConfirm(message, { danger: operation === "delete" })) return;
@@ -198,7 +200,8 @@ async function runOperation(operation, trigger = null) {
   threadOperationInFlight = true;
   if (trigger) trigger.disabled = true;
   try {
-  const result = await api(`/tasks/${state.selectedId}/operation`, { method: "POST", body: JSON.stringify({ operation, args: [] }) });
+  if (operation === "fork") toast(uiLabel("sessionDuplicating"));
+  const result = await api(`/tasks/${taskId}/operation`, { method: "POST", body: JSON.stringify({ operation, args: [] }) });
   if (result.memory_mode && state.selectedTask) {
     // Reflect the acknowledged mode immediately while the authoritative
     // refresh also updates the other browser clients.
@@ -211,6 +214,14 @@ async function runOperation(operation, trigger = null) {
     state.selectedId = null;
     showEmptyConversation();
     await refresh(false);
+  } else if (operation === "fork") {
+    if (!result.task?.id) throw Error("Codex 未返回复制后的会话");
+    mergeTask(result.task);
+    forkCreated = true;
+    renderSessionList();
+    renderSidebarStats();
+    toast(uiLabel("sessionDuplicated"));
+    await selectSession(result.task.id);
   } else {
     // A command can change fields that are only present in the full task
     // payload (memory mode, archive state, renamed title). Refresh the
@@ -219,8 +230,12 @@ async function runOperation(operation, trigger = null) {
     await refresh(true);
     if (result.task?.id && result.task.id !== state.selectedId) await selectSession(result.task.id);
   }
-  const message = operation === "fork" ? uiLabel("sessionDuplicated") : result.trashed ? "会话已移到回收站" : operation === "unarchive" ? "会话已取消归档" : operation === "memory-enable" ? "记忆已打开" : operation === "memory-disable" ? "记忆已关闭" : uiLabel("operationComplete");
-  toast(message);
+  if (operation !== "fork") {
+    const message = result.trashed ? "会话已移到回收站" : operation === "unarchive" ? "会话已取消归档" : operation === "memory-enable" ? "记忆已打开" : operation === "memory-disable" ? "记忆已关闭" : uiLabel("operationComplete");
+    toast(message);
+  }
+  } catch (error) {
+    toast(operation === "fork" ? `${forkCreated ? "会话已复制，但打开副本失败" : "复制会话失败"}：${error.message}` : error.message);
   } finally {
     threadOperationInFlight = false;
     if (trigger) trigger.disabled = false;

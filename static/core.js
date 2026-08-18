@@ -111,6 +111,7 @@ const UI_LABELS = {
   threadControls: { zh: "线程控制", en: "Thread controls", fr: "Contrôles du thread", ja: "スレッド操作", ko: "스레드 제어" },
   copySession: { zh: "复制会话", en: "Duplicate session", fr: "Dupliquer", ja: "セッションを複製", ko: "세션 복제" },
   sessionRenamed: { zh: "会话已重命名", en: "Session renamed", fr: "Session renommée", ja: "セッション名を変更しました", ko: "세션 이름이 변경되었습니다" },
+  sessionDuplicating: { zh: "正在复制会话…", en: "Duplicating session…", fr: "Duplication de la session…", ja: "セッションを複製中…", ko: "세션 복제 중…" },
   sessionDuplicated: { zh: "会话已复制", en: "Session duplicated", fr: "Session dupliquée", ja: "セッションを複製しました", ko: "세션이 복제되었습니다" },
   operationComplete: { zh: "操作已完成", en: "Operation completed", fr: "Opération terminée", ja: "操作が完了しました", ko: "작업이 완료되었습니다" },
   explorationOpen: { zh: "探索地图", en: "Activity map", fr: "Carte d’exploration", ja: "探索マップ", ko: "탐색 지도" },

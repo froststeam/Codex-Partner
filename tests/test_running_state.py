@@ -2884,9 +2884,12 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('uiLabel("binaryAttachment"', app_js)
         self.assertIn("let threadOperationInFlight = false", app_js)
         self.assertIn('runOperation("fork", button)', app_js)
+        self.assertIn('toast(uiLabel("sessionDuplicating"))', app_js)
+        self.assertIn('mergeTask(result.task)', app_js)
+        self.assertIn('forkCreated ? "会话已复制，但打开副本失败" : "复制会话失败"', app_js)
         self.assertIn('uiLabel("sessionRenamed")', app_js)
         self.assertIn('uiLabel("sessionDuplicated")', app_js)
-        self.assertIn('/app.js?v=20260818-terminal-queue', html)
+        self.assertIn('/app.js?v=20260818-fork-feedback', html)
         self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
@@ -3127,7 +3130,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('/conversation.js?v=20260818-running-session-dot', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
-        self.assertIn('/app.js?v=20260818-terminal-queue', html)
+        self.assertIn('/app.js?v=20260818-fork-feedback', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
         self.assertIn('/styles.css?v=20260818-running-session-dot', html)
         self.assertIn('/vendor/katex/katex.min.css', html)
@@ -3221,7 +3224,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertNotIn("stream.scrollTop = target * state.chatAverageHeight", conversation)
         self.assertIn("function syncPageVisibility", app_js)
         self.assertIn('/styles.css?v=20260818-running-session-dot', html)
-        self.assertIn('/app.js?v=20260818-terminal-queue', html)
+        self.assertIn('/app.js?v=20260818-fork-feedback', html)
 
     def test_optimistic_queue_messages_survive_authoritative_refresh(self):
         static = Path(__file__).resolve().parents[1] / "static"
