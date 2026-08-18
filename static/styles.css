@@ -193,6 +193,7 @@ body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56p
 .message.user .message-avatar { cursor: pointer; }
 .human-avatar b::after { content: none; }
 .message-body { min-width: 0; width: min(780px, calc(100% - 49px)); max-width: min(780px, calc(100% - 49px)); }
+.message.assistant .message-body { flex: 1 1 0; width: auto; }
 .message.user .message-body { width: fit-content; min-width: min(180px, calc(100% - 49px)); }
 .message-body.copyable-chat-block { position: relative; }
 .message-body.copyable-chat-block > .message-meta { padding-right: 27px; }
@@ -209,6 +210,7 @@ body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56p
 .message-meta span { border: 1px solid #344148; border-radius: 4px; padding: 1px 5px; color: #839298; font-size: 8px; }
 .message-meta time { color: #65747a; font-size: 9px; }
 .message-content { border: 1px solid #29363b; border-radius: 4px 10px 10px 10px; padding: 11px 14px; background: #151d21; color: #dce4e7; font-size: 14px; line-height: 1.7; overflow-wrap: anywhere; box-shadow: 0 5px 16px #00000018; }
+.message.assistant .message-content, .message.assistant .message-content > p { box-sizing: border-box; width: 100%; }
 .chat-file-attachment { display: flex; align-items: center; gap: 8px; min-width: 170px; max-width: 310px; margin-top: 9px; padding: 7px 8px; border: 1px solid #3d514e; border-radius: 7px; background: #192923; text-align: left; cursor: zoom-in; }
 .chat-file-attachment:hover { border-color: #8aa968; background: #20332a; }
 .chat-file-attachment:focus-visible { outline: 2px solid #9abd6b; outline-offset: 2px; }

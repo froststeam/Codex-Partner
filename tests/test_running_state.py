@@ -1899,7 +1899,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('disabled title="${esc(uiLabel("protectedSkillDelete"))}"', settings)
         self.assertIn(".panel-item button.danger-text:not(:disabled)", styles)
         self.assertNotIn(".panel-item button:last-child", styles)
-        self.assertIn('/styles.css?v=20260818-chat-layout', html)
+        self.assertIn('/styles.css?v=20260818-chat-layout-stable', html)
         self.assertIn('/core.js?v=20260818-chat-performance', html)
         self.assertIn('/settings.js?v=20260817-skill-actions', html)
 
@@ -2692,7 +2692,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260818-chat-performance', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
-        self.assertIn('/styles.css?v=20260818-chat-layout', html)
+        self.assertIn('/styles.css?v=20260818-chat-layout-stable', html)
         self.assertIn('/vendor/katex/katex.min.css', html)
         self.assertIn('<span id="goal-run-label">暂停</span>', html)
         self.assertNotIn('id="goal-run-label" class="sr-only"', html)
@@ -2773,10 +2773,12 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("transform: translateX(470%)", styles)
         self.assertIn("min-width: min(180px, calc(100% - 49px))", styles)
         self.assertIn(".message.user .message-content { display: block; box-sizing: border-box; width: 100%", styles)
+        self.assertIn(".message.assistant .message-body { flex: 1 1 0; width: auto; }", styles)
+        self.assertIn(".message.assistant .message-content, .message.assistant .message-content > p", styles)
         self.assertIn("if (chatIsNearBottom(stream))", conversation)
         self.assertNotIn("stream.scrollTop = target * state.chatAverageHeight", conversation)
         self.assertIn("function syncPageVisibility", app_js)
-        self.assertIn('/styles.css?v=20260818-chat-layout', html)
+        self.assertIn('/styles.css?v=20260818-chat-layout-stable', html)
         self.assertIn('/app.js?v=20260818-chat-performance', html)
 
     def test_optimistic_queue_messages_survive_authoritative_refresh(self):
