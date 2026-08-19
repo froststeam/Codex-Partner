@@ -693,6 +693,11 @@ body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56p
 .exploration-node.selected .exploration-node-copy { outline: 2px solid color-mix(in srgb, var(--star) 68%, white); outline-offset: 3px; border-color: white; box-shadow: 0 0 16px var(--star), 0 8px 24px #000b; }
 .exploration-node-copy strong { display: -webkit-box; overflow: hidden; color: #fff; font-size: 12px; font-weight: 800; line-height: 1.4; text-shadow: 0 1px 2px #000b; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .exploration-node-copy small { overflow: hidden; color: #e0e8ea; font-size: 10px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.exploration-node.active .exploration-node-copy { background: #16414a; }
+.exploration-node.completed .exploration-node-copy { background: #203d29; }
+.exploration-node.failed .exploration-node-copy { background: #4a2928; }
+.exploration-node.rolledback .exploration-node-copy { background: #392a4b; }
+.exploration-node.abandoned .exploration-node-copy { background: #493b20; }
 .exploration-node-copy small b { color: #b5c5c9; font-size: 8px; letter-spacing: 0; }
 .exploration-node.active .exploration-node-copy small { color: #84dbe3; }
 .exploration-map-detail { min-width: 0; min-height: 0; overflow: auto; border-left: 1px solid #2b373d; padding: 18px; background: #12191d; }
