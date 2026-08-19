@@ -138,6 +138,39 @@ class RunningStateTests(unittest.TestCase):
         self.assertEqual("fileChange", patch_payload["type"])
         self.assertEqual("应用代码修改", patch_payload["text"])
 
+    def test_empty_reasoning_items_are_filtered_at_source_and_in_history(self):
+        self.assertIsNone(self.app.rollout_browser_payload({
+            "type": "response_item",
+            "payload": {"type": "reasoning", "id": "empty", "summary": [], "content": []},
+        }))
+        populated = self.app.rollout_browser_payload({
+            "type": "response_item",
+            "payload": {"type": "reasoning", "id": "useful", "summary": [{"type": "summary_text", "text": "Inspecting queue state"}], "content": []},
+        })
+        self.assertEqual("reasoning", populated["type"])
+        self.assertIn("Inspecting queue state", populated["text"])
+
+        task_id = "empty-reasoning-history"
+        self.make_task(task_id)
+        self.app.db.execute("UPDATE tasks SET native=1,codex_session_id=? WHERE id=?", (task_id, task_id))
+
+        class FakeClient:
+            async def request(self, method, params):
+                return {"thread": {"turns": [{"id": "turn", "items": [
+                    {"type": "reasoning", "id": "empty", "summary": [], "content": []},
+                    {"type": "agentMessage", "id": "answer", "text": "visible"},
+                ]}]}}
+
+        try:
+            self.app.native_history_cache.pop(task_id, None)
+            with mock.patch.object(self.app, "appserver_for", new=mock.AsyncMock(return_value=FakeClient())):
+                rows = asyncio.run(self.app.native_history_events(self.app.task_or_404(task_id)))
+            self.assertEqual(1, len(rows))
+            self.assertEqual("visible", json.loads(rows[0]["payload"])["text"])
+        finally:
+            self.app.native_history_cache.pop(task_id, None)
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
     def test_task_or_404_falls_back_when_alias_points_to_missing_task(self):
         task_id = "task-alias-fallback"
         missing_thread_id = "missing-thread-alias"

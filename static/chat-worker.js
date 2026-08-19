@@ -81,7 +81,12 @@ function eventText(raw, labels) {
   if (payload.type === "agentMessage") return stripCodexHiddenContext(payload.text || "");
   if (payload.type === "agentMessageStarted") return "";
   if (payload.type === "agent_delta") return payload.delta || "";
-  if (payload.type === "reasoning") return payload.text || payload.summary || "";
+  if (payload.type === "reasoning") {
+    const value = payload.text || payload.summary || payload.content || "";
+    if (typeof value === "string") return value;
+    if (Array.isArray(value)) return value.map(item => typeof item === "string" ? item : (item?.text || item?.summary || "")).filter(Boolean).join("\n");
+    return value?.text || value?.summary || "";
+  }
   if (payload.type === "goal_updated") return "";
   if (payload.type === "fileChange") return payload.text || labels.fileChanged;
   if (payload.type === "contextCompaction") return labels.contextCompressed;
@@ -91,6 +96,17 @@ function eventText(raw, labels) {
   if (["slashCommand", "commandResult"].includes(payload.type)) return payload.text || "";
   if (payload.type === "codex") return payload.method ? `Codex · ${payload.method}` : labels.codexActivity;
   return payload.delta || payload.text || JSON.stringify(payload);
+}
+
+function isEmptyReasoningEnvelope(text) {
+  const value = String(text || "").trim();
+  if (!value.startsWith("{") || !value.endsWith("}")) return false;
+  try {
+    const parsed = JSON.parse(value);
+    if (String(parsed?.type || "").toLowerCase() !== "reasoning") return false;
+    const empty = item => item == null || item === "" || (Array.isArray(item) && item.length === 0);
+    return empty(parsed.summary) && empty(parsed.content) && !String(parsed.text || "").trim();
+  } catch (_) { return false; }
 }
 
 function isUser(event) {
@@ -130,9 +146,10 @@ function activityItem(raw, labels, event) {
   const args = stringify(payload?.arguments || native.arguments || native.input);
   const changes = Array.isArray(payload?.changes) ? payload.changes : (Array.isArray(native.changes) ? native.changes : []);
   const plan = Array.isArray(payload?.plan) ? payload.plan : (Array.isArray(native.plan) ? native.plan : (Array.isArray(native.steps) ? native.steps : []));
-  const protocolNoise = ["updated", "update", "diff", "output", "delta", "itemupdated", "itemdelta", "turnupdated", "turndiff"].includes(normalizedType);
+  const protocolNoise = ["updated", "update", "diff", "output", "delta", "itemupdated", "itemdelta", "turnupdated", "turndiff"].includes(normalizedType)
+    || isEmptyReasoningEnvelope(detail);
   const rawCodexProtocol = type === "codex" && Boolean(payload?.method);
-  const reasoningText = String(payload?.text || native.summary || native.content || "").trim();
+  const reasoningText = String(eventText({ type: "reasoning", text: payload?.text, summary: native.summary, content: native.content }, labels) || "").trim();
   const emptyReasoning = type.includes("reason") && (!reasoningText || ["reasoning", "正在分析与规划", "正在处理"].includes(reasoningText));
   return {
     text: generic || !detail ? label : `${label} · ${detail}`,

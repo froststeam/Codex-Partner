@@ -1060,6 +1060,8 @@ def rollout_browser_payload(record: dict) -> Optional[dict]:
             }
         if lowered == "reasoning":
             text = structured_text(payload.get("summary") or payload.get("content") or payload.get("text"))
+            if not text.strip():
+                return None
             return {"type": "reasoning", "text": compact_activity_detail(text, 1200), "item_id": payload.get("id", ""), "turn_id": turn_id}
         if lowered in {"custom_tool_call", "function_call"}:
             event_type, detail = rollout_tool_activity(payload)
@@ -2554,6 +2556,8 @@ async def native_history_events(task: dict) -> list[dict]:
                     )
                 if not text and item_type in {"reasoning", "plan"}:
                     text = structured_text(item.get("summary") or item.get("content"))
+                    if not text.strip():
+                        continue
                 if not text:
                     if item_type == "fileChange":
                         changes = item.get("changes") or []
