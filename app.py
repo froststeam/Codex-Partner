@@ -2715,7 +2715,6 @@ async def handle_appserver_notification(server_key: str, message: dict) -> None:
         turn = params.get("turn") or {}
         turn_status = turn.get("status") or "completed"
         payload = {"type": "turn_completed", "status": turn_status, "thread_id": thread_id}
-        native_history_cache.pop(task_id, None)
         waiter = turn_waiters.pop(thread_id, None)
         if waiter and not waiter.done():
             if turn_status in {"failed", "interrupted"}:
@@ -2916,7 +2915,9 @@ async def supervise_appserver_turn(
         # Bind the persisted session before goal/turn notifications can arrive.
         app_thread_bindings[task["id"]] = (key, thread_id, session_id)
         db.execute("UPDATE tasks SET codex_session_id=?,updated_at=? WHERE id=?", (thread_id, now(), task["id"]))
-        native_history_cache.pop(task["id"], None)
+        cached_history = native_history_cache.get(task["id"])
+        if mode == "start" or (cached_history and cached_history.get("thread_id") != thread_id):
+            native_history_cache.pop(task["id"], None)
         async with goal_sync_lock(task["id"]):
             goal_task = task_or_404(task["id"])
             goal_revision_at_start = int(goal_task.get("goal_revision") or 0)
@@ -5241,7 +5242,7 @@ async def native_timeline_events(task: dict) -> tuple[list[dict], list[dict]]:
     persisted = db.all(
         "SELECT * FROM (SELECT * FROM events WHERE task_id=? AND ("
         "stream IN ('system','rollout') OR (stream='app-server' AND "
-        "lower(json_extract(payload,'$.type')) IN ('reasoning','commandexecution','mcptoolcall','filechange','websearch','contextcompaction'))) "
+        "lower(json_extract(payload,'$.type')) IN ('usermessage','browsermessage','agentmessage','reasoning','commandexecution','mcptoolcall','filechange','websearch','contextcompaction'))) "
         "ORDER BY id DESC LIMIT 5000) "
         "ORDER BY ts,id",
         (task["id"],),

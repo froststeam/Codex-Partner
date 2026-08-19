@@ -3,6 +3,7 @@ const chatFileObjectUrls = new Map();
 const chatThumbnailObjectUrls = new Map();
 const chatThumbnailLoads = new Map();
 const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260819-activity-retention") : null;
+const conversationSnapshots = new Map();
 let chatBuildRequestId = 0;
 let chatBuildInFlight = false;
 let chatBuildQueued = false;
@@ -91,6 +92,15 @@ function clearChatSelectionForSessionSwitch() {
 }
 async function selectSession(id, openSocket = true) {
   if (state.selectedId !== id) clearChatSelectionForSessionSwitch();
+  const previousId = state.selectedId;
+  if (previousId && previousId !== id && state.selectedTask) {
+    conversationSnapshots.set(previousId, {
+      task: state.selectedTask, events: state.selectedEvents, messages: state.selectedMessages,
+      historyCursor: state.historyCursor, historyHasMore: state.historyHasMore,
+      nodes: state.explorationNodes, edges: state.explorationEdges,
+      explorationPrecomputed: state.explorationPrecomputed,
+    });
+  }
   const requestId = ++state.sessionRequestId;
   state.sessionAbortController?.abort();
   const controller = new AbortController();
@@ -108,6 +118,17 @@ async function selectSession(id, openSocket = true) {
   state.selectedId = id; localStorage.setItem("codex-dashboard-session", id);
   const task = state.tasks.find(item => item.id === id);
   if (task) state.selectedTask = task;
+  const cached = conversationSnapshots.get(id);
+  if (cached) {
+    state.selectedTask = cached.task || task;
+    state.selectedEvents = cached.events || [];
+    state.selectedMessages = cached.messages || [];
+    state.historyCursor = cached.historyCursor || "";
+    state.historyHasMore = Boolean(cached.historyHasMore);
+    state.explorationNodes = cached.nodes || [];
+    state.explorationEdges = cached.edges || [];
+    state.explorationPrecomputed = Boolean(cached.explorationPrecomputed);
+  }
   // Reflect keyboard navigation immediately, then replace the row with the full task after loading.
   renderSessionList();
   scrollSessionIntoView(id);
@@ -117,37 +138,40 @@ async function selectSession(id, openSocket = true) {
     setInspectorOpen(window.innerWidth >= 861 && !state.inspectorClosed);
     renderConversation();
   }
-  let fullTask, timeline, messages, activityMap;
+  if (openSocket) connectSocket(id);
+  const fullTaskPromise = api(`/tasks/${encodeURIComponent(id)}`, { signal: controller.signal });
+  const timelinePromise = api(`/tasks/${encodeURIComponent(id)}/timeline?limit=120`, { signal: controller.signal });
+  const messagesPromise = api(`/tasks/${encodeURIComponent(id)}/messages`, { signal: controller.signal });
+  const activityMapPromise = api(`/tasks/${encodeURIComponent(id)}/activity-map`, { signal: controller.signal });
+  const detailsUpdate = Promise.all([fullTaskPromise, messagesPromise]).then(([fullTask, messages]) => {
+    if (requestId !== state.sessionRequestId || state.selectedId !== id) return;
+    state.selectedTask = fullTask; replaceTaskMessages(messages); renderSessionList(); renderConversation();
+  }).catch(error => { if (error.name !== "AbortError") toast(error.message); });
+  const activityMapUpdate = activityMapPromise.then(activityMap => {
+    if (requestId !== state.sessionRequestId || state.selectedId !== id) return;
+    state.explorationPrecomputed = true;
+    if (typeof applyActivityMapSnapshot === "function") applyActivityMapSnapshot(activityMap);
+  }).catch(error => { if (error.name !== "AbortError") state.explorationLoadError = error.message; });
+  Promise.allSettled([timelinePromise, detailsUpdate, activityMapUpdate]).then(() => {
+    if (state.sessionAbortController === controller) state.sessionAbortController = null;
+  });
+  let timeline;
   try {
-    [fullTask, timeline, messages, activityMap] = await Promise.all([
-      api(`/tasks/${encodeURIComponent(id)}`, { signal: controller.signal }),
-      api(`/tasks/${encodeURIComponent(id)}/timeline?limit=160`, { signal: controller.signal }),
-      api(`/tasks/${encodeURIComponent(id)}/messages`, { signal: controller.signal }),
-      api(`/tasks/${encodeURIComponent(id)}/activity-map`, { signal: controller.signal }),
-    ]);
+    timeline = await timelinePromise;
   } catch (error) {
     if (error.name === "AbortError") return;
     throw error;
   }
   if (requestId !== state.sessionRequestId || state.selectedId !== id) return;
-  if (state.sessionAbortController === controller) state.sessionAbortController = null;
-  state.selectedTask = fullTask;
-  state.explorationPrecomputed = true;
-  if (typeof applyActivityMapSnapshot === "function") applyActivityMapSnapshot(activityMap);
   state.selectedEvents = [...(timeline.items || []), ...(timeline.metrics || [])];
-  state.explorationEvents = [];
-  state.explorationNeedsSync = false;
   state.historyCursor = timeline.next_cursor || ""; state.historyHasMore = Boolean(timeline.has_more);
-  replaceTaskMessages(messages);
-  // A newly selected thread should open at its latest message. Consume this
-  // once in renderChat instead of smooth-scrolling on every intermediate
-  // update while the history/socket is loading.
-  state.chatSnapToBottom = true;
+  state.chatSnapToBottom = !cached;
+  renderConversation();
   $("#empty-conversation").hidden = true; $("#conversation-view").hidden = false;
   if (wasEmpty && window.innerWidth >= 861) state.inspectorClosed = false;
   setInspectorOpen(window.innerWidth >= 861 && !state.inspectorClosed);
-  renderSessionList(); renderConversation();
-  if (openSocket) connectSocket(id); if (window.innerWidth <= 860) setSessionSidebarOpen(false);
+  renderSessionList();
+  if (window.innerWidth <= 860) setSessionSidebarOpen(false);
   loadWorkspace("").catch(() => {});
 }
 function renderConversation(renderMessages = true) {

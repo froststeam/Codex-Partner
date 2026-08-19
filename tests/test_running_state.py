@@ -1140,7 +1140,7 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
         conversation = (worker.parent / "conversation.js").read_text(encoding="utf-8")
         html = (worker.parent / "index.html").read_text(encoding="utf-8")
         self.assertIn('/chat-worker.js?v=20260819-activity-retention', conversation)
-        self.assertIn('/conversation.js?v=20260819-activity-retention', html)
+        self.assertIn('/conversation.js?v=20260819-session-snapshot', html)
 
     def test_worker_hides_native_media_tags(self):
         script = f"""
@@ -1611,7 +1611,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn('data-activity-output-key="${esc(outputKey)}"', conversation)
         self.assertIn("Object.prototype.hasOwnProperty.call(state.activityOutputOpen, outputKey)", conversation)
         self.assertIn("state.activityOutputOpen[output.dataset.activityOutputKey] = output.open", conversation)
-        self.assertIn('/conversation.js?v=20260819-activity-retention', html)
+        self.assertIn('/conversation.js?v=20260819-session-snapshot', html)
 
     def test_message_history_skips_activity_only_pages(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -1667,7 +1667,7 @@ const cursors = [];
         self.assertIn("HistoryPagination.fetchEarlierTimelinePages", conversation)
         self.assertIn("messageTarget: 12, maxPages: 8", conversation)
         self.assertIn('/history-pagination.js?v=20260817-message-history', html)
-        self.assertIn('/conversation.js?v=20260819-activity-retention', html)
+        self.assertIn('/conversation.js?v=20260819-session-snapshot', html)
 
     def test_sent_browser_messages_follow_the_loaded_timeline_boundary(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -3263,8 +3263,8 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260819-activity-retention', html)
-        self.assertIn("/timeline?limit=160", conversation_js)
+        self.assertIn('/conversation.js?v=20260819-session-snapshot', html)
+        self.assertIn("/timeline?limit=120", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
         self.assertIn("appendStreamingDelta", conversation_js)
@@ -3508,7 +3508,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260819-activity-retention', html)
+        self.assertIn('/conversation.js?v=20260819-session-snapshot', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260818-fork-feedback', html)
@@ -3573,7 +3573,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('const sessionList = $("#task-list")', conversation)
         self.assertIn("void selectSession(pointerSelectedSessionId)", conversation)
         self.assertIn('aria-current="${selected ? "true" : "false"}"', conversation)
-        self.assertIn('/conversation.js?v=20260819-activity-retention', html)
+        self.assertIn('/conversation.js?v=20260819-session-snapshot', html)
 
     def test_live_chat_rendering_coalesces_expensive_work(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -3591,8 +3591,17 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("state.explorationNeedsSync && (state.explorationOpen || !state.explorationNodes.length)", conversation)
         self.assertIn("if (current !== previous) scheduleRenderChat()", conversation)
         self.assertIn("renderConversation(false)", conversation)
+        self.assertIn("const conversationSnapshots = new Map()", conversation)
+        self.assertIn("conversationSnapshots.set(previousId", conversation)
+        self.assertIn("const cached = conversationSnapshots.get(id)", conversation)
+        self.assertIn("timeline = await timelinePromise", conversation)
+        self.assertIn("const activityMapUpdate = activityMapPromise.then", conversation)
+        select_start = conversation.index("async function selectSession")
+        socket_start = conversation.index("if (openSocket) connectSocket(id)", select_start)
+        timeline_wait = conversation.index("timeline = await timelinePromise", select_start)
+        self.assertLess(socket_start, timeline_wait)
         self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
-        self.assertIn('/conversation.js?v=20260819-activity-retention', html)
+        self.assertIn('/conversation.js?v=20260819-session-snapshot', html)
         styles = (static / "styles.css").read_text(encoding="utf-8")
         app_js = (static / "app.js").read_text(encoding="utf-8")
         self.assertNotIn("content-visibility: auto", styles)
