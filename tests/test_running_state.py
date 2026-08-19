@@ -118,6 +118,62 @@ class RunningStateTests(unittest.TestCase):
         self.assertEqual(0, payload["exit_code"])
         self.assertEqual("completed", payload["status"])
 
+    def test_native_timeline_keeps_normalized_appserver_activity(self):
+        task_id = "native-appserver-activity"
+        self.make_task(task_id, "available")
+        self.app.db.execute("UPDATE tasks SET native=1,codex_session_id=? WHERE id=?", (task_id, task_id))
+        session_id = "native-appserver-session"
+        self.app.db.execute(
+            "INSERT INTO sessions (id,task_id,status,attempt,provider_id,command,started_at,codex_session_id) VALUES (?,?,?,?,?,?,?,?)",
+            (session_id, task_id, "imported", 0, None, "imported", self.app.now(), task_id),
+        )
+        for index, payload in enumerate((
+            {"type": "agent_delta", "delta": "partial", "turn_id": "turn-1"},
+            {"type": "codex", "method": "item/commandExecution/outputDelta", "params": {"turnId": "turn-1"}},
+            {"type": "commandExecution", "command": "pwd", "item_id": "call-1", "turn_id": "turn-1", "status": "completed"},
+            {"type": "mcpToolCall", "tool": "search", "item_id": "call-2", "turn_id": "turn-1", "status": "completed"},
+        )):
+            self.app.db.execute(
+                "INSERT INTO events (session_id,task_id,ts,stream,payload) VALUES (?,?,?,?,?)",
+                (session_id, task_id, f"2026-08-19T08:00:0{index}+00:00", "app-server", json.dumps(payload)),
+            )
+
+        async def exercise():
+            with mock.patch.object(self.app, "native_history_events", new=mock.AsyncMock(return_value=[])):
+                events, _metrics = await self.app.native_timeline_events(self.app.task_or_404(task_id))
+            return [json.loads(event["payload"])["type"] for event in events]
+
+        try:
+            self.assertEqual(["commandExecution", "mcpToolCall"], asyncio.run(exercise()))
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_native_fast_timeline_uses_persisted_semantic_events(self):
+        task_id = "native-fast-timeline"
+        self.make_task(task_id, "available")
+        self.app.db.execute("UPDATE tasks SET native=1,codex_session_id=? WHERE id=?", (task_id, task_id))
+        session_id = "native-fast-session"
+        self.app.db.execute(
+            "INSERT INTO sessions (id,task_id,status,attempt,provider_id,command,started_at,codex_session_id) VALUES (?,?,?,?,?,?,?,?)",
+            (session_id, task_id, "imported", 0, None, "imported", self.app.now(), task_id),
+        )
+        for index, payload in enumerate((
+            {"type": "agent_delta", "delta": "noise"},
+            {"type": "codex", "method": "item/commandExecution/outputDelta"},
+            {"type": "commandExecution", "command": "pwd"},
+            {"type": "agentMessage", "text": "done"},
+        )):
+            self.app.db.execute(
+                "INSERT INTO events (session_id,task_id,ts,stream,payload) VALUES (?,?,?,?,?)",
+                (session_id, task_id, f"2026-08-19T08:01:0{index}+00:00", "app-server", json.dumps(payload)),
+            )
+        try:
+            result = asyncio.run(self.app.task_timeline(task_id, limit=120, fast=True, _=None))
+            self.assertTrue(result["fast"])
+            self.assertEqual(["commandExecution", "agentMessage"], [json.loads(row["payload"])["type"] for row in result["items"]])
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
     def test_rollout_plan_steps_extracts_wrapped_update_plan(self):
         payload = {
             "type": "custom_tool_call",
@@ -137,6 +193,39 @@ class RunningStateTests(unittest.TestCase):
         })
         self.assertEqual("fileChange", patch_payload["type"])
         self.assertEqual("应用代码修改", patch_payload["text"])
+
+    def test_empty_reasoning_items_are_filtered_at_source_and_in_history(self):
+        self.assertIsNone(self.app.rollout_browser_payload({
+            "type": "response_item",
+            "payload": {"type": "reasoning", "id": "empty", "summary": [], "content": []},
+        }))
+        populated = self.app.rollout_browser_payload({
+            "type": "response_item",
+            "payload": {"type": "reasoning", "id": "useful", "summary": [{"type": "summary_text", "text": "Inspecting queue state"}], "content": []},
+        })
+        self.assertEqual("reasoning", populated["type"])
+        self.assertIn("Inspecting queue state", populated["text"])
+
+        task_id = "empty-reasoning-history"
+        self.make_task(task_id)
+        self.app.db.execute("UPDATE tasks SET native=1,codex_session_id=? WHERE id=?", (task_id, task_id))
+
+        class FakeClient:
+            async def request(self, method, params):
+                return {"thread": {"turns": [{"id": "turn", "items": [
+                    {"type": "reasoning", "id": "empty", "summary": [], "content": []},
+                    {"type": "agentMessage", "id": "answer", "text": "visible"},
+                ]}]}}
+
+        try:
+            self.app.native_history_cache.pop(task_id, None)
+            with mock.patch.object(self.app, "appserver_for", new=mock.AsyncMock(return_value=FakeClient())):
+                rows = asyncio.run(self.app.native_history_events(self.app.task_or_404(task_id)))
+            self.assertEqual(1, len(rows))
+            self.assertEqual("visible", json.loads(rows[0]["payload"])["text"])
+        finally:
+            self.app.native_history_cache.pop(task_id, None)
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
     def test_task_or_404_falls_back_when_alias_points_to_missing_task(self):
         task_id = "task-alias-fallback"
@@ -602,7 +691,7 @@ class RunningStateTests(unittest.TestCase):
         self.assertEqual(str(path), self.app.external_turns[task_id]["path"])
         self.assertEqual(self.app.external_turns[task_id]["session_id"], self.app.task_or_404(task_id)["active_session_id"])
 
-    def test_goal_resume_adopts_active_terminal_turn(self):
+    def test_conversation_resume_does_not_activate_goal_on_terminal_turn(self):
         task_id = f"external-goal-{time.time_ns()}"
         self.make_task(task_id, "available")
         self.app.db.execute(
@@ -620,10 +709,10 @@ class RunningStateTests(unittest.TestCase):
             result = asyncio.run(self.app.resume_task(task_id, None))
             self.assertTrue(result["shared"])
             self.assertEqual("running", result["status"])
-            self.assertEqual("goal_resume", result["run_mode"])
+            self.assertEqual("terminal", result["run_mode"])
             self.assertEqual("terminal", result["execution_source"])
             self.app.persist_external_task_status(task_id, dashboard_active=False)
-            self.assertEqual("goal_resume", self.app.task_or_404(task_id)["run_mode"])
+            self.assertEqual("terminal", self.app.task_or_404(task_id)["run_mode"])
         finally:
             self.app.clear_external_turns(task_id)
 
@@ -636,10 +725,10 @@ class RunningStateTests(unittest.TestCase):
         )
         with mock.patch.object(self.app, "launch", new=mock.AsyncMock(return_value={"session_id": "next"})) as launch:
             asyncio.run(self.app.drain_task_messages(task_id))
-        launch.assert_awaited_once_with(task_id, "resume")
+        launch.assert_awaited_once_with(task_id, "goal-resume")
         self.assertEqual("queued", self.app.task_or_404(task_id)["status"])
 
-    def test_paused_or_blocked_goal_auto_resumes_when_retry_forever_is_on(self):
+    def test_blocked_goal_auto_resumes_but_paused_goal_requires_goal_start(self):
         for status in ("paused", "blocked"):
             task_id = f"external-goal-{status}-{time.time_ns()}"
             self.make_task(task_id, "available")
@@ -650,12 +739,16 @@ class RunningStateTests(unittest.TestCase):
             try:
                 with mock.patch.object(self.app, "launch", new=mock.AsyncMock(return_value={"session_id": "next"})) as launch:
                     asyncio.run(self.app.drain_task_messages(task_id))
-                launch.assert_awaited_once_with(task_id, "resume")
                 task = self.app.task_or_404(task_id)
-                self.assertEqual("queued", task["status"])
                 self.assertEqual(status, task["goal_status"])
-                self.assertTrue(self.app.goal_auto_resume_enabled(task))
-                self.assertEqual("active", self.app.goal_status_for_resume(task))
+                if status == "blocked":
+                    launch.assert_awaited_once_with(task_id, "goal-resume")
+                    self.assertEqual("queued", task["status"])
+                    self.assertTrue(self.app.goal_auto_resume_enabled(task))
+                else:
+                    launch.assert_not_awaited()
+                    self.assertFalse(self.app.goal_auto_resume_enabled(task))
+                self.assertEqual(status, self.app.goal_status_for_resume(task))
             finally:
                 self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
@@ -665,6 +758,15 @@ class RunningStateTests(unittest.TestCase):
             self.assertFalse(self.app.goal_auto_resume_enabled(task))
             self.assertFalse(self.app.task_retry_allowed(task, 0))
             self.assertEqual(status, self.app.goal_status_for_resume(task))
+
+    def test_manual_message_does_not_change_active_goal_state(self):
+        task = {"goal": "build the activity galaxy", "goal_status": "active", "retry_forever": 0}
+        self.assertEqual("active", self.app.goal_status_for_turn(task, "message"))
+        self.assertEqual("active", self.app.goal_status_for_turn(task, "goal_resume"))
+
+    def test_manual_message_cannot_activate_paused_goal(self):
+        task = {"goal": "build the activity galaxy", "goal_status": "paused", "retry_forever": 1}
+        self.assertEqual("paused", self.app.goal_status_for_turn(task, "message"))
 
     def test_goal_cannot_be_paused_before_auto_resume_is_disabled(self):
         task_id = f"goal-pause-order-{time.time_ns()}"
@@ -678,7 +780,13 @@ class RunningStateTests(unittest.TestCase):
         self.assertEqual(409, raised.exception.status_code)
         self.assertEqual("active", self.app.task_or_404(task_id)["goal_status"])
 
-    def test_enabling_auto_resume_wakes_a_paused_goal(self):
+    def test_goal_pause_control_is_disabled_when_auto_resume_is_enabled(self):
+        source = Path(self.app.__file__).with_name("static").joinpath("conversation.js").read_text(encoding="utf-8")
+        self.assertIn("const goalPauseBlocked = goalActive && Boolean(task.retry_forever);", source)
+        self.assertIn('$("#goal-run-toggle").disabled = !goal || goalPauseBlocked;', source)
+        self.assertIn('uiLabel("goalPauseRetryEnabled")', source)
+
+    def test_enabling_auto_resume_does_not_wake_a_paused_goal(self):
         task_id = f"goal-retry-enable-{time.time_ns()}"
         self.make_task(task_id, "available")
         self.app.db.execute(
@@ -688,13 +796,13 @@ class RunningStateTests(unittest.TestCase):
         with mock.patch.object(self.app, "schedule_task_drain") as schedule:
             result = asyncio.run(self.app.patch_task(task_id, self.app.TaskPatch(retry_forever=True), None))
         self.assertTrue(result["retry_forever"])
-        schedule.assert_called_once_with(task_id)
+        schedule.assert_not_called()
 
     def test_appserver_retry_waits_for_previous_turn_cleanup(self):
         source = Path(self.app.__file__).read_text(encoding="utf-8")
         self.assertIn("async def launch_after_turn_cleanup", source)
-        self.assertIn('asyncio.create_task(launch_after_turn_cleanup(task["id"], "resume"', source)
-        self.assertNotIn('await launch(task["id"], "resume", "", "", set())', source)
+        self.assertIn('asyncio.create_task(launch_after_turn_cleanup(task["id"], "goal-resume"', source)
+        self.assertNotIn('await launch(task["id"], "goal-resume", "", "", set())', source)
 
     def test_stop_clears_unowned_running_state(self):
         task_id = "orphan-thread"
@@ -1032,6 +1140,15 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
         finally:
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
+    def test_auto_resume_reloads_goal_before_starting_turn(self):
+        source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
+        self.assertIn('task = task_or_404(task["id"])\n        async with goal_sync_lock(task["id"]):', source)
+        self.assertIn('async with goal_sync_lock(task["id"]):\n            task = task_or_404(task["id"])\n            goal_revision_at_start', source)
+        self.assertIn('"objective": task["goal"]', source)
+        self.assertIn('"input": appserver_turn_inputs(task, message, include_goal_memory=run_mode == "goal_resume")', source)
+        self.assertIn('await launch(task_id, "goal-resume")', source)
+        self.assertIn('"goal-resume" if goal_auto_resume_enabled(latest)', source)
+
     def test_worker_hides_codex_environment_context_from_user_messages(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
         hidden_context = json.dumps("<environment_context>\n<current_date>2026-08-18</current_date>\n</environment_context>")
@@ -1063,8 +1180,8 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
 
         conversation = (worker.parent / "conversation.js").read_text(encoding="utf-8")
         html = (worker.parent / "index.html").read_text(encoding="utf-8")
-        self.assertIn('/chat-worker.js?v=20260818-full-exploration-graph', conversation)
-        self.assertIn('/conversation.js?v=20260818-running-session-dot', html)
+        self.assertIn('/chat-worker.js?v=20260819-activity-retention', conversation)
+        self.assertIn('/conversation.js?v=20260819-chat-layout-stability', html)
 
     def test_worker_hides_native_media_tags(self):
         script = f"""
@@ -1183,6 +1300,27 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertEqual(1, len(blocks[0]["items"]))
         self.assertEqual("completed", blocks[0]["items"][0]["status"])
         self.assertEqual("done · python3 -m unittest", blocks[0]["items"][0]["text"])
+
+    def test_worker_completion_does_not_erase_started_activity_details(self):
+        worker = Path(__file__).resolve().parents[1] / "static/chat-worker.js"
+        script = f"""
+const fs = require("fs");
+const vm = require("vm");
+const context = {{ self: {{ postMessage() {{}} }} }};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync({json.dumps(str(worker))}, "utf8"), context);
+const blocks = context.buildBlocks([
+  {{ stream: "app-server", payload: {{ type: "commandExecution", item_id: "command-1", command: "python3 -m unittest", tool: "exec_command", arguments: "{{}}", status: "started" }} }},
+  {{ stream: "app-server", payload: {{ type: "commandExecution", item_id: "command-1", status: "completed" }} }}
+], true, {{ activityCommand: "running", activityCommandDone: "done", activityWorking: "working" }});
+process.stdout.write(JSON.stringify(blocks));
+"""
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
+        item = json.loads(result.stdout)[0]["items"][0]
+        self.assertEqual("python3 -m unittest", item["command"])
+        self.assertEqual("exec_command", item["tool"])
+        self.assertEqual("{}", item["arguments"])
+        self.assertEqual("completed", item["status"])
 
     def test_worker_hides_raw_codex_protocol_but_keeps_normalized_command(self):
         worker = Path(__file__).resolve().parents[1] / "static/chat-worker.js"
@@ -1355,6 +1493,8 @@ process.stdout.write(JSON.stringify(posts));
         self.assertNotIn("timeline?limit=500", tree)
         self.assertIn("activity_map_patch", conversation)
         self.assertIn("applyActivityMapSnapshot(activityMap)", conversation)
+        self.assertIn("function explorationLayout(nodes, graphEdges = [])", tree)
+        self.assertIn("exploration-galaxy-lane", tree)
 
     def test_activity_graph_plans_form_semantic_branches(self):
         from codex_partner.activity_graph import project_events
@@ -1389,7 +1529,7 @@ process.stdout.write(JSON.stringify(posts));
         self.assertEqual(2, len(children[second_phase["id"]]))
 
     def test_activity_graph_reconnects_related_topics_instead_of_flattening_time(self):
-        from codex_partner.activity_graph import project_events
+        from codex_partner.activity_graph import project_edges, project_events
 
         def user(event_id, text):
             return {"id": event_id, "ts": event_id, "stream": "native", "payload": {
@@ -1407,6 +1547,57 @@ process.stdout.write(JSON.stringify(posts));
         self.assertEqual(first["id"], pagination["parentId"])
         self.assertEqual(first["id"], musa["parentId"])
         self.assertEqual(pagination["id"], pagination_return["parentId"])
+        edges = project_edges(nodes)
+        relation = next(edge for edge in edges if edge["targetId"] == pagination_return["id"] and edge["kind"] == "related")
+        self.assertEqual(first["id"], relation["sourceId"])
+
+    def test_activity_graph_persists_typed_edges(self):
+        from codex_partner.activity_graph import project_edges, project_events
+
+        task_id = f"activity-edges-{time.time_ns()}"
+        self.make_task(task_id)
+        events = [
+            {"id": "u1", "ts": 1, "stream": "native", "payload": {"type": "userMessage", "text": "帮我实现知识图谱活动地图", "item_id": "u1", "turn_id": "t1"}},
+            {"id": "p1", "ts": 2, "stream": "native", "payload": {"type": "plan", "turn_id": "t1", "plan": [{"step": "实现多关系边", "status": "in_progress"}]}},
+        ]
+        nodes, seen = project_events(events, task_running=True, task_status="running")
+        expected = project_edges(nodes)
+        self.app.activity_graph_store.mark_building(task_id, self.app.now())
+        self.app.activity_graph_store.replace(task_id, nodes, seen, len(events), self.app.now())
+        snapshot = self.app.activity_graph_store.snapshot(task_id)
+        self.assertEqual(expected, snapshot["edges"])
+        self.assertIn("contains", {edge["kind"] for edge in snapshot["edges"]})
+
+    def test_activity_graph_recall_is_hidden_and_query_relevant(self):
+        from codex_partner.activity_graph import recall_context
+
+        snapshot = {"nodes": [
+            {"id": "map", "kind": "decision", "status": "completed", "title": "使用多关系知识图谱", "summary": "地图支持语义边", "score": 9, "files": ["static/exploration-tree.js"]},
+            {"id": "gpu", "kind": "direction", "status": "completed", "title": "分析 MUSA kernel spill", "summary": "检查寄存器", "score": 8},
+        ], "edges": []}
+        context = recall_context("继续实现探索地图关系", snapshot, "构建星系地图")
+        self.assertIn('<memory_context source="codex-partner-activity-graph">', context)
+        self.assertIn("使用多关系知识图谱", context)
+        self.assertNotIn("分析 MUSA kernel spill", context)
+        self.assertEqual("", recall_context("交互修复验证：只回答 OK", snapshot))
+        current_snapshot = {"nodes": snapshot["nodes"] + [
+            {"id": "current", "kind": "steering", "status": "active", "title": "交互修复验证：只回答 OK", "summary": "当前 turn", "score": 10},
+        ], "edges": [{"id": "current-edge", "sourceId": "gpu", "targetId": "current", "kind": "branch", "score": 1}]}
+        self.assertEqual("", recall_context("交互修复验证：只回答 OK", current_snapshot))
+
+        task = {"id": "recall-task", "prompt": "", "context": "", "goal": "构建星系地图", "memory_mode": "enabled"}
+        with mock.patch.object(self.app.activity_graph_store, "snapshot", return_value=snapshot):
+            inputs = self.app.appserver_turn_inputs(task, "继续实现探索地图关系")
+        self.assertIn("继续实现探索地图关系", inputs[0]["text"])
+        self.assertIn("<memory_context", inputs[0]["text"])
+
+        task["goal"] = "分析 MUSA kernel spill"
+        with mock.patch.object(self.app.activity_graph_store, "snapshot", return_value=snapshot):
+            manual_inputs = self.app.appserver_turn_inputs(task, "交互修复验证：只回答 OK")
+            goal_inputs = self.app.appserver_turn_inputs(task, "继续", include_goal_memory=True)
+        self.assertNotIn("<memory_context", manual_inputs[0]["text"])
+        self.assertIn("分析 MUSA kernel spill", goal_inputs[0]["text"])
+        self.assertNotIn("使用多关系知识图谱", goal_inputs[0]["text"])
 
     def test_activity_history_expands_independently_from_message_history(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -1461,7 +1652,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn('data-activity-output-key="${esc(outputKey)}"', conversation)
         self.assertIn("Object.prototype.hasOwnProperty.call(state.activityOutputOpen, outputKey)", conversation)
         self.assertIn("state.activityOutputOpen[output.dataset.activityOutputKey] = output.open", conversation)
-        self.assertIn('/conversation.js?v=20260818-running-session-dot', html)
+        self.assertIn('/conversation.js?v=20260819-chat-layout-stability', html)
 
     def test_message_history_skips_activity_only_pages(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -1517,7 +1708,7 @@ const cursors = [];
         self.assertIn("HistoryPagination.fetchEarlierTimelinePages", conversation)
         self.assertIn("messageTarget: 12, maxPages: 8", conversation)
         self.assertIn('/history-pagination.js?v=20260817-message-history', html)
-        self.assertIn('/conversation.js?v=20260818-running-session-dot', html)
+        self.assertIn('/conversation.js?v=20260819-chat-layout-stability', html)
 
     def test_sent_browser_messages_follow_the_loaded_timeline_boundary(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -1550,7 +1741,7 @@ process.stdout.write(JSON.stringify({{ recent: bodies(recentEvents), older: bodi
         self.assertEqual(["currently running message", "old sent message", "current sent message"], payload["older"])
 
         conversation = (worker.parent / "conversation.js").read_text(encoding="utf-8")
-        self.assertIn('/chat-worker.js?v=20260818-full-exploration-graph', conversation)
+        self.assertIn('/chat-worker.js?v=20260819-activity-retention', conversation)
 
     def test_metrics_user_event_does_not_hide_its_browser_message(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -1986,6 +2177,133 @@ process.stdout.write(JSON.stringify(browserMessages));
         finally:
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
+    def test_goal_edit_remains_committed_when_native_sync_fails(self):
+        task_id = "goal-sync-failure-thread"
+        self.make_task(task_id, "available")
+
+        class FailingClient:
+            async def request(self, method, params):
+                raise RuntimeError("native writer unavailable")
+
+        try:
+            with (
+                mock.patch.object(self.app, "appserver_for_task", new=mock.AsyncMock(return_value=(FailingClient(), None))),
+                mock.patch.object(self.app, "ensure_thread_loaded", new=mock.AsyncMock()),
+            ):
+                result = asyncio.run(self.app.patch_goal(task_id, self.app.GoalPatch(objective="new durable objective"), None))
+            self.assertEqual("new durable objective", result["goal"])
+            self.assertEqual(1, result["goal_revision"])
+            self.assertEqual("paused", result["goal_status"])
+            self.assertIn("local Goal is saved", result["goal_sync_error"])
+            self.assertEqual("new durable objective", self.app.task_or_404(task_id)["goal"])
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_goal_start_activates_latest_revision_and_starts_goal_turn(self):
+        task_id = "atomic-goal-start"
+        self.make_task(task_id, "available")
+        self.app.db.execute("UPDATE tasks SET goal='latest objective',goal_status='paused',goal_revision=4 WHERE id=?", (task_id,))
+        launched = {"id": task_id, "status": "running", "goal": "latest objective", "goal_status": "active", "run_mode": "goal_resume"}
+        try:
+            with (
+                mock.patch.object(self.app, "sync_current_goal", new=mock.AsyncMock(return_value="")) as sync,
+                mock.patch.object(self.app, "launch", new=mock.AsyncMock(return_value=launched)) as launch,
+                mock.patch.object(self.app, "broadcast_task", new=mock.AsyncMock()),
+                mock.patch.object(self.app, "broadcast_overview", new=mock.AsyncMock()),
+            ):
+                result = asyncio.run(self.app.start_goal(task_id, None))
+            self.assertEqual("active", self.app.task_or_404(task_id)["goal_status"])
+            self.assertEqual(5, self.app.task_or_404(task_id)["goal_revision"])
+            self.assertEqual("latest objective", sync.await_args.args[0]["goal"])
+            launch.assert_awaited_once_with(task_id, "goal-resume")
+            self.assertEqual("goal_resume", result["run_mode"])
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_goal_start_does_not_adopt_a_stale_external_turn(self):
+        task_id = f"stale-external-goal-{time.time_ns()}"
+        self.make_task(task_id, "stopped")
+        self.app.db.execute("UPDATE tasks SET goal='latest objective',goal_status='paused' WHERE id=?", (task_id,))
+        self.app.register_external_turn(task_id, {
+            "thread_id": task_id,
+            "turn_id": "dead-turn",
+            "started_at": self.app.now(),
+            "session_id": f"external:{task_id}:dead-turn",
+            "path": "/tmp/codex-partner-missing-rollout.jsonl",
+        })
+        launched = {"id": task_id, "status": "running", "goal_status": "active", "run_mode": "goal_resume"}
+        try:
+            with (
+                mock.patch.object(self.app, "sync_current_goal", new=mock.AsyncMock(return_value="")),
+                mock.patch.object(self.app, "launch", new=mock.AsyncMock(return_value=launched)) as launch,
+                mock.patch.object(self.app, "broadcast_task", new=mock.AsyncMock()),
+                mock.patch.object(self.app, "broadcast_overview", new=mock.AsyncMock()),
+            ):
+                result = asyncio.run(self.app.start_goal(task_id, None))
+            launch.assert_awaited_once_with(task_id, "goal-resume")
+            self.assertNotIn(task_id, self.app.external_turns)
+            self.assertEqual("goal_resume", result["run_mode"])
+        finally:
+            self.app.clear_external_turns(task_id)
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_goal_start_adopts_a_launch_race_and_keeps_goal_resume_pending(self):
+        task_id = f"goal-start-race-{time.time_ns()}"
+        self.make_task(task_id, "stopped")
+        self.app.db.execute("UPDATE tasks SET goal='latest objective',goal_status='paused' WHERE id=?", (task_id,))
+        try:
+            with (
+                mock.patch.object(self.app, "sync_current_goal", new=mock.AsyncMock(return_value="")),
+                mock.patch.object(self.app, "refresh_live_external_turn", new=mock.AsyncMock(return_value=False)),
+                mock.patch.object(self.app, "launch", new=mock.AsyncMock(side_effect=self.app.HTTPException(409, "Task is already running"))),
+                mock.patch.object(self.app, "broadcast_task", new=mock.AsyncMock()),
+                mock.patch.object(self.app, "broadcast_overview", new=mock.AsyncMock()),
+            ):
+                result = asyncio.run(self.app.start_goal(task_id, None))
+            self.assertEqual("active", result["goal_status"])
+            self.assertEqual("goal_resume", result["run_mode"])
+            self.assertEqual("", result["last_error"])
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_manual_turn_completion_honors_goal_start_takeover(self):
+        source = Path(self.app.__file__).read_text(encoding="utf-8")
+        self.assertIn('and goal_task.get("run_mode") == "goal_resume"', source)
+        self.assertIn('launch_after_turn_cleanup(task["id"], "goal-resume"', source)
+
+    def test_goal_pause_pauses_goal_and_stops_conversation(self):
+        task_id = "atomic-goal-pause"
+        self.make_task(task_id, "running")
+        self.app.db.execute("UPDATE tasks SET goal='ship it',goal_status='active',retry_forever=1,goal_revision=2 WHERE id=?", (task_id,))
+        try:
+            with (
+                mock.patch.object(self.app, "sync_current_goal", new=mock.AsyncMock(return_value="")),
+                mock.patch.object(self.app, "stop_task_run", new=mock.AsyncMock(side_effect=lambda _id, pause_goal=False: self.app.task_or_404(_id))) as stop,
+                mock.patch.object(self.app, "broadcast_task", new=mock.AsyncMock()),
+                mock.patch.object(self.app, "broadcast_overview", new=mock.AsyncMock()),
+            ):
+                result = asyncio.run(self.app.pause_goal(task_id, None))
+            self.assertEqual("paused", result["goal_status"])
+            self.assertFalse(result["retry_forever"])
+            stop.assert_awaited_once_with(task_id, pause_goal=False)
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_conversation_stop_pauses_goal_even_when_turn_is_already_stopped(self):
+        task_id = "conversation-stop-pauses-goal"
+        self.make_task(task_id, "available")
+        self.app.db.execute("UPDATE tasks SET goal='ship it',goal_status='active',retry_forever=1 WHERE id=?", (task_id,))
+        try:
+            with (
+                mock.patch.object(self.app, "broadcast_task", new=mock.AsyncMock()),
+                mock.patch.object(self.app, "broadcast_overview", new=mock.AsyncMock()),
+            ):
+                result = asyncio.run(self.app.stop_task_run(task_id))
+            self.assertEqual("paused", result["goal_status"])
+            self.assertFalse(result["retry_forever"])
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
     def test_health_counts_terminal_owned_task(self):
         task_id = "health-terminal-thread"
         self.make_task(task_id, "running")
@@ -2293,7 +2611,7 @@ process.stdout.write(JSON.stringify(browserMessages));
 
         class FakeClient:
             async def request(self, method, _params):
-                if method == "thread/read":
+                if method == "thread/resume":
                     return {"thread": {"id": "remote-thread"}}
                 if method == "thread/fork":
                     return {"thread": {"id": "remote-forked-thread"}}
@@ -2312,6 +2630,52 @@ process.stdout.write(JSON.stringify(browserMessages));
             self.app.db.execute("DELETE FROM tasks WHERE id IN (?,?)", (task_id, forked["id"]))
 
         asyncio.run(exercise())
+
+    def test_thread_operation_resumes_rollout_before_compacting(self):
+        task_id = "compact-unloaded-thread"
+        self.make_task(task_id, "available")
+        self.app.db.execute(
+            "UPDATE tasks SET codex_session_id=? WHERE id=?",
+            (task_id, task_id),
+        )
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+                self.closed = False
+
+            async def request(self, method, params):
+                self.calls.append((method, params))
+                if method == "thread/resume":
+                    return {"thread": {"id": task_id}}
+                if method == "thread/compact/start":
+                    return {"ok": True}
+                if method == "thread/unsubscribe":
+                    return {"status": "unsubscribed"}
+                raise AssertionError(method)
+
+            async def close(self):
+                self.closed = True
+
+        async def exercise():
+            client = FakeClient()
+            task = self.app.task_or_404(task_id)
+            key = self.app.appserver_key(None, task)
+            self.app.app_servers[key] = client
+            with mock.patch.object(self.app, "appserver_for", new=mock.AsyncMock(return_value=client)):
+                result = await self.app.run_thread_operation(task, self.app.OperationIn(operation="compact"))
+            self.assertTrue(result["ok"])
+            self.assertEqual(
+                ["thread/resume", "thread/compact/start", "thread/unsubscribe"],
+                [method for method, _params in client.calls],
+            )
+            self.assertTrue(client.closed)
+            self.assertNotIn(key, self.app.app_servers)
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
     def test_running_thread_allows_rename_and_fork_metadata_operations(self):
         task_id = "running-thread-metadata-operations"
@@ -2337,7 +2701,7 @@ process.stdout.write(JSON.stringify(browserMessages));
 
         class FakeClient:
             async def request(self, method, params):
-                if method == "thread/read":
+                if method == "thread/resume":
                     return {"thread": {"id": task_id}}
                 if method == "thread/name/set":
                     self.name = params["name"]
@@ -2425,7 +2789,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('disabled title="${esc(uiLabel("protectedSkillDelete"))}"', settings)
         self.assertIn(".panel-item button.danger-text:not(:disabled)", styles)
         self.assertNotIn(".panel-item button:last-child", styles)
-        self.assertIn('/styles.css?v=20260818-running-session-dot', html)
+        self.assertIn('/styles.css?v=20260819-chat-layout-stability', html)
         self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
         self.assertIn('/settings.js?v=20260817-skill-actions', html)
 
@@ -2991,8 +3355,8 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260818-running-session-dot', html)
-        self.assertIn("/timeline?limit=160", conversation_js)
+        self.assertIn('/conversation.js?v=20260819-chat-layout-stability', html)
+        self.assertIn("/timeline?limit=120", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
         self.assertIn("appendStreamingDelta", conversation_js)
@@ -3011,7 +3375,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn(".queued-messages[hidden] { display: block !important", (static / "styles.css").read_text(encoding="utf-8"))
         self.assertIn("min-height: 37px", (static / "styles.css").read_text(encoding="utf-8"))
         self.assertNotIn("未设置 Goal，点击修改后让 Codex 持续追踪目标", conversation_js)
-        self.assertIn('launch_after_turn_cleanup(task["id"], "resume", "", "", set())', (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8"))
+        self.assertIn('launch_after_turn_cleanup(task["id"], "goal-resume", "", "", set())', (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8"))
         self.assertIn("flex-wrap: nowrap", (static / "styles.css").read_text(encoding="utf-8"))
 
     def test_composer_model_picker_survives_realtime_status_renders(self):
@@ -3045,15 +3409,15 @@ process.stdout.write(JSON.stringify(browserMessages));
         app_js = (root / "static" / "app.js").read_text(encoding="utf-8")
         database_py = (root / "codex_partner" / "database.py").read_text(encoding="utf-8")
         self.assertIn("function goalIsActive", conversation_js)
-        self.assertIn('goalCanAutoResume(task.goal_status || "active", Boolean(task.retry_forever))', conversation_js)
+        self.assertIn('(task.goal_status || "none") === "active"', conversation_js)
         self.assertIn("goalIsActive(task)", app_js)
-        self.assertIn('const turnActive = ["running", "retrying", "queued"].includes(task.status)', app_js)
+        self.assertIn('/goal/${goalActive ? "pause" : "start"}', app_js)
         self.assertIn('active: "enabled"', conversation_js)
         self.assertIn('goalProgress.textContent = goalStatusLabel', conversation_js)
         self.assertIn('function goalStatusSummary', conversation_js)
         self.assertIn('function goalCanAutoResume', conversation_js)
         self.assertIn('return retryForever || !["paused", "blocked"].includes(value)', conversation_js)
-        self.assertIn('请先关闭 Goal 自动续跑，再暂停 Goal', app_js)
+        self.assertIn('Goal 和会话已暂停', app_js)
         self.assertIn('${uiLabel("goalStatusPrefix")}：${goalStatusLabel', conversation_js)
         self.assertNotIn('statusLabel(task.status)}', conversation_js)
         self.assertNotIn('sessionStatusPrefix', conversation_js)
@@ -3061,8 +3425,17 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("authoritative.run_mode !== state.selectedTask.run_mode", (root / "static" / "core.js").read_text(encoding="utf-8"))
         self.assertIn("run_mode TEXT DEFAULT ''", database_py)
         self.assertEqual("message", self.app.requested_run_mode({"goal": "ship it"}, "message", "message-1"))
-        self.assertEqual("goal_resume", self.app.requested_run_mode({"goal": "ship it"}, "resume"))
+        self.assertEqual("operation", self.app.requested_run_mode({"goal": "ship it"}, "resume"))
+        self.assertEqual("goal_resume", self.app.requested_run_mode({"goal": "ship it"}, "goal-resume"))
         self.assertEqual("operation", self.app.requested_run_mode({"goal": ""}, "resume"))
+
+    def test_appserver_supervisor_receives_explicit_run_mode(self):
+        import inspect
+
+        signature = inspect.signature(self.app.supervise_appserver_turn)
+        self.assertIn("run_mode", signature.parameters)
+        source = inspect.getsource(self.app.launch_appserver)
+        self.assertIn("supervise_appserver_turn(task, provider, mode, run_mode, message", source)
 
     def test_browser_auth_uses_ssh_cookie_instead_of_access_tokens(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -3227,19 +3600,24 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260818-running-session-dot', html)
+        self.assertIn('/conversation.js?v=20260819-chat-layout-stability', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260818-fork-feedback', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
-        self.assertIn('/styles.css?v=20260818-running-session-dot', html)
+        self.assertIn('/styles.css?v=20260819-chat-layout-stability', html)
         self.assertIn('/vendor/katex/katex.min.css', html)
         self.assertIn('<span id="goal-run-label">暂停</span>', html)
         self.assertNotIn('id="goal-run-label" class="sr-only"', html)
         self.assertIn(".session-card.selected::before", styles)
+        self.assertIn(".exploration-node.dimmed { opacity: 1; filter: saturate(1.12) brightness(1.08)", styles)
+        self.assertIn(".exploration-node.dimmed:hover { opacity: 1", styles)
+        self.assertIn(".exploration-edge.muted { opacity: .72", styles)
+        self.assertNotIn(".exploration-node.planned { opacity:", styles)
+        self.assertIn(".exploration-node.selected .exploration-node-copy", styles)
         self.assertNotIn("renderSessionList(); renderConversation(); await loadWorkspace(\"\")", conversation_js)
         self.assertIn(".queued-messages { width: auto; height: auto; min-height: 0; max-height: none; align-self: stretch;", styles)
-        self.assertIn('/chat-worker.js?v=20260818-full-exploration-graph', conversation_js)
+        self.assertIn('/chat-worker.js?v=20260819-activity-retention', conversation_js)
         self.assertIn('data-live="true" open', conversation_js)
         self.assertIn("activity-event.current::after", styles)
         self.assertIn("function renderActivityEvent", conversation_js)
@@ -3292,7 +3670,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('const sessionList = $("#task-list")', conversation)
         self.assertIn("void selectSession(pointerSelectedSessionId)", conversation)
         self.assertIn('aria-current="${selected ? "true" : "false"}"', conversation)
-        self.assertIn('/conversation.js?v=20260818-running-session-dot', html)
+        self.assertIn('/conversation.js?v=20260819-chat-layout-stability', html)
 
     def test_live_chat_rendering_coalesces_expensive_work(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -3310,20 +3688,31 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("state.explorationNeedsSync && (state.explorationOpen || !state.explorationNodes.length)", conversation)
         self.assertIn("if (current !== previous) scheduleRenderChat()", conversation)
         self.assertIn("renderConversation(false)", conversation)
+        self.assertIn("const conversationSnapshots = new Map()", conversation)
+        self.assertIn("conversationSnapshots.set(previousId", conversation)
+        self.assertIn("const cached = conversationSnapshots.get(id)", conversation)
+        self.assertIn("timeline = await timelinePromise", conversation)
+        self.assertIn("const activityMapUpdate = activityMapPromise.then", conversation)
+        select_start = conversation.index("async function selectSession")
+        socket_start = conversation.index("if (openSocket) connectSocket(id)", select_start)
+        timeline_wait = conversation.index("timeline = await timelinePromise", select_start)
+        self.assertLess(socket_start, timeline_wait)
         self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
-        self.assertIn('/conversation.js?v=20260818-running-session-dot', html)
+        self.assertIn('/conversation.js?v=20260819-chat-layout-stability', html)
         styles = (static / "styles.css").read_text(encoding="utf-8")
         app_js = (static / "app.js").read_text(encoding="utf-8")
         self.assertNotIn("content-visibility: auto", styles)
         self.assertIn("transform: translateX(470%)", styles)
         self.assertIn("min-width: min(180px, calc(100% - 49px))", styles)
         self.assertIn(".message.user .message-content { display: block; box-sizing: border-box; width: 100%", styles)
-        self.assertIn(".message.assistant .message-body { flex: 1 1 0; width: auto; }", styles)
+        self.assertIn(".message.assistant .message-body { flex: 1 1 auto; width: min(780px, calc(100% - 49px));", styles)
+        self.assertIn("streamWidth > 0 && streamWidth < 240 && chatLayoutRetryCount < 5", conversation)
+        self.assertIn("}, 40);", conversation)
         self.assertIn(".message.assistant .message-content, .message.assistant .message-content > p", styles)
         self.assertIn("if (chatIsNearBottom(stream))", conversation)
         self.assertNotIn("stream.scrollTop = target * state.chatAverageHeight", conversation)
         self.assertIn("function syncPageVisibility", app_js)
-        self.assertIn('/styles.css?v=20260818-running-session-dot', html)
+        self.assertIn('/styles.css?v=20260819-chat-layout-stability', html)
         self.assertIn('/app.js?v=20260818-fork-feedback', html)
 
     def test_optimistic_queue_messages_survive_authoritative_refresh(self):
@@ -3507,6 +3896,14 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertTrue(result["already_installed"])
         create.assert_not_awaited()
 
+
+    def test_legacy_manual_message_does_not_append_persistent_goal(self):
+        task = {"goal": "old exploration objective", "prompt": "", "context": "", "workspace": "/tmp", "yolo": False, "model": "", "reasoning_effort": ""}
+        with_goal = self.app.command_for(task, None, prompt_override="git clone the repository")
+        without_goal = self.app.command_for(task, None, prompt_override="git clone the repository", include_goal=False)
+        self.assertIn("old exploration objective", with_goal[-1])
+        self.assertNotIn("old exploration objective", without_goal[-1])
+        self.assertIn("git clone the repository", without_goal[-1])
 
 if __name__ == "__main__":
     unittest.main()

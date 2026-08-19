@@ -2,10 +2,13 @@
 const chatFileObjectUrls = new Map();
 const chatThumbnailObjectUrls = new Map();
 const chatThumbnailLoads = new Map();
-const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260818-full-exploration-graph") : null;
+const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260819-activity-retention") : null;
+const conversationSnapshots = new Map();
 let chatBuildRequestId = 0;
 let chatBuildInFlight = false;
 let chatBuildQueued = false;
+let chatLayoutRetryTimer = 0;
+let chatLayoutRetryCount = 0;
 let chatHistoryLoadPromise = null;
 let mediaViewerMarkdown = null;
 function renderSidebarStats() {
@@ -72,7 +75,7 @@ async function syncQueuedMessages() {
     queueSyncInFlight = false;
   }
 }
-function showEmptyConversation() { if (terminalTaskId) destroyTerminal(); stopQueueSync(); state.sessionAbortController?.abort(); state.sessionAbortController = null; state.editingQueuedId = null; state.pendingApprovals = []; state.inspectorClosed = true; state.explorationNodes = []; state.explorationEvents = []; state.explorationPrecomputed = false; state.explorationRequestId += 1; if (typeof closeExplorationMap === "function") closeExplorationMap(); $("#empty-conversation").hidden = false; $("#conversation-view").hidden = true; $("#goal-bar").hidden = true; $("#queued-messages").hidden = true; $("#approval-center").hidden = true; setInspectorOpen(false); }
+function showEmptyConversation() { if (terminalTaskId) destroyTerminal(); stopQueueSync(); state.sessionAbortController?.abort(); state.sessionAbortController = null; state.editingQueuedId = null; state.pendingApprovals = []; state.inspectorClosed = true; state.explorationNodes = []; state.explorationEdges = []; state.explorationEvents = []; state.explorationPrecomputed = false; state.explorationRequestId += 1; if (typeof closeExplorationMap === "function") closeExplorationMap(); $("#empty-conversation").hidden = false; $("#conversation-view").hidden = true; $("#goal-bar").hidden = true; $("#queued-messages").hidden = true; $("#approval-center").hidden = true; setInspectorOpen(false); }
 function resetWorkspaceBrowser() {
   state.workspacePath = "";
   state.workspaceFile = null;
@@ -91,6 +94,15 @@ function clearChatSelectionForSessionSwitch() {
 }
 async function selectSession(id, openSocket = true) {
   if (state.selectedId !== id) clearChatSelectionForSessionSwitch();
+  const previousId = state.selectedId;
+  if (previousId && previousId !== id && state.selectedTask) {
+    conversationSnapshots.set(previousId, {
+      task: state.selectedTask, events: state.selectedEvents, messages: state.selectedMessages,
+      historyCursor: state.historyCursor, historyHasMore: state.historyHasMore,
+      nodes: state.explorationNodes, edges: state.explorationEdges,
+      explorationPrecomputed: state.explorationPrecomputed,
+    });
+  }
   const requestId = ++state.sessionRequestId;
   state.sessionAbortController?.abort();
   const controller = new AbortController();
@@ -100,7 +112,7 @@ async function selectSession(id, openSocket = true) {
   const wasEmpty = $("#conversation-view").hidden;
   if (state.selectedId !== id) {
     resetWorkspaceBrowser(); state.titleExpanded = false; state.historyCursor = ""; state.historyHasMore = false;
-    state.historyLoading = false; state.chatBlocks = []; state.chatVirtualStart = null; state.activityVisibleCounts = {}; state.activityOutputOpen = {}; state.explorationNodes = []; state.explorationEvents = []; state.explorationSelectedNodeId = ""; state.explorationLoading = false; state.explorationHistoryComplete = false; state.explorationLoadedEventCount = 0; state.explorationLoadError = ""; state.explorationRequestId += 1; state.explorationRevision = 0; state.explorationNeedsSync = false; state.explorationPrecomputed = false; state.explorationMapStatus = "pending"; state.explorationProcessedEvents = 0; state.pendingApprovals = [];
+    state.historyLoading = false; state.chatBlocks = []; state.chatVirtualStart = null; state.activityVisibleCounts = {}; state.activityOutputOpen = {}; state.explorationNodes = []; state.explorationEdges = []; state.explorationEvents = []; state.explorationSelectedNodeId = ""; state.explorationLoading = false; state.explorationHistoryComplete = false; state.explorationLoadedEventCount = 0; state.explorationLoadError = ""; state.explorationRequestId += 1; state.explorationRevision = 0; state.explorationNeedsSync = false; state.explorationPrecomputed = false; state.explorationMapStatus = "pending"; state.explorationProcessedEvents = 0; state.pendingApprovals = [];
     state.selectedEvents = []; state.selectedMessages = []; state.composerHistory = []; state.historyIndex = -1;
     if (typeof renderExplorationMap === "function") renderExplorationMap();
     state.runtimeMetrics = { taskId: "", ttftMs: null, tpotMs: null, estimated: true, outputTokens: 0 };
@@ -108,6 +120,17 @@ async function selectSession(id, openSocket = true) {
   state.selectedId = id; localStorage.setItem("codex-dashboard-session", id);
   const task = state.tasks.find(item => item.id === id);
   if (task) state.selectedTask = task;
+  const cached = conversationSnapshots.get(id);
+  if (cached) {
+    state.selectedTask = cached.task || task;
+    state.selectedEvents = cached.events || [];
+    state.selectedMessages = cached.messages || [];
+    state.historyCursor = cached.historyCursor || "";
+    state.historyHasMore = Boolean(cached.historyHasMore);
+    state.explorationNodes = cached.nodes || [];
+    state.explorationEdges = cached.edges || [];
+    state.explorationPrecomputed = Boolean(cached.explorationPrecomputed);
+  }
   // Reflect keyboard navigation immediately, then replace the row with the full task after loading.
   renderSessionList();
   scrollSessionIntoView(id);
@@ -117,37 +140,48 @@ async function selectSession(id, openSocket = true) {
     setInspectorOpen(window.innerWidth >= 861 && !state.inspectorClosed);
     renderConversation();
   }
-  let fullTask, timeline, messages, activityMap;
+  if (openSocket) connectSocket(id);
+  const fullTaskPromise = api(`/tasks/${encodeURIComponent(id)}`, { signal: controller.signal });
+  const timelinePromise = api(`/tasks/${encodeURIComponent(id)}/timeline?limit=120&fast=1`, { signal: controller.signal });
+  const messagesPromise = api(`/tasks/${encodeURIComponent(id)}/messages`, { signal: controller.signal });
+  const activityMapPromise = api(`/tasks/${encodeURIComponent(id)}/activity-map`, { signal: controller.signal });
+  const detailsUpdate = Promise.all([fullTaskPromise, messagesPromise]).then(([fullTask, messages]) => {
+    if (requestId !== state.sessionRequestId || state.selectedId !== id) return;
+    state.selectedTask = fullTask; replaceTaskMessages(messages); renderSessionList(); renderConversation();
+  }).catch(error => { if (error.name !== "AbortError") toast(error.message); });
+  const activityMapUpdate = activityMapPromise.then(activityMap => {
+    if (requestId !== state.sessionRequestId || state.selectedId !== id) return;
+    state.explorationPrecomputed = true;
+    if (typeof applyActivityMapSnapshot === "function") applyActivityMapSnapshot(activityMap);
+  }).catch(error => { if (error.name !== "AbortError") state.explorationLoadError = error.message; });
+  Promise.allSettled([timelinePromise, detailsUpdate, activityMapUpdate]).then(() => {
+    if (state.sessionAbortController === controller) state.sessionAbortController = null;
+  });
+  let timeline;
   try {
-    [fullTask, timeline, messages, activityMap] = await Promise.all([
-      api(`/tasks/${encodeURIComponent(id)}`, { signal: controller.signal }),
-      api(`/tasks/${encodeURIComponent(id)}/timeline?limit=160`, { signal: controller.signal }),
-      api(`/tasks/${encodeURIComponent(id)}/messages`, { signal: controller.signal }),
-      api(`/tasks/${encodeURIComponent(id)}/activity-map`, { signal: controller.signal }),
-    ]);
+    timeline = await timelinePromise;
   } catch (error) {
     if (error.name === "AbortError") return;
     throw error;
   }
   if (requestId !== state.sessionRequestId || state.selectedId !== id) return;
-  if (state.sessionAbortController === controller) state.sessionAbortController = null;
-  state.selectedTask = fullTask;
-  state.explorationPrecomputed = true;
-  if (typeof applyActivityMapSnapshot === "function") applyActivityMapSnapshot(activityMap);
   state.selectedEvents = [...(timeline.items || []), ...(timeline.metrics || [])];
-  state.explorationEvents = [];
-  state.explorationNeedsSync = false;
   state.historyCursor = timeline.next_cursor || ""; state.historyHasMore = Boolean(timeline.has_more);
-  replaceTaskMessages(messages);
-  // A newly selected thread should open at its latest message. Consume this
-  // once in renderChat instead of smooth-scrolling on every intermediate
-  // update while the history/socket is loading.
-  state.chatSnapToBottom = true;
+  state.chatSnapToBottom = !cached;
+  renderConversation();
+  const refreshFullTimeline = () => api(`/tasks/${encodeURIComponent(id)}/timeline?limit=120`, { signal: controller.signal }).then(full => {
+    if (requestId !== state.sessionRequestId || state.selectedId !== id) return;
+    state.selectedEvents = [...(full.items || []), ...(full.metrics || [])];
+    state.historyCursor = full.next_cursor || ""; state.historyHasMore = Boolean(full.has_more);
+    renderChat();
+  }).catch(error => { if (error.name !== "AbortError") console.warn("timeline refresh failed", error); });
+  if (typeof requestIdleCallback === "function") requestIdleCallback(refreshFullTimeline, { timeout: 2500 });
+  else setTimeout(refreshFullTimeline, 250);
   $("#empty-conversation").hidden = true; $("#conversation-view").hidden = false;
   if (wasEmpty && window.innerWidth >= 861) state.inspectorClosed = false;
   setInspectorOpen(window.innerWidth >= 861 && !state.inspectorClosed);
-  renderSessionList(); renderConversation();
-  if (openSocket) connectSocket(id); if (window.innerWidth <= 860) setSessionSidebarOpen(false);
+  renderSessionList();
+  if (window.innerWidth <= 860) setSessionSidebarOpen(false);
   loadWorkspace("").catch(() => {});
 }
 function renderConversation(renderMessages = true) {
@@ -337,7 +371,7 @@ function goalCanAutoResume(status, retryForever = false) {
   return retryForever || !["paused", "blocked"].includes(value);
 }
 function goalIsActive(task) {
-  return Boolean(String(task?.goal || "").trim()) && goalCanAutoResume(task.goal_status || "active", Boolean(task.retry_forever));
+  return Boolean(String(task?.goal || "").trim()) && (task.goal_status || "none") === "active";
 }
 function renderGoalBar() {
   const task = state.selectedTask;
@@ -352,8 +386,13 @@ function renderGoalBar() {
   $("#goal-text").classList.toggle("empty", !goal);
   $("#goal-task-status").textContent = goalStatusSummary(task, goal);
   $("#goal-run-toggle").classList.toggle("active", goalActive);
-  $("#goal-run-toggle").disabled = !goal;
-  $("#goal-run-toggle").title = !goal ? uiLabel("setGoal") : (goalActive ? uiLabel("goalPause") : uiLabel("goalStart"));
+  const goalPauseBlocked = goalActive && Boolean(task.retry_forever);
+  $("#goal-run-toggle").disabled = !goal || goalPauseBlocked;
+  $("#goal-run-toggle").title = !goal
+    ? uiLabel("setGoal")
+    : goalPauseBlocked
+      ? uiLabel("goalPauseRetryEnabled")
+      : (goalActive ? uiLabel("goalPause") : uiLabel("goalStart"));
   $("#goal-run-toggle").setAttribute("aria-label", $("#goal-run-toggle").title);
   $("#goal-run-icon").textContent = goalActive ? "Ⅱ" : "▶";
   $("#goal-run-label").textContent = goalActive ? uiLabel("pause") : uiLabel("start");
@@ -645,6 +684,17 @@ function loadEarlierActivity(activityKey) {
 function paintVirtualChat(stickToBottom = false) {
   if (state.chatSelectionActive) { state.chatRenderDeferred = true; state.chatDeferredStickToBottom ||= stickToBottom; return; }
   const stream = $("#chat-log"); const blocks = state.chatBlocks || []; const windowSize = 90;
+  const streamWidth = stream.getBoundingClientRect().width;
+  if (streamWidth > 0 && streamWidth < 240 && chatLayoutRetryCount < 5) {
+    chatLayoutRetryCount += 1;
+    if (!chatLayoutRetryTimer) chatLayoutRetryTimer = setTimeout(() => {
+      chatLayoutRetryTimer = 0;
+      paintVirtualChat(stickToBottom);
+    }, 40);
+    return;
+  }
+  if (chatLayoutRetryTimer) { clearTimeout(chatLayoutRetryTimer); chatLayoutRetryTimer = 0; }
+  chatLayoutRetryCount = 0;
   const viewport = captureChatViewport(stream);
   if (!blocks.length) { stream.innerHTML = `<div class="chat-empty">${mascotMarkup("mascot-chat")}<p>${uiLabel("firstMessage")}</p></div>`; return; }
   if (state.chatVirtualStart === null || stickToBottom) state.chatVirtualStart = Math.max(0, blocks.length - windowSize);
@@ -1372,6 +1422,7 @@ function connectSocket(id, reconnect = false) {
       for (const node of data.upsert_nodes || []) nodes.set(node.id, node);
       for (const nodeId of data.remove_node_ids || []) nodes.delete(nodeId);
       state.explorationNodes = [...nodes.values()].sort((left, right) => Number(left.sequence || 0) - Number(right.sequence || 0));
+      if (Array.isArray(data.edges)) state.explorationEdges = data.edges;
       state.explorationRevision = Number(data.revision || state.explorationRevision);
       state.explorationMapStatus = "ready";
       renderExplorationMap({ liveUpdate: true });

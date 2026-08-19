@@ -57,7 +57,7 @@ except ImportError:  # Installed through the Windows-only pywinpty dependency.
 from PIL import Image, ImageOps, ImageSequence, UnidentifiedImageError
 
 from codex_partner import APP_NAME, APP_VERSION
-from codex_partner.activity_graph import ActivityGraphStore, PROJECTION_VERSION, project_events, semantic_event
+from codex_partner.activity_graph import ActivityGraphStore, PROJECTION_VERSION, project_events, recall_context, semantic_event
 from codex_partner.commands import SLASH_ALIASES, SLASH_COMMAND_BY_NAME, SLASH_COMMANDS, parse_slash_command
 from codex_partner.database import Database
 from codex_partner.app_server import AppServerClient
@@ -570,7 +570,7 @@ async def lifespan(_: FastAPI):
                 continue
             try:
                 task = task_or_404(row["id"])
-                await launch(row["id"], "resume" if latest_codex_session(task) else "start")
+                await launch(row["id"], "goal-resume" if goal_auto_resume_enabled(task) else ("resume" if latest_codex_session(task) else "start"))
             except Exception:
                 continue
     drain_task_ids = {
@@ -630,6 +630,15 @@ activity_graph_backlog: dict[str, list[dict[str, Any]]] = {}
 app_servers: dict[str, "AppServerClient"] = {}
 app_thread_bindings: dict[str, tuple[str, str, str]] = {}
 turn_waiters: dict[str, asyncio.Future] = {}
+goal_sync_locks: dict[str, asyncio.Lock] = {}
+
+
+def goal_sync_lock(task_id: str) -> asyncio.Lock:
+    lock = goal_sync_locks.get(task_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        goal_sync_locks[task_id] = lock
+    return lock
 appserver_turn_tasks: dict[str, asyncio.Task] = {}
 appserver_turn_ids: dict[str, str] = {}
 pending_appserver_requests: dict[str, dict[str, Any]] = {}
@@ -1051,6 +1060,8 @@ def rollout_browser_payload(record: dict) -> Optional[dict]:
             }
         if lowered == "reasoning":
             text = structured_text(payload.get("summary") or payload.get("content") or payload.get("text"))
+            if not text.strip():
+                return None
             return {"type": "reasoning", "text": compact_activity_detail(text, 1200), "item_id": payload.get("id", ""), "turn_id": turn_id}
         if lowered in {"custom_tool_call", "function_call"}:
             event_type, detail = rollout_tool_activity(payload)
@@ -1701,8 +1712,17 @@ async def refresh_native_rollouts() -> None:
 
 async def refresh_live_external_turn(task_id: str) -> bool:
     """Synchronously close the rollout-observer gap before starting a web turn."""
-    if external_turns.get(task_id):
-        return True
+    current = external_turns.get(task_id)
+    if current:
+        tracked = list((external_turn_sets.get(task_id) or {}).values())
+        paths = {str(turn.get("path") or "") for turn in tracked} - {""}
+        for path in paths:
+            if await asyncio.to_thread(native_rollout_writer_pids, path, True):
+                return True
+        if dashboard_owns_task(task_id):
+            clear_external_turns(task_id)
+        else:
+            await settle_inactive_external_turn(task_id, "Codex process ended without a completion event", current)
     task = task_or_404(task_id)
     if task.get("ssh_host"):
         return False
@@ -2545,6 +2565,8 @@ async def native_history_events(task: dict) -> list[dict]:
                     )
                 if not text and item_type in {"reasoning", "plan"}:
                     text = structured_text(item.get("summary") or item.get("content"))
+                    if not text.strip():
+                        continue
                 if not text:
                     if item_type == "fileChange":
                         changes = item.get("changes") or []
@@ -2702,7 +2724,6 @@ async def handle_appserver_notification(server_key: str, message: dict) -> None:
         turn = params.get("turn") or {}
         turn_status = turn.get("status") or "completed"
         payload = {"type": "turn_completed", "status": turn_status, "thread_id": thread_id}
-        native_history_cache.pop(task_id, None)
         waiter = turn_waiters.pop(thread_id, None)
         if waiter and not waiter.done():
             if turn_status in {"failed", "interrupted"}:
@@ -2831,7 +2852,7 @@ async def launch_appserver(
         (attempt, session_id, run_mode, stamp, task["id"]),
     )
     turn_task = asyncio.create_task(
-        supervise_appserver_turn(task, provider, mode, message, message_id, session_id, attempted_provider_ids or set())
+        supervise_appserver_turn(task, provider, mode, run_mode, message, message_id, session_id, attempted_provider_ids or set())
     )
     appserver_turn_tasks[task["id"]] = turn_task
     return task_or_404(task["id"]) | {"session_id": session_id, "mode": mode, "message_id": message_id, "thread_id": resume_id, "shared_owner": True}
@@ -2841,6 +2862,7 @@ async def supervise_appserver_turn(
     task: dict,
     provider: Optional[dict],
     mode: str,
+    run_mode: str,
     message: str,
     message_id: str,
     session_id: str,
@@ -2850,6 +2872,8 @@ async def supervise_appserver_turn(
     thread_id = ""
     turn_id = ""
     waiter: Optional[asyncio.Future] = None
+    goal_revision_at_start: Optional[int] = None
+    resume_goal_after_cleanup = False
     try:
         client = await appserver_for(provider, task)
         key = client.key
@@ -2901,15 +2925,16 @@ async def supervise_appserver_turn(
         # Bind the persisted session before goal/turn notifications can arrive.
         app_thread_bindings[task["id"]] = (key, thread_id, session_id)
         db.execute("UPDATE tasks SET codex_session_id=?,updated_at=? WHERE id=?", (thread_id, now(), task["id"]))
-        native_history_cache.pop(task["id"], None)
-        goal_task = task_or_404(task["id"])
-        if goal_task.get("goal"):
-            goal_result = await client.request(
-                "thread/goal/set",
-                {"threadId": thread_id, "objective": goal_task["goal"], "status": goal_status_for_resume(goal_task)},
-            )
-            goal = goal_result.get("goal") or {}
-            db.execute("UPDATE tasks SET goal_status=?, goal_tokens_used=?, updated_at=? WHERE id=?", (goal.get("status", "active"), goal.get("tokensUsed", 0), now(), task["id"]))
+        cached_history = native_history_cache.get(task["id"])
+        if mode == "start" or (cached_history and cached_history.get("thread_id") != thread_id):
+            native_history_cache.pop(task["id"], None)
+        # Auto-resume can be scheduled from an older task snapshot while the
+        # user is editing the Goal. Always reload before binding Goal state.
+        task = task_or_404(task["id"])
+        async with goal_sync_lock(task["id"]):
+            goal_task = task_or_404(task["id"])
+            task = goal_task
+            goal_revision_at_start = int(goal_task.get("goal_revision") or 0)
         codex_label = f"ssh {task['ssh_host']} codex" if task.get("ssh_host") else CODEX_BIN
         command = shlex.join([codex_label, "app-server", "thread/resume" if mode != "start" else "thread/start", thread_id, "turn/start"])
         db.execute("UPDATE sessions SET command=?, codex_session_id=? WHERE id=?", (command, thread_id, session_id))
@@ -2917,15 +2942,28 @@ async def supervise_appserver_turn(
         running[task["id"]] = client.process  # owner marker; browsers never spawn a second resume
         waiter = asyncio.get_running_loop().create_future()
         turn_waiters[thread_id] = waiter
-        turn_params = {
-            "threadId": thread_id,
-            "cwd": task["workspace"],
-            "input": appserver_turn_inputs(task, message),
-            "approvalPolicy": approval,
-            "clientUserMessageId": message_id or None,
-            **turn_settings(task, provider, sandbox_policy),
-        }
-        turn_result = await client.request("turn/start", turn_params)
+        # Do not allow a Goal edit between thread/goal/set and turn/start.
+        # Both the native Goal and the structured input must use one latest
+        # revision, otherwise auto-resume can send the previous objective.
+        async with goal_sync_lock(task["id"]):
+            task = task_or_404(task["id"])
+            goal_revision_at_start = int(task.get("goal_revision") or 0)
+            if task.get("goal") and run_mode == "goal_resume":
+                await client.request(
+                    "thread/goal/set",
+                    {"threadId": thread_id, "objective": task["goal"], "status": goal_status_for_turn(task, run_mode)},
+                )
+            elif run_mode != "goal_resume":
+                await client.request("thread/goal/clear", {"threadId": thread_id})
+            turn_params = {
+                "threadId": thread_id,
+                "cwd": task["workspace"],
+                "input": appserver_turn_inputs(task, message, include_goal_memory=run_mode == "goal_resume"),
+                "approvalPolicy": approval,
+                "clientUserMessageId": message_id or None,
+                **turn_settings(task, provider, sandbox_policy),
+            }
+            turn_result = await client.request("turn/start", turn_params)
         turn_id = (turn_result.get("turn") or {}).get("id") or ""
         if message_id:
             db.execute("UPDATE task_messages SET status='running', session_id=?, error='' WHERE id=?", (session_id, message_id))
@@ -2936,7 +2974,7 @@ async def supervise_appserver_turn(
             external_live = bool(
                 external_candidate
                 and external_candidate.get("path")
-                and await asyncio.to_thread(rollout_is_live, external_candidate["path"])
+                and await asyncio.to_thread(native_rollout_writer_pids, external_candidate["path"], True)
             )
             misclassified = None if external_live else remove_external_turn(task["id"], turn_id)
             if misclassified and misclassified.get("session_id"):
@@ -2956,17 +2994,25 @@ async def supervise_appserver_turn(
         if task_or_404(task["id"])["status"] == "stopped":
             raise asyncio.CancelledError
         goal_task = task_or_404(task["id"])
-        if goal_task.get("goal"):
+        revision_changed = int(goal_task.get("goal_revision") or 0) != int(goal_revision_at_start or 0)
+        if goal_task.get("goal") and run_mode == "goal_resume" and not revision_changed:
             goal_result = await client.request("thread/goal/get", {"threadId": thread_id})
             goal = goal_result.get("goal") or {}
             goal_status = goal.get("status", "active")
             db.execute("UPDATE tasks SET goal_status=?, goal_tokens_used=?, updated_at=? WHERE id=?", (goal_status, goal.get("tokensUsed", 0), now(), task["id"]))
-            if goal_status != "complete":
+            if goal_status != "complete" and not revision_changed:
                 record_provider_outcome(provider, True, "Codex turn completed; Goal continues")
                 raise GoalIncompleteError(f"Codex goal is not complete: {goal_status}")
         record_provider_outcome(provider, True, "Codex app-server turn completed")
         db.execute("UPDATE sessions SET status='succeeded', finished_at=?, exit_code=0, summary=? WHERE id=?", (now(), "Codex app-server turn completed", session_id))
         external = refresh_external_primary(task["id"])
+        resume_goal_after_cleanup = bool(
+            not external
+            and run_mode != "goal_resume"
+            and goal_task.get("goal")
+            and goal_task.get("goal_status") == "active"
+            and goal_task.get("run_mode") == "goal_resume"
+        )
         if external:
             db.execute(
                 "UPDATE tasks SET status='running',active_session_id=?,execution_source='terminal',execution_turn_id=?,run_mode='terminal',last_error='',updated_at=? WHERE id=?",
@@ -2974,8 +3020,8 @@ async def supervise_appserver_turn(
             )
         else:
             db.execute(
-                "UPDATE tasks SET status='succeeded',active_session_id=NULL,execution_source='',execution_turn_id='',last_error='',updated_at=? WHERE id=?",
-                (now(), task["id"]),
+                "UPDATE tasks SET status=?,active_session_id=NULL,execution_source='',execution_turn_id='',last_error='',updated_at=? WHERE id=?",
+                ("queued" if resume_goal_after_cleanup else "succeeded", now(), task["id"]),
             )
         if message_id:
             db.execute("UPDATE task_messages SET status='sent', finished_at=?, session_id=?, error='' WHERE id=?", (now(), session_id, message_id))
@@ -3089,7 +3135,7 @@ async def supervise_appserver_turn(
                 return
             db.execute("UPDATE tasks SET status='queued',execution_source='dashboard',updated_at=? WHERE id=?", (now(), task["id"]))
             if goal_continues:
-                asyncio.create_task(launch_after_turn_cleanup(task["id"], "resume", "", "", set()))
+                asyncio.create_task(launch_after_turn_cleanup(task["id"], "goal-resume", "", "", set()))
             else:
                 asyncio.create_task(launch_after_turn_cleanup(task["id"], "message" if message_id else "resume", message, message_id, set()))
             return
@@ -3124,6 +3170,8 @@ async def supervise_appserver_turn(
         # active and dispatch queued rows as soon as this turn is idle.
         schedule_task_drain(task["id"])
         await close_task_appserver(provider, task, client)
+        if resume_goal_after_cleanup:
+            asyncio.create_task(launch_after_turn_cleanup(task["id"], "goal-resume", "", "", set()))
     await drain_task_messages(task["id"])
 
 
@@ -3631,7 +3679,7 @@ def appserver_attachment_path(task: dict, encoded_path: str) -> tuple[str, str] 
     return normalized, str(candidate)
 
 
-def appserver_turn_inputs(task: dict, message: str) -> list[dict[str, Any]]:
+def appserver_turn_inputs(task: dict, message: str, include_goal_memory: bool = False) -> list[dict[str, Any]]:
     """Translate durable chat markers into the structured app-server input protocol."""
     attachments: list[tuple[str, str]] = []
 
@@ -3648,6 +3696,11 @@ def appserver_turn_inputs(task: dict, message: str) -> list[dict[str, Any]]:
     clean_message = LEGACY_FILE_MARKER.sub(lambda match: collect(match, True), clean_message)
     inputs: list[dict[str, Any]] = []
     prompt = prompt_for(task, clean_message.strip())
+    if prompt and task.get("id") and task.get("memory_mode", "enabled") != "disabled":
+        snapshot = activity_graph_store.snapshot(task["id"])
+        memory = recall_context(clean_message, snapshot, task.get("goal", "") if include_goal_memory else "")
+        if memory:
+            prompt = f"{prompt}\n\n{memory}"
     if prompt:
         inputs.append({"type": "text", "text": prompt})
     seen: set[tuple[str, str]] = set()
@@ -3669,7 +3722,7 @@ def requested_run_mode(task: dict, mode: str, message_id: str = "") -> str:
     """Describe why the current turn exists for synchronized browser controls."""
     if message_id or mode == "message":
         return "message"
-    if task.get("goal") and mode == "resume":
+    if mode == "goal-resume":
         return "goal_resume"
     return "operation"
 
@@ -3679,11 +3732,14 @@ GOAL_MANUAL_STOP_STATUSES = {"paused", "blocked"}
 
 
 def goal_status_for_resume(task: dict) -> str:
-    """Reactivate unfinished Goals when durable auto-resume owns scheduling."""
+    """Return persisted Goal state without implicitly activating it."""
     status = task.get("goal_status") or "active"
-    if task.get("retry_forever") and status not in GOAL_TERMINAL_STATUSES:
-        return "active"
-    return "active" if status == "none" else status
+    return "paused" if status == "none" and task.get("goal") else status
+
+
+def goal_status_for_turn(task: dict, run_mode: str) -> str:
+    """Only the dedicated Goal start operation may activate a Goal."""
+    return "active" if run_mode == "goal_resume" else goal_status_for_resume(task)
 
 
 def goal_auto_resume_enabled(task: dict) -> bool:
@@ -3691,7 +3747,7 @@ def goal_auto_resume_enabled(task: dict) -> bool:
     if not task.get("goal") or not task.get("retry_forever"):
         return False
     status = task.get("goal_status") or "active"
-    return status not in GOAL_TERMINAL_STATUSES
+    return status not in GOAL_TERMINAL_STATUSES | {"paused"}
 
 
 def task_retry_allowed(task: dict, retries: int) -> bool:
@@ -3753,7 +3809,7 @@ def turn_settings(task: dict, provider: Optional[dict], sandbox_policy: dict) ->
     return settings
 
 
-def command_for(task: dict, provider: Optional[dict], resume_id: str = "", prompt_override: str = "") -> list[str]:
+def command_for(task: dict, provider: Optional[dict], resume_id: str = "", prompt_override: str = "", include_goal: bool = True) -> list[str]:
     # Codex has no literal --yolo flag; these are its current equivalent.
     cmd = [CODEX_BIN, "exec"]
     if resume_id:
@@ -3771,7 +3827,7 @@ def command_for(task: dict, provider: Optional[dict], resume_id: str = "", promp
     prompt = prompt_for(task, prompt_override)
     # The legacy CLI fallback has no app-server goal RPC, so preserve the
     # native slash directive only on that transport.
-    if task.get("goal"):
+    if task.get("goal") and include_goal:
         prompt = f"/goal {task['goal']}\n\n{prompt}"
     cmd.append(prompt)
     return cmd
@@ -4189,7 +4245,7 @@ async def drain_task_messages(task_id: str) -> None:
                 (now(), task_id),
             )
             try:
-                await launch(task_id, "resume")
+                await launch(task_id, "goal-resume")
             except Exception as exc:
                 if not is_task_busy_error(exc):
                     db.execute("UPDATE tasks SET status='failed',last_error=?,updated_at=? WHERE id=?", (str(exc), now(), task_id))
@@ -4402,25 +4458,24 @@ async def ensure_thread_loaded(task: dict, client: AppServerClient, provider: Op
     thread_id = latest_codex_session(task)
     if not thread_id:
         return ""
-    try:
-        await client.request("thread/read", {"threadId": thread_id, "includeTurns": False})
-        return thread_id
-    except RuntimeError:
-        approval = "never" if task.get("yolo") else "on-request"
-        params: dict[str, Any] = {"threadId": thread_id, "cwd": task["workspace"], "approvalPolicy": approval, "excludeTurns": True}
-        if task.get("permission_profile"):
-            params["permissions"] = task["permission_profile"]
-        else:
-            params["sandbox"] = "danger-full-access" if task.get("yolo") else "workspace-write"
-        model = task.get("model") or (provider or {}).get("model")
-        if model:
-            params["model"] = model
-        if (provider or {}).get("model_provider"):
-            params["modelProvider"] = provider["model_provider"]
-        if task.get("personality"):
-            params["personality"] = task["personality"]
-        await client.request("thread/resume", params)
-        return thread_id
+    # thread/read can return a rollout stored on disk without loading it into
+    # this app-server process. Operations such as compact and fork require a
+    # loaded thread, so resume it even when thread/read would succeed.
+    approval = "never" if task.get("yolo") else "on-request"
+    params: dict[str, Any] = {"threadId": thread_id, "cwd": task["workspace"], "approvalPolicy": approval, "excludeTurns": True}
+    if task.get("permission_profile"):
+        params["permissions"] = task["permission_profile"]
+    else:
+        params["sandbox"] = "danger-full-access" if task.get("yolo") else "workspace-write"
+    model = task.get("model") or (provider or {}).get("model")
+    if model:
+        params["model"] = model
+    if (provider or {}).get("model_provider"):
+        params["modelProvider"] = provider["model_provider"]
+    if task.get("personality"):
+        params["personality"] = task["personality"]
+    await client.request("thread/resume", params)
+    return thread_id
 
 
 def task_is_running(task: dict) -> bool:
@@ -4918,51 +4973,158 @@ async def patch_context(task_id: str, payload: ContextPatch, _: Any = Depends(au
 
 @app.put("/api/tasks/{task_id}/goal")
 async def patch_goal(task_id: str, payload: GoalPatch, _: Any = Depends(auth)):
+    sync_error = ""
+    async with goal_sync_lock(task_id):
+        task = task_or_404(task_id)
+        if payload.status == "paused" and task.get("retry_forever"):
+            raise HTTPException(409, "Turn off Goal auto-resume before pausing the Goal")
+        updates: dict[str, Any] = {}
+        objective = payload.objective if payload.objective is not None else task.get("goal", "")
+        if payload.objective is not None:
+            updates["goal"] = payload.objective
+            current_status = (task.get("goal_status") or "none") if str(task.get("goal") or "").strip() else "none"
+            # Editing never activates a Goal. An already active Goal remains
+            # active and receives the new objective; a new or paused Goal
+            # stays paused until the dedicated Goal start operation.
+            updates["goal_status"] = (current_status if current_status != "none" else "paused") if payload.objective.strip() else "none"
+            updates["goal_tokens_used"] = 0
+            if payload.objective.strip() and not task.get("retry_explicit"):
+                updates["retry_forever"] = 0
+                updates["retry_explicit"] = 0
+            elif not payload.objective.strip():
+                updates["retry_forever"] = 0
+                updates["retry_explicit"] = 0
+        elif payload.status is not None:
+            if payload.status == "active":
+                raise HTTPException(409, "Use Goal start to activate the Goal")
+            updates["goal_status"] = payload.status
+        if updates:
+            sets = ",".join(f"{key}=?" for key in updates)
+            stamp = now()
+            revision_update = ",goal_revision=goal_revision+1,goal_updated_at=?" if payload.objective is not None or payload.status is not None else ""
+            revision_args = (stamp,) if payload.objective is not None or payload.status is not None else ()
+            db.execute(f"UPDATE tasks SET {sets}{revision_update}, updated_at=? WHERE id=?", tuple(updates.values()) + revision_args + (stamp, task_id))
+
+        task = task_or_404(task_id)
+        thread_id = latest_codex_session(task)
+        remote_goal: dict[str, Any] = {}
+        if thread_id and (payload.objective is not None or payload.status is not None):
+            binding = app_thread_bindings.get(task_id)
+            client = app_servers.get(binding[0]) if binding else None
+            if not client:
+                client, _provider = await appserver_for_task(task)
+                await ensure_thread_loaded(task, client)
+            try:
+                if not objective.strip():
+                    await client.request("thread/goal/clear", {"threadId": thread_id})
+                else:
+                    remote_goal = (await client.request(
+                        "thread/goal/set",
+                        {"threadId": thread_id, "objective": objective, "status": task.get("goal_status") or "active"},
+                    )).get("goal") or {}
+                if remote_goal:
+                    db.execute("UPDATE tasks SET goal_status=?, goal_tokens_used=?, updated_at=? WHERE id=?", (remote_goal.get("status", task.get("goal_status")), int(remote_goal.get("tokensUsed", 0) or 0), now(), task_id))
+            except Exception as exc:
+                sync_error = f"Codex Goal sync failed: {exc}; local Goal is saved and will retry on next turn"
+        result = task_or_404(task_id)
+        if sync_error:
+            result["goal_sync_error"] = sync_error
+    await broadcast_task(task_id, {"type": "task_status", "task": result, "source": {"kind": "goal"}})
+    await broadcast_overview(task_id, {"kind": "goal"})
+    return result
+
+
+def persist_goal_paused(task_id: str) -> bool:
     task = task_or_404(task_id)
-    if payload.status == "paused" and task.get("retry_forever"):
-        raise HTTPException(409, "Turn off Goal auto-resume before pausing the Goal")
-    remote_goal: dict[str, Any] = {}
+    if not task.get("goal") or task.get("goal_status") in GOAL_TERMINAL_STATUSES:
+        return False
+    if task.get("goal_status") == "paused" and not task.get("retry_forever"):
+        return False
+    stamp = now()
+    db.execute(
+        "UPDATE tasks SET goal_status='paused',retry_forever=0,retry_explicit=0,goal_revision=goal_revision+1,goal_updated_at=?,updated_at=? WHERE id=?",
+        (stamp, stamp, task_id),
+    )
+    return True
+
+
+async def sync_current_goal(task: dict, status: str) -> str:
     thread_id = latest_codex_session(task)
-    if thread_id and (payload.objective is not None or payload.status is not None):
-        binding = app_thread_bindings.get(task_id)
+    if not thread_id or not task.get("goal"):
+        return ""
+    try:
+        binding = app_thread_bindings.get(task["id"])
         client = app_servers.get(binding[0]) if binding else None
         if not client:
             client, _provider = await appserver_for_task(task)
             await ensure_thread_loaded(task, client)
-        try:
-            if payload.objective is not None and not payload.objective.strip():
-                await client.request("thread/goal/clear", {"threadId": thread_id})
-            else:
-                objective = payload.objective if payload.objective is not None else task.get("goal", "")
-                status = payload.status or ("active" if objective else None)
-                remote_goal = (await client.request(
-                    "thread/goal/set",
-                    {"threadId": thread_id, "objective": objective, "status": status},
-                )).get("goal") or {}
-        except Exception as exc:
-            raise HTTPException(502, f"Codex Goal sync failed: {exc}")
-    updates = {}
-    if payload.objective is not None:
-        updates["goal"] = payload.objective
-        updates["goal_status"] = remote_goal.get("status") or payload.status or ("active" if payload.objective.strip() else "none")
-        updates["goal_tokens_used"] = int(remote_goal.get("tokensUsed", 0) or 0)
-        if payload.objective.strip() and not task.get("retry_explicit"):
-            updates["retry_forever"] = 0
-            updates["retry_explicit"] = 0
-        elif not payload.objective.strip():
-            updates["retry_forever"] = 0
-            updates["retry_explicit"] = 0
-    elif payload.status is not None:
-        updates["goal_status"] = remote_goal.get("status") or payload.status
-    if updates:
-        sets = ",".join(f"{key}=?" for key in updates)
+        goal = (await client.request(
+            "thread/goal/set",
+            {"threadId": thread_id, "objective": task["goal"], "status": status},
+        )).get("goal") or {}
+        db.execute(
+            "UPDATE tasks SET goal_status=?,goal_tokens_used=?,updated_at=? WHERE id=?",
+            (goal.get("status", status), int(goal.get("tokensUsed", 0) or 0), now(), task["id"]),
+        )
+        return ""
+    except Exception as exc:
+        return f"Codex Goal sync failed: {exc}"
+
+
+@app.post("/api/tasks/{task_id}/goal/start")
+async def start_goal(task_id: str, _: Any = Depends(auth)):
+    async with goal_sync_lock(task_id):
+        task = task_or_404(task_id)
+        if not str(task.get("goal") or "").strip():
+            raise HTTPException(409, "Set a Goal before starting it")
+        if task.get("goal_status") == "complete":
+            raise HTTPException(409, "Completed Goal cannot be restarted; edit it first")
         stamp = now()
-        revision_update = ",goal_revision=goal_revision+1,goal_updated_at=?" if payload.objective is not None else ""
-        revision_args = (stamp,) if payload.objective is not None else ()
-        db.execute(f"UPDATE tasks SET {sets}{revision_update}, updated_at=? WHERE id=?", tuple(updates.values()) + revision_args + (stamp, task_id))
-    result = task_or_404(task_id)
-    await broadcast_task(task_id, {"type": "task_status", "task": result, "source": {"kind": "goal"}})
-    await broadcast_overview(task_id, {"kind": "goal"})
+        db.execute(
+            "UPDATE tasks SET goal_status='active',goal_revision=goal_revision+1,goal_updated_at=?,last_error='',updated_at=? WHERE id=?",
+            (stamp, stamp, task_id),
+        )
+        task = task_or_404(task_id)
+        sync_error = await sync_current_goal(task, "active")
+        task = task_or_404(task_id)
+    external_live = await refresh_live_external_turn(task_id)
+    task = task_or_404(task_id)
+    if task_id in running or task_id in appserver_turn_tasks or task.get("status") == "running" or external_live:
+        db.execute("UPDATE tasks SET run_mode='goal_resume',updated_at=? WHERE id=?", (now(), task_id))
+        result = task_or_404(task_id)
+    else:
+        db.execute("UPDATE tasks SET retry_count=0,status='queued',run_mode='goal_resume',updated_at=? WHERE id=?", (now(), task_id))
+        try:
+            result = await launch(task_id, "goal-resume")
+        except Exception as exc:
+            if not is_task_busy_error(exc):
+                raise
+            db.execute("UPDATE tasks SET run_mode='goal_resume',last_error='',updated_at=? WHERE id=?", (now(), task_id))
+            result = task_or_404(task_id)
+    if sync_error:
+        result["goal_sync_error"] = sync_error
+    await broadcast_task(task_id, {"type": "task_status", "task": result, "source": {"kind": "goal_start"}})
+    await broadcast_overview(task_id, {"kind": "goal_start"})
+    return result
+
+
+@app.post("/api/tasks/{task_id}/goal/pause")
+async def pause_goal(task_id: str, _: Any = Depends(auth)):
+    async with goal_sync_lock(task_id):
+        task = task_or_404(task_id)
+        if not task.get("goal"):
+            raise HTTPException(409, "Task has no Goal")
+        persist_goal_paused(task_id)
+        sync_error = await sync_current_goal(task_or_404(task_id), "paused")
+    task = task_or_404(task_id)
+    if task_id in running or task_id in appserver_turn_tasks or task.get("status") in {"running", "queued", "retrying"} or external_turns.get(task_id):
+        result = await stop_task_run(task_id, pause_goal=False)
+    else:
+        result = task
+    if sync_error:
+        result["goal_sync_error"] = sync_error
+    await broadcast_task(task_id, {"type": "task_status", "task": result, "source": {"kind": "goal_pause"}})
+    await broadcast_overview(task_id, {"kind": "goal_pause"})
     return result
 
 
@@ -4986,18 +5148,18 @@ def history_event_identity(event: dict) -> Optional[tuple[str, str, str]]:
 def merge_native_with_rollout(native_events: list[dict], persisted: list[dict]) -> list[dict]:
     """Keep rollout ordering while filling tool details from richer native items."""
     merged_persisted = [dict(event) for event in persisted]
-    rollout_indexes = {
+    persisted_indexes = {
         identity: index
         for index, event in enumerate(merged_persisted)
-        if event.get("stream") == "rollout" and (identity := history_event_identity(event))
+        if event.get("stream") in {"rollout", "app-server"} and (identity := history_event_identity(event))
     }
     remaining_native: list[dict] = []
     for native in native_events:
         identity = history_event_identity(native)
-        if identity not in rollout_indexes:
+        if identity not in persisted_indexes:
             remaining_native.append(native)
             continue
-        index = rollout_indexes[identity]
+        index = persisted_indexes[identity]
         rollout = merged_persisted[index]
         try:
             native_payload = native.get("payload") if isinstance(native.get("payload"), dict) else json.loads(native.get("payload") or "{}")
@@ -5103,15 +5265,34 @@ def history_event_key(event: dict) -> tuple[str, str]:
     return stamp, str(event.get("id") or "")
 
 
+TIMELINE_SEMANTIC_TYPES = {
+    "usermessage", "browsermessage", "agentmessage", "reasoning", "commandexecution",
+    "mcptoolcall", "filechange", "websearch", "contextcompaction",
+}
+
+
+def semantic_timeline_rows(rows: list[dict], limit: int = 0) -> list[dict]:
+    result = []
+    for event in rows:
+        if event.get("stream") in {"system", "rollout"}:
+            result.append(event)
+        elif event.get("stream") == "app-server":
+            try:
+                payload = event.get("payload") if isinstance(event.get("payload"), dict) else json.loads(event.get("payload") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if str((payload or {}).get("type") or "").lower() in TIMELINE_SEMANTIC_TYPES:
+                result.append(event)
+        if limit and len(result) >= limit:
+            break
+    return result
+
+
 async def native_timeline_events(task: dict) -> tuple[list[dict], list[dict]]:
     """Merge one cached native snapshot with small live/persisted overlays."""
     native_events = list(await native_history_events(task))
-    persisted = db.all(
-        "SELECT * FROM (SELECT * FROM events "
-        "WHERE task_id=? AND stream IN ('system','rollout') ORDER BY id DESC LIMIT 1500) "
-        "ORDER BY ts,id",
-        (task["id"],),
-    )
+    recent_persisted = db.all("SELECT * FROM events WHERE task_id=? ORDER BY id DESC LIMIT 5000", (task["id"],))
+    persisted = list(reversed(semantic_timeline_rows(recent_persisted)))
     metric_version_row = db.one(
         "SELECT id FROM events WHERE task_id=? AND stream='app-server' ORDER BY id DESC LIMIT 1",
         (task["id"],),
@@ -5281,13 +5462,20 @@ async def task_activity_map(task_id: str, _: Any = Depends(auth)):
 
 
 @app.get("/api/tasks/{task_id}/timeline")
-async def task_timeline(task_id: str, before: str = "", limit: int = 160, _: Any = Depends(auth)):
+async def task_timeline(task_id: str, before: str = "", limit: int = 160, fast: bool = False, _: Any = Depends(auth)):
     """Return one newest-first cursor page, rendered oldest-to-newest by clients."""
     task = task_or_404(task_id)
     task_id = task["id"]
     limit = max(25, min(limit, 500))
     cursor = decode_history_cursor(before)
     if task.get("native"):
+        if fast and not before:
+            candidates = db.all(
+                "SELECT * FROM events WHERE task_id=? ORDER BY id DESC LIMIT ?",
+                (task_id, min(5000, max(800, limit * 16))),
+            )
+            rows = semantic_timeline_rows(candidates, limit)
+            return {"items": list(reversed(rows)), "next_cursor": "", "has_more": True, "metrics": [], "fast": True}
         events, metrics = await native_timeline_events(task)
         if cursor:
             if cursor.get("kind") != "native" or not isinstance(cursor.get("ts"), str):
@@ -5793,7 +5981,7 @@ async def launch(
     session_id = str(uuid.uuid4())
     provider = ordered[0]
     run_mode = requested_run_mode(task, mode, message_id)
-    if (USE_APP_SERVER or task.get("ssh_host")) and mode in {"start", "resume", "message"}:
+    if (USE_APP_SERVER or task.get("ssh_host")) and mode in {"start", "resume", "goal-resume", "message"}:
         # Reserve the task before any IPC awaits, so a second browser request
         # queues behind this owner instead of opening another thread/reader.
         db.execute(
@@ -5804,24 +5992,25 @@ async def launch(
         await broadcast_overview(task_id, {"type": "session", "status": "running"})
         return result
     resume_id = ""
-    if mode in {"resume", "message", "auto-retry"}:
+    if mode in {"resume", "goal-resume", "message", "auto-retry"}:
         resume_id = latest_codex_session(task)
-    cmd = command_for(task, provider, resume_id, message)
+    include_goal = run_mode == "goal_resume"
+    cmd = command_for(task, provider, resume_id, message, include_goal=include_goal)
     db.execute("INSERT INTO sessions (id,task_id,status,attempt,provider_id,command,started_at,codex_session_id) VALUES (?,?,?,?,?,?,?,?)", (session_id, task_id, "running", attempt, provider["id"] if provider else None, shlex.join(cmd), now(), resume_id))
     db.execute(
         "UPDATE tasks SET status='running',retry_count=?,active_session_id=?,execution_source='dashboard',execution_turn_id='',run_mode=?,last_error='',updated_at=? WHERE id=?",
         (attempt, session_id, run_mode, now(), task_id),
     )
-    asyncio.create_task(supervise(task, session_id, ordered, cmd, resume_id, message_id, message))
+    asyncio.create_task(supervise(task, session_id, ordered, cmd, resume_id, message_id, message, include_goal))
     await broadcast_overview(task_id, {"type": "session", "status": "running"})
     return task_or_404(task_id) | {"session_id": session_id, "command": shlex.join(cmd), "mode": mode, "message_id": message_id}
 
 
-async def supervise(task: dict, session_id: str, providers: list[Optional[dict]], initial_cmd: list[str], resume_id: str = "", message_id: str = "", prompt_override: str = "") -> None:
+async def supervise(task: dict, session_id: str, providers: list[Optional[dict]], initial_cmd: list[str], resume_id: str = "", message_id: str = "", prompt_override: str = "", include_goal: bool = False) -> None:
     task_id = task["id"]
     last_error = ""
     for index, provider in enumerate(providers):
-        cmd = initial_cmd if index == 0 else command_for(task, provider, resume_id, prompt_override)
+        cmd = initial_cmd if index == 0 else command_for(task, provider, resume_id, prompt_override, include_goal=include_goal)
         db.execute(
             "UPDATE sessions SET provider_id=?,command=? WHERE id=?",
             (provider["id"] if provider else None, shlex.join(cmd), session_id),
@@ -5920,7 +6109,7 @@ async def supervise(task: dict, session_id: str, providers: list[Optional[dict]]
         await broadcast_task(task_id, {"type": "session", "session_id": session_id, "status": "retrying", "error": last_error})
         await asyncio.sleep(min(30, 2 ** min(retries, 4)))
         try:
-            await launch(task_id, "resume" if goal_auto_resume_enabled(latest) else "auto-retry")
+            await launch(task_id, "goal-resume" if goal_auto_resume_enabled(latest) else "auto-retry")
         except Exception:
             pass
     else:
@@ -5952,13 +6141,11 @@ async def start_task(task_id: str, _: Any = Depends(auth)):
 async def resume_task(task_id: str, _: Any = Depends(auth)):
     task = task_or_404(task_id)
     if external_turns.get(task_id):
-        if task.get("goal"):
-            db.execute("UPDATE tasks SET run_mode='goal_resume',last_error='',updated_at=? WHERE id=?", (now(), task_id))
         persist_external_task_status(task_id, dashboard_active=False)
         result = task_or_404(task_id)
-        await broadcast_task(task_id, {"type": "task_status", "task": result, "source": {"kind": "goal_resume", "surface": "terminal"}})
-        await broadcast_overview(task_id, {"kind": "goal_resume", "surface": "terminal"})
-        return result | {"shared": True, "message": "Goal resume adopted the active terminal Codex turn"}
+        await broadcast_task(task_id, {"type": "task_status", "task": result, "source": {"kind": "resume", "surface": "terminal"}})
+        await broadcast_overview(task_id, {"kind": "resume", "surface": "terminal"})
+        return result | {"shared": True, "message": "Conversation resume adopted the active terminal Codex turn"}
     if task_id in running or task_id in appserver_turn_tasks or task["status"] == "running":
         # Rejoin the server-owned turn instead of starting a competing CLI
         # process. All browser tabs can continue through /messages.
@@ -6123,7 +6310,7 @@ async def steer_task_message(task_id: str, payload: TaskMessageIn, _: Any = Depe
             {
                 "threadId": thread_id,
                 "expectedTurnId": turn_id,
-                "input": appserver_turn_inputs(task, message_body),
+                "input": appserver_turn_inputs(task, message_body, include_goal_memory=False),
                 "clientUserMessageId": message_id,
             },
         )
@@ -6233,8 +6420,11 @@ async def stop_task(task_id: str, _: Any = Depends(auth)):
     return await stop_task_run(task_id)
 
 
-async def stop_task_run(task_id: str) -> dict:
+async def stop_task_run(task_id: str, pause_goal: bool = True) -> dict:
     task = task_or_404(task_id)
+    goal_paused = persist_goal_paused(task_id) if pause_goal else False
+    if goal_paused:
+        task = task_or_404(task_id)
     for request in list(pending_appserver_requests.values()):
         if request["task_id"] == task_id and not request["future"].done():
             request["future"].set_result(approval_result(request, ApprovalResolveIn(decision="cancel")))
@@ -6265,6 +6455,10 @@ async def stop_task_run(task_id: str) -> dict:
             await broadcast_task(task_id, {"type": "task_status", "task": result, "source": {"kind": "stop"}})
             await broadcast_overview(task_id, {"kind": "stop"})
             return result
+        if goal_paused:
+            await broadcast_task(task_id, {"type": "task_status", "task": task, "source": {"kind": "conversation_pause"}})
+            await broadcast_overview(task_id, {"kind": "conversation_pause"})
+            return task
         raise HTTPException(409, "Task is not running")
     db.execute(
         "UPDATE tasks SET status='stopped',execution_source='',execution_turn_id='',run_mode='',last_error='Stopped by user',updated_at=? WHERE id=?",
@@ -6311,7 +6505,7 @@ CODEX_OPERATIONS = {
 THREAD_RPC_OPERATIONS = {"archive", "unarchive", "delete", "fork", "rename", "compact", "memory-enable", "memory-disable"}
 
 
-async def run_thread_operation(task: dict, payload: OperationIn) -> dict:
+async def _run_thread_operation(task: dict, payload: OperationIn) -> dict:
     thread_id = latest_codex_session(task)
     operation = payload.operation
     if payload.operation == "delete":
@@ -6422,6 +6616,25 @@ async def run_thread_operation(task: dict, payload: OperationIn) -> dict:
     return {"ok": True, "operation": operation, "thread_id": thread_id, "fork_thread_id": fork_id, "task": forked_task}
 
 
+async def run_thread_operation(task: dict, payload: OperationIn) -> dict:
+    """Run a thread RPC without leaving a temporary app-server writer behind."""
+    provider = db.one("SELECT * FROM providers WHERE id=?", (task.get("provider_id"),)) if task.get("provider_id") else None
+    key = appserver_key(provider, task)
+    active_turn_client = task["id"] in appserver_turn_tasks or task["id"] in running
+    try:
+        return await _run_thread_operation(task, payload)
+    finally:
+        client = app_servers.get(key)
+        if client and not active_turn_client:
+            thread_id = latest_codex_session(task)
+            if thread_id:
+                try:
+                    await asyncio.wait_for(client.request("thread/unsubscribe", {"threadId": thread_id}), timeout=3)
+                except Exception:
+                    pass
+            await close_task_appserver(provider, task, client)
+
+
 def create_command_task(source: dict, prompt: str, status: str = "queued") -> dict:
     task_id, stamp = str(uuid.uuid4()), now()
     clean_prompt = prompt.strip() or "开始一个新的 Codex 会话"
@@ -6494,6 +6707,28 @@ async def execute_slash_command(task: dict, command: str, arg_text: str, args: l
         return result_message(command, command_help(args[0] if args else ""))
 
     if command == "goal":
+        # Slash Goal updates share the same serialization boundary as the
+        # REST editor. This prevents a running turn from restoring an older
+        # objective after the command has returned.
+        async with goal_sync_lock(task["id"]):
+            return await execute_goal_slash_command(task, command, arg_text, args, confirmed)
+
+    return await execute_slash_command_unlocked(task, command, arg_text, args, confirmed)
+
+
+async def execute_goal_slash_command(task: dict, command: str, arg_text: str, args: list[str], confirmed: bool = False) -> dict:
+    """Execute Goal slash commands while holding the per-task Goal lock."""
+    # Keep the original command implementation below in one place. The
+    # function is split out so REST edits and slash edits use one lock.
+    return await _execute_slash_command_body(task, command, arg_text, args, confirmed)
+
+
+async def execute_slash_command_unlocked(task: dict, command: str, arg_text: str, args: list[str], confirmed: bool = False) -> dict:
+    return await _execute_slash_command_body(task, command, arg_text, args, confirmed)
+
+
+async def _execute_slash_command_body(task: dict, command: str, arg_text: str, args: list[str], confirmed: bool = False) -> dict:
+    if command == "goal":
         thread_id = latest_codex_session(task)
         client = None
         if thread_id:
@@ -6512,10 +6747,10 @@ async def execute_slash_command(task: dict, command: str, arg_text: str, args: l
                 return result_message(command, "当前线程没有设置 Goal。\n\n用法：`/goal <objective>`")
             return result_message(command, f"**Goal**\n{goal.get('objective')}\n\n状态：`{goal.get('status', 'active')}` · 已用 tokens：{goal.get('tokensUsed', 0)}", goal=goal)
         if first == "clear":
-            if client and thread_id:
-                await client.request("thread/goal/clear", {"threadId": thread_id})
             stamp = now()
             db.execute("UPDATE tasks SET goal='',goal_status='none',goal_tokens_used=0,goal_revision=goal_revision+1,goal_updated_at=?,retry_forever=0,retry_explicit=0,updated_at=? WHERE id=?", (stamp, stamp, task["id"]))
+            if client and thread_id:
+                await client.request("thread/goal/clear", {"threadId": thread_id})
             return result_message(command, "Goal 已清除。")
         if first == "budget":
             if len(args) != 2 or not args[1].isdigit():
@@ -6536,20 +6771,23 @@ async def execute_slash_command(task: dict, command: str, arg_text: str, args: l
             objective = task.get("goal", "")
             if not objective:
                 raise HTTPException(400, "当前线程还没有 Goal")
+            stamp = now()
+            db.execute("UPDATE tasks SET goal_status=?,goal_revision=goal_revision+1,goal_updated_at=?,updated_at=? WHERE id=?", (status, stamp, stamp, task["id"]))
             if client and thread_id:
                 goal = (await client.request("thread/goal/set", {"threadId": thread_id, "objective": objective, "status": status})).get("goal") or {}
                 status = goal.get("status", status)
-            db.execute("UPDATE tasks SET goal_status=?,updated_at=? WHERE id=?", (status, now(), task["id"]))
+                db.execute("UPDATE tasks SET goal_status=?,updated_at=? WHERE id=?", (status, now(), task["id"]))
             return result_message(command, f"Goal 状态已切换为 `{status}`。")
         objective = arg_text.strip()
         if not objective:
             raise HTTPException(400, "用法：/goal <objective>")
         status = "active"
+        stamp = now()
+        db.execute("UPDATE tasks SET goal=?,goal_status=?,goal_tokens_used=0,goal_revision=goal_revision+1,goal_updated_at=?,updated_at=? WHERE id=?", (objective, status, stamp, stamp, task["id"]))
         if client and thread_id:
             goal = (await client.request("thread/goal/set", {"threadId": thread_id, "objective": objective, "status": status})).get("goal") or {}
             status = goal.get("status", status)
-        stamp = now()
-        db.execute("UPDATE tasks SET goal=?,goal_status=?,goal_tokens_used=0,goal_revision=goal_revision+1,goal_updated_at=?,updated_at=? WHERE id=?", (objective, status, stamp, stamp, task["id"]))
+            db.execute("UPDATE tasks SET goal_status=?,updated_at=? WHERE id=?", (status, now(), task["id"]))
         return result_message(command, f"Goal 已设置：\n\n{objective}\n\n状态：`{status}`。", goal={"objective": objective, "status": status})
 
     if command == "status":
