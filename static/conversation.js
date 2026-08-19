@@ -7,6 +7,8 @@ const conversationSnapshots = new Map();
 let chatBuildRequestId = 0;
 let chatBuildInFlight = false;
 let chatBuildQueued = false;
+let chatLayoutRetryTimer = 0;
+let chatLayoutRetryCount = 0;
 let chatHistoryLoadPromise = null;
 let mediaViewerMarkdown = null;
 function renderSidebarStats() {
@@ -677,6 +679,17 @@ function loadEarlierActivity(activityKey) {
 function paintVirtualChat(stickToBottom = false) {
   if (state.chatSelectionActive) { state.chatRenderDeferred = true; state.chatDeferredStickToBottom ||= stickToBottom; return; }
   const stream = $("#chat-log"); const blocks = state.chatBlocks || []; const windowSize = 90;
+  const streamWidth = stream.getBoundingClientRect().width;
+  if (streamWidth > 0 && streamWidth < 240 && chatLayoutRetryCount < 5) {
+    chatLayoutRetryCount += 1;
+    if (!chatLayoutRetryTimer) chatLayoutRetryTimer = setTimeout(() => {
+      chatLayoutRetryTimer = 0;
+      paintVirtualChat(stickToBottom);
+    }, 40);
+    return;
+  }
+  if (chatLayoutRetryTimer) { clearTimeout(chatLayoutRetryTimer); chatLayoutRetryTimer = 0; }
+  chatLayoutRetryCount = 0;
   const viewport = captureChatViewport(stream);
   if (!blocks.length) { stream.innerHTML = `<div class="chat-empty">${mascotMarkup("mascot-chat")}<p>${uiLabel("firstMessage")}</p></div>`; return; }
   if (state.chatVirtualStart === null || stickToBottom) state.chatVirtualStart = Math.max(0, blocks.length - windowSize);
