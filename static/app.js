@@ -357,22 +357,10 @@ async function toggleGoalRun() {
   const goal = String(task?.goal || "").trim();
   if (!task || !state.selectedId || !goal) return toast("请先设置 Goal");
   const goalActive = goalIsActive(task);
-  if (goalActive && task.retry_forever) return toast("请先关闭 Goal 自动续跑，再暂停 Goal");
-  const turnActive = ["running", "retrying", "queued"].includes(task.status);
-  if (goalActive && turnActive) {
-    const stopped = await changeSelectedRun("stop", false);
-    if (!stopped || ["running", "retrying", "queued"].includes(stopped.status)) return toast("当前 Codex 未能暂停");
-  }
   try {
-    const updated = await api(`/tasks/${state.selectedId}/goal`, { method: "PUT", body: JSON.stringify({ status: goalActive ? "paused" : "active" }) });
+    const updated = await api(`/tasks/${state.selectedId}/goal/${goalActive ? "pause" : "start"}`, { method: "POST" });
     state.selectedTask = { ...state.selectedTask, ...updated }; mergeTask(updated); renderConversation();
-    if (!goalActive) {
-      const resumed = await changeSelectedRun("resume", false);
-      if (!resumed) return toast("Goal 已继续，但恢复 Codex 失败");
-      toast("Goal 已继续，正在 resume");
-    } else {
-      toast("Goal 已暂停");
-    }
+    toast(updated.goal_sync_error || (goalActive ? "Goal 和会话已暂停" : "Goal 和会话已启动"));
   } catch (error) { toast(error.message); }
 }
 $("#goal-run-toggle").onclick = toggleGoalRun;

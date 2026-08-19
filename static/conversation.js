@@ -337,7 +337,7 @@ function goalCanAutoResume(status, retryForever = false) {
   return retryForever || !["paused", "blocked"].includes(value);
 }
 function goalIsActive(task) {
-  return Boolean(String(task?.goal || "").trim()) && goalCanAutoResume(task.goal_status || "active", Boolean(task.retry_forever));
+  return Boolean(String(task?.goal || "").trim()) && (task.goal_status || "none") === "active";
 }
 function renderGoalBar() {
   const task = state.selectedTask;
