@@ -2840,7 +2840,7 @@ async def launch_appserver(
         (attempt, session_id, run_mode, stamp, task["id"]),
     )
     turn_task = asyncio.create_task(
-        supervise_appserver_turn(task, provider, mode, message, message_id, session_id, attempted_provider_ids or set())
+        supervise_appserver_turn(task, provider, mode, run_mode, message, message_id, session_id, attempted_provider_ids or set())
     )
     appserver_turn_tasks[task["id"]] = turn_task
     return task_or_404(task["id"]) | {"session_id": session_id, "mode": mode, "message_id": message_id, "thread_id": resume_id, "shared_owner": True}
@@ -2850,6 +2850,7 @@ async def supervise_appserver_turn(
     task: dict,
     provider: Optional[dict],
     mode: str,
+    run_mode: str,
     message: str,
     message_id: str,
     session_id: str,

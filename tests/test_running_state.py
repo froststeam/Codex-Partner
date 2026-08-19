@@ -3194,6 +3194,14 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertEqual("goal_resume", self.app.requested_run_mode({"goal": "ship it"}, "goal-resume"))
         self.assertEqual("operation", self.app.requested_run_mode({"goal": ""}, "resume"))
 
+    def test_appserver_supervisor_receives_explicit_run_mode(self):
+        import inspect
+
+        signature = inspect.signature(self.app.supervise_appserver_turn)
+        self.assertIn("run_mode", signature.parameters)
+        source = inspect.getsource(self.app.launch_appserver)
+        self.assertIn("supervise_appserver_turn(task, provider, mode, run_mode, message", source)
+
     def test_browser_auth_uses_ssh_cookie_instead_of_access_tokens(self):
         static = Path(__file__).resolve().parents[1] / "static"
         core_js = (static / "core.js").read_text(encoding="utf-8")
