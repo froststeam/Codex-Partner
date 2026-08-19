@@ -79,6 +79,7 @@ const UI_LABELS = {
   pause: { zh: "暂停", en: "Pause", fr: "Pause", ja: "一時停止", ko: "일시정지" },
   goalStart: { zh: "开始目标续跑", en: "Start goal resume", fr: "Reprendre l’objectif", ja: "目標の再開", ko: "목표 재개" },
   goalPause: { zh: "暂停目标续跑", en: "Pause goal resume", fr: "Suspendre l’objectif", ja: "目標を一時停止", ko: "목표 일시정지" },
+  goalPauseRetryEnabled: { zh: "请先关闭自动续跑，才能暂停 Goal", en: "Disable auto-resume before pausing the Goal", fr: "Désactivez la reprise automatique avant de mettre l’objectif en pause", ja: "Goalを一時停止するには自動再開を先に無効にしてください", ko: "Goal을 일시정지하려면 자동 재개를 먼저 끄세요" },
   setGoal: { zh: "先设置目标", en: "Set a goal first", fr: "Définissez un objectif", ja: "目標を設定してください", ko: "목표를 먼저 설정하세요" },
   retryOn: { zh: "开启目标自动续跑", en: "Enable goal auto-resume", fr: "Activer la reprise automatique", ja: "目標の自動再開を有効化", ko: "목표 자동 재개 켜기" },
   retryOff: { zh: "关闭目标自动续跑", en: "Disable goal auto-resume", fr: "Désactiver la reprise automatique", ja: "目標の自動再開を無効化", ko: "목표 자동 재개 끄기" },

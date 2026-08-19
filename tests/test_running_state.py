@@ -780,6 +780,12 @@ class RunningStateTests(unittest.TestCase):
         self.assertEqual(409, raised.exception.status_code)
         self.assertEqual("active", self.app.task_or_404(task_id)["goal_status"])
 
+    def test_goal_pause_control_is_disabled_when_auto_resume_is_enabled(self):
+        source = Path(self.app.__file__).with_name("static").joinpath("conversation.js").read_text(encoding="utf-8")
+        self.assertIn("const goalPauseBlocked = goalActive && Boolean(task.retry_forever);", source)
+        self.assertIn('$("#goal-run-toggle").disabled = !goal || goalPauseBlocked;', source)
+        self.assertIn('uiLabel("goalPauseRetryEnabled")', source)
+
     def test_enabling_auto_resume_does_not_wake_a_paused_goal(self):
         task_id = f"goal-retry-enable-{time.time_ns()}"
         self.make_task(task_id, "available")
@@ -2213,6 +2219,57 @@ process.stdout.write(JSON.stringify(browserMessages));
             self.assertEqual("goal_resume", result["run_mode"])
         finally:
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_goal_start_does_not_adopt_a_stale_external_turn(self):
+        task_id = f"stale-external-goal-{time.time_ns()}"
+        self.make_task(task_id, "stopped")
+        self.app.db.execute("UPDATE tasks SET goal='latest objective',goal_status='paused' WHERE id=?", (task_id,))
+        self.app.register_external_turn(task_id, {
+            "thread_id": task_id,
+            "turn_id": "dead-turn",
+            "started_at": self.app.now(),
+            "session_id": f"external:{task_id}:dead-turn",
+            "path": "/tmp/codex-partner-missing-rollout.jsonl",
+        })
+        launched = {"id": task_id, "status": "running", "goal_status": "active", "run_mode": "goal_resume"}
+        try:
+            with (
+                mock.patch.object(self.app, "sync_current_goal", new=mock.AsyncMock(return_value="")),
+                mock.patch.object(self.app, "launch", new=mock.AsyncMock(return_value=launched)) as launch,
+                mock.patch.object(self.app, "broadcast_task", new=mock.AsyncMock()),
+                mock.patch.object(self.app, "broadcast_overview", new=mock.AsyncMock()),
+            ):
+                result = asyncio.run(self.app.start_goal(task_id, None))
+            launch.assert_awaited_once_with(task_id, "goal-resume")
+            self.assertNotIn(task_id, self.app.external_turns)
+            self.assertEqual("goal_resume", result["run_mode"])
+        finally:
+            self.app.clear_external_turns(task_id)
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_goal_start_adopts_a_launch_race_and_keeps_goal_resume_pending(self):
+        task_id = f"goal-start-race-{time.time_ns()}"
+        self.make_task(task_id, "stopped")
+        self.app.db.execute("UPDATE tasks SET goal='latest objective',goal_status='paused' WHERE id=?", (task_id,))
+        try:
+            with (
+                mock.patch.object(self.app, "sync_current_goal", new=mock.AsyncMock(return_value="")),
+                mock.patch.object(self.app, "refresh_live_external_turn", new=mock.AsyncMock(return_value=False)),
+                mock.patch.object(self.app, "launch", new=mock.AsyncMock(side_effect=self.app.HTTPException(409, "Task is already running"))),
+                mock.patch.object(self.app, "broadcast_task", new=mock.AsyncMock()),
+                mock.patch.object(self.app, "broadcast_overview", new=mock.AsyncMock()),
+            ):
+                result = asyncio.run(self.app.start_goal(task_id, None))
+            self.assertEqual("active", result["goal_status"])
+            self.assertEqual("goal_resume", result["run_mode"])
+            self.assertEqual("", result["last_error"])
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_manual_turn_completion_honors_goal_start_takeover(self):
+        source = Path(self.app.__file__).read_text(encoding="utf-8")
+        self.assertIn('and goal_task.get("run_mode") == "goal_resume"', source)
+        self.assertIn('launch_after_turn_cleanup(task["id"], "goal-resume"', source)
 
     def test_goal_pause_pauses_goal_and_stops_conversation(self):
         task_id = "atomic-goal-pause"

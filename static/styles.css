@@ -366,6 +366,7 @@ body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56p
 #goal-run-toggle { min-width: 55px; }
 #goal-run-label { font-size: 10px; }
 .goal-button:hover, .goal-button.active { border-color: #8aa968; background: #2a3b2e; color: #d8f0b1; }
+.goal-button:disabled, .goal-button:disabled:hover { border-color: #39453d; background: #1a231e; color: #66756b; cursor: not-allowed; opacity: .72; }
 .goal-button.subtle { border-color: transparent; background: transparent; color: #8fa197; }
 .goal-button.subtle:hover { border-color: #405248; }
 .goal-button.retry strong { color: #9aa9a0; font-size: 10px; }.goal-button.retry.active strong { color: var(--lime); }

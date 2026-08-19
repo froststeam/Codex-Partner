@@ -357,6 +357,7 @@ async function toggleGoalRun() {
   const goal = String(task?.goal || "").trim();
   if (!task || !state.selectedId || !goal) return toast("请先设置 Goal");
   const goalActive = goalIsActive(task);
+  if (goalActive && task.retry_forever) return toast(uiLabel("goalPauseRetryEnabled"));
   try {
     const updated = await api(`/tasks/${state.selectedId}/goal/${goalActive ? "pause" : "start"}`, { method: "POST" });
     state.selectedTask = { ...state.selectedTask, ...updated }; mergeTask(updated); renderConversation();

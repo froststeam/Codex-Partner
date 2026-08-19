@@ -1712,8 +1712,17 @@ async def refresh_native_rollouts() -> None:
 
 async def refresh_live_external_turn(task_id: str) -> bool:
     """Synchronously close the rollout-observer gap before starting a web turn."""
-    if external_turns.get(task_id):
-        return True
+    current = external_turns.get(task_id)
+    if current:
+        tracked = list((external_turn_sets.get(task_id) or {}).values())
+        paths = {str(turn.get("path") or "") for turn in tracked} - {""}
+        for path in paths:
+            if await asyncio.to_thread(native_rollout_writer_pids, path, True):
+                return True
+        if dashboard_owns_task(task_id):
+            clear_external_turns(task_id)
+        else:
+            await settle_inactive_external_turn(task_id, "Codex process ended without a completion event", current)
     task = task_or_404(task_id)
     if task.get("ssh_host"):
         return False
@@ -2864,6 +2873,7 @@ async def supervise_appserver_turn(
     turn_id = ""
     waiter: Optional[asyncio.Future] = None
     goal_revision_at_start: Optional[int] = None
+    resume_goal_after_cleanup = False
     try:
         client = await appserver_for(provider, task)
         key = client.key
@@ -2964,7 +2974,7 @@ async def supervise_appserver_turn(
             external_live = bool(
                 external_candidate
                 and external_candidate.get("path")
-                and await asyncio.to_thread(rollout_is_live, external_candidate["path"])
+                and await asyncio.to_thread(native_rollout_writer_pids, external_candidate["path"], True)
             )
             misclassified = None if external_live else remove_external_turn(task["id"], turn_id)
             if misclassified and misclassified.get("session_id"):
@@ -2996,6 +3006,13 @@ async def supervise_appserver_turn(
         record_provider_outcome(provider, True, "Codex app-server turn completed")
         db.execute("UPDATE sessions SET status='succeeded', finished_at=?, exit_code=0, summary=? WHERE id=?", (now(), "Codex app-server turn completed", session_id))
         external = refresh_external_primary(task["id"])
+        resume_goal_after_cleanup = bool(
+            not external
+            and run_mode != "goal_resume"
+            and goal_task.get("goal")
+            and goal_task.get("goal_status") == "active"
+            and goal_task.get("run_mode") == "goal_resume"
+        )
         if external:
             db.execute(
                 "UPDATE tasks SET status='running',active_session_id=?,execution_source='terminal',execution_turn_id=?,run_mode='terminal',last_error='',updated_at=? WHERE id=?",
@@ -3003,8 +3020,8 @@ async def supervise_appserver_turn(
             )
         else:
             db.execute(
-                "UPDATE tasks SET status='succeeded',active_session_id=NULL,execution_source='',execution_turn_id='',last_error='',updated_at=? WHERE id=?",
-                (now(), task["id"]),
+                "UPDATE tasks SET status=?,active_session_id=NULL,execution_source='',execution_turn_id='',last_error='',updated_at=? WHERE id=?",
+                ("queued" if resume_goal_after_cleanup else "succeeded", now(), task["id"]),
             )
         if message_id:
             db.execute("UPDATE task_messages SET status='sent', finished_at=?, session_id=?, error='' WHERE id=?", (now(), session_id, message_id))
@@ -3153,6 +3170,8 @@ async def supervise_appserver_turn(
         # active and dispatch queued rows as soon as this turn is idle.
         schedule_task_drain(task["id"])
         await close_task_appserver(provider, task, client)
+        if resume_goal_after_cleanup:
+            asyncio.create_task(launch_after_turn_cleanup(task["id"], "goal-resume", "", "", set()))
     await drain_task_messages(task["id"])
 
 
@@ -5068,12 +5087,20 @@ async def start_goal(task_id: str, _: Any = Depends(auth)):
         task = task_or_404(task_id)
         sync_error = await sync_current_goal(task, "active")
         task = task_or_404(task_id)
-    if task_id in running or task_id in appserver_turn_tasks or task.get("status") == "running" or external_turns.get(task_id):
+    external_live = await refresh_live_external_turn(task_id)
+    task = task_or_404(task_id)
+    if task_id in running or task_id in appserver_turn_tasks or task.get("status") == "running" or external_live:
         db.execute("UPDATE tasks SET run_mode='goal_resume',updated_at=? WHERE id=?", (now(), task_id))
         result = task_or_404(task_id)
     else:
         db.execute("UPDATE tasks SET retry_count=0,status='queued',run_mode='goal_resume',updated_at=? WHERE id=?", (now(), task_id))
-        result = await launch(task_id, "goal-resume")
+        try:
+            result = await launch(task_id, "goal-resume")
+        except Exception as exc:
+            if not is_task_busy_error(exc):
+                raise
+            db.execute("UPDATE tasks SET run_mode='goal_resume',last_error='',updated_at=? WHERE id=?", (now(), task_id))
+            result = task_or_404(task_id)
     if sync_error:
         result["goal_sync_error"] = sync_error
     await broadcast_task(task_id, {"type": "task_status", "task": result, "source": {"kind": "goal_start"}})

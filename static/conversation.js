@@ -386,8 +386,13 @@ function renderGoalBar() {
   $("#goal-text").classList.toggle("empty", !goal);
   $("#goal-task-status").textContent = goalStatusSummary(task, goal);
   $("#goal-run-toggle").classList.toggle("active", goalActive);
-  $("#goal-run-toggle").disabled = !goal;
-  $("#goal-run-toggle").title = !goal ? uiLabel("setGoal") : (goalActive ? uiLabel("goalPause") : uiLabel("goalStart"));
+  const goalPauseBlocked = goalActive && Boolean(task.retry_forever);
+  $("#goal-run-toggle").disabled = !goal || goalPauseBlocked;
+  $("#goal-run-toggle").title = !goal
+    ? uiLabel("setGoal")
+    : goalPauseBlocked
+      ? uiLabel("goalPauseRetryEnabled")
+      : (goalActive ? uiLabel("goalPause") : uiLabel("goalStart"));
   $("#goal-run-toggle").setAttribute("aria-label", $("#goal-run-toggle").title);
   $("#goal-run-icon").textContent = goalActive ? "Ⅱ" : "▶";
   $("#goal-run-label").textContent = goalActive ? uiLabel("pause") : uiLabel("start");
