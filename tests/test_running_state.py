@@ -2723,7 +2723,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('disabled title="${esc(uiLabel("protectedSkillDelete"))}"', settings)
         self.assertIn(".panel-item button.danger-text:not(:disabled)", styles)
         self.assertNotIn(".panel-item button:last-child", styles)
-        self.assertIn('/styles.css?v=20260819-map-node-contrast-4', html)
+        self.assertIn('/styles.css?v=20260819-map-node-contrast-5', html)
         self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
         self.assertIn('/settings.js?v=20260817-skill-actions', html)
 
@@ -3539,7 +3539,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260818-fork-feedback', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
-        self.assertIn('/styles.css?v=20260819-map-node-contrast-4', html)
+        self.assertIn('/styles.css?v=20260819-map-node-contrast-5', html)
         self.assertIn('/vendor/katex/katex.min.css', html)
         self.assertIn('<span id="goal-run-label">暂停</span>', html)
         self.assertNotIn('id="goal-run-label" class="sr-only"', html)
@@ -3644,7 +3644,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("if (chatIsNearBottom(stream))", conversation)
         self.assertNotIn("stream.scrollTop = target * state.chatAverageHeight", conversation)
         self.assertIn("function syncPageVisibility", app_js)
-        self.assertIn('/styles.css?v=20260819-map-node-contrast-4', html)
+        self.assertIn('/styles.css?v=20260819-map-node-contrast-5', html)
         self.assertIn('/app.js?v=20260818-fork-feedback', html)
 
     def test_optimistic_queue_messages_survive_authoritative_refresh(self):
