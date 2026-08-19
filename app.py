@@ -630,6 +630,15 @@ activity_graph_backlog: dict[str, list[dict[str, Any]]] = {}
 app_servers: dict[str, "AppServerClient"] = {}
 app_thread_bindings: dict[str, tuple[str, str, str]] = {}
 turn_waiters: dict[str, asyncio.Future] = {}
+goal_sync_locks: dict[str, asyncio.Lock] = {}
+
+
+def goal_sync_lock(task_id: str) -> asyncio.Lock:
+    lock = goal_sync_locks.get(task_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        goal_sync_locks[task_id] = lock
+    return lock
 appserver_turn_tasks: dict[str, asyncio.Task] = {}
 appserver_turn_ids: dict[str, str] = {}
 pending_appserver_requests: dict[str, dict[str, Any]] = {}
@@ -2850,6 +2859,7 @@ async def supervise_appserver_turn(
     thread_id = ""
     turn_id = ""
     waiter: Optional[asyncio.Future] = None
+    goal_revision_at_start: Optional[int] = None
     try:
         client = await appserver_for(provider, task)
         key = client.key
@@ -2902,14 +2912,25 @@ async def supervise_appserver_turn(
         app_thread_bindings[task["id"]] = (key, thread_id, session_id)
         db.execute("UPDATE tasks SET codex_session_id=?,updated_at=? WHERE id=?", (thread_id, now(), task["id"]))
         native_history_cache.pop(task["id"], None)
-        goal_task = task_or_404(task["id"])
-        if goal_task.get("goal"):
-            goal_result = await client.request(
-                "thread/goal/set",
-                {"threadId": thread_id, "objective": goal_task["goal"], "status": goal_status_for_resume(goal_task)},
-            )
-            goal = goal_result.get("goal") or {}
-            db.execute("UPDATE tasks SET goal_status=?, goal_tokens_used=?, updated_at=? WHERE id=?", (goal.get("status", "active"), goal.get("tokensUsed", 0), now(), task["id"]))
+        async with goal_sync_lock(task["id"]):
+            goal_task = task_or_404(task["id"])
+            goal_revision_at_start = int(goal_task.get("goal_revision") or 0)
+            # A manual message must be independent from a durable Goal. Keep
+            # the Goal in our database, but clear the native app-server Goal
+            # for this turn so an old objective cannot hijack the message.
+            manual_turn = mode == "message" and not goal_task.get("retry_forever")
+            if manual_turn and goal_task.get("goal"):
+                await client.request("thread/goal/clear", {"threadId": thread_id})
+                db.execute("UPDATE tasks SET goal_status='paused',updated_at=? WHERE id=?", (now(), task["id"]))
+            elif goal_task.get("goal"):
+                goal_result = await client.request(
+                    "thread/goal/set",
+                    {"threadId": thread_id, "objective": goal_task["goal"], "status": goal_status_for_resume(goal_task)},
+                )
+                goal = goal_result.get("goal") or {}
+                current = task_or_404(task["id"])
+                if int(current.get("goal_revision") or 0) == goal_revision_at_start:
+                    db.execute("UPDATE tasks SET goal_status=?, goal_tokens_used=?, updated_at=? WHERE id=?", (goal.get("status", "active"), goal.get("tokensUsed", 0), now(), task["id"]))
         codex_label = f"ssh {task['ssh_host']} codex" if task.get("ssh_host") else CODEX_BIN
         command = shlex.join([codex_label, "app-server", "thread/resume" if mode != "start" else "thread/start", thread_id, "turn/start"])
         db.execute("UPDATE sessions SET command=?, codex_session_id=? WHERE id=?", (command, thread_id, session_id))
@@ -2956,12 +2977,13 @@ async def supervise_appserver_turn(
         if task_or_404(task["id"])["status"] == "stopped":
             raise asyncio.CancelledError
         goal_task = task_or_404(task["id"])
-        if goal_task.get("goal"):
+        revision_changed = int(goal_task.get("goal_revision") or 0) != int(goal_revision_at_start or 0)
+        if goal_task.get("goal") and mode != "message" and not revision_changed:
             goal_result = await client.request("thread/goal/get", {"threadId": thread_id})
             goal = goal_result.get("goal") or {}
             goal_status = goal.get("status", "active")
             db.execute("UPDATE tasks SET goal_status=?, goal_tokens_used=?, updated_at=? WHERE id=?", (goal_status, goal.get("tokensUsed", 0), now(), task["id"]))
-            if goal_status != "complete":
+            if goal_status != "complete" and not revision_changed:
                 record_provider_outcome(provider, True, "Codex turn completed; Goal continues")
                 raise GoalIncompleteError(f"Codex goal is not complete: {goal_status}")
         record_provider_outcome(provider, True, "Codex app-server turn completed")
@@ -3753,7 +3775,7 @@ def turn_settings(task: dict, provider: Optional[dict], sandbox_policy: dict) ->
     return settings
 
 
-def command_for(task: dict, provider: Optional[dict], resume_id: str = "", prompt_override: str = "") -> list[str]:
+def command_for(task: dict, provider: Optional[dict], resume_id: str = "", prompt_override: str = "", include_goal: bool = True) -> list[str]:
     # Codex has no literal --yolo flag; these are its current equivalent.
     cmd = [CODEX_BIN, "exec"]
     if resume_id:
@@ -3771,7 +3793,7 @@ def command_for(task: dict, provider: Optional[dict], resume_id: str = "", promp
     prompt = prompt_for(task, prompt_override)
     # The legacy CLI fallback has no app-server goal RPC, so preserve the
     # native slash directive only on that transport.
-    if task.get("goal"):
+    if task.get("goal") and include_goal:
         prompt = f"/goal {task['goal']}\n\n{prompt}"
     cmd.append(prompt)
     return cmd
@@ -4918,49 +4940,56 @@ async def patch_context(task_id: str, payload: ContextPatch, _: Any = Depends(au
 
 @app.put("/api/tasks/{task_id}/goal")
 async def patch_goal(task_id: str, payload: GoalPatch, _: Any = Depends(auth)):
-    task = task_or_404(task_id)
-    if payload.status == "paused" and task.get("retry_forever"):
-        raise HTTPException(409, "Turn off Goal auto-resume before pausing the Goal")
-    remote_goal: dict[str, Any] = {}
-    thread_id = latest_codex_session(task)
-    if thread_id and (payload.objective is not None or payload.status is not None):
-        binding = app_thread_bindings.get(task_id)
-        client = app_servers.get(binding[0]) if binding else None
-        if not client:
-            client, _provider = await appserver_for_task(task)
-            await ensure_thread_loaded(task, client)
-        try:
-            if payload.objective is not None and not payload.objective.strip():
-                await client.request("thread/goal/clear", {"threadId": thread_id})
-            else:
-                objective = payload.objective if payload.objective is not None else task.get("goal", "")
-                status = payload.status or ("active" if objective else None)
-                remote_goal = (await client.request(
-                    "thread/goal/set",
-                    {"threadId": thread_id, "objective": objective, "status": status},
-                )).get("goal") or {}
-        except Exception as exc:
-            raise HTTPException(502, f"Codex Goal sync failed: {exc}")
-    updates = {}
-    if payload.objective is not None:
-        updates["goal"] = payload.objective
-        updates["goal_status"] = remote_goal.get("status") or payload.status or ("active" if payload.objective.strip() else "none")
-        updates["goal_tokens_used"] = int(remote_goal.get("tokensUsed", 0) or 0)
-        if payload.objective.strip() and not task.get("retry_explicit"):
-            updates["retry_forever"] = 0
-            updates["retry_explicit"] = 0
-        elif not payload.objective.strip():
-            updates["retry_forever"] = 0
-            updates["retry_explicit"] = 0
-    elif payload.status is not None:
-        updates["goal_status"] = remote_goal.get("status") or payload.status
-    if updates:
-        sets = ",".join(f"{key}=?" for key in updates)
-        stamp = now()
-        revision_update = ",goal_revision=goal_revision+1,goal_updated_at=?" if payload.objective is not None else ""
-        revision_args = (stamp,) if payload.objective is not None else ()
-        db.execute(f"UPDATE tasks SET {sets}{revision_update}, updated_at=? WHERE id=?", tuple(updates.values()) + revision_args + (stamp, task_id))
-    result = task_or_404(task_id)
+    sync_error = ""
+    async with goal_sync_lock(task_id):
+        task = task_or_404(task_id)
+        if payload.status == "paused" and task.get("retry_forever"):
+            raise HTTPException(409, "Turn off Goal auto-resume before pausing the Goal")
+        updates: dict[str, Any] = {}
+        objective = payload.objective if payload.objective is not None else task.get("goal", "")
+        if payload.objective is not None:
+            updates["goal"] = payload.objective
+            updates["goal_status"] = payload.status or ("active" if payload.objective.strip() else "none")
+            updates["goal_tokens_used"] = 0
+            if payload.objective.strip() and not task.get("retry_explicit"):
+                updates["retry_forever"] = 0
+                updates["retry_explicit"] = 0
+            elif not payload.objective.strip():
+                updates["retry_forever"] = 0
+                updates["retry_explicit"] = 0
+        elif payload.status is not None:
+            updates["goal_status"] = payload.status
+        if updates:
+            sets = ",".join(f"{key}=?" for key in updates)
+            stamp = now()
+            revision_update = ",goal_revision=goal_revision+1,goal_updated_at=?" if payload.objective is not None or payload.status is not None else ""
+            revision_args = (stamp,) if payload.objective is not None or payload.status is not None else ()
+            db.execute(f"UPDATE tasks SET {sets}{revision_update}, updated_at=? WHERE id=?", tuple(updates.values()) + revision_args + (stamp, task_id))
+
+        task = task_or_404(task_id)
+        thread_id = latest_codex_session(task)
+        remote_goal: dict[str, Any] = {}
+        if thread_id and (payload.objective is not None or payload.status is not None):
+            binding = app_thread_bindings.get(task_id)
+            client = app_servers.get(binding[0]) if binding else None
+            if not client:
+                client, _provider = await appserver_for_task(task)
+                await ensure_thread_loaded(task, client)
+            try:
+                if not objective.strip():
+                    await client.request("thread/goal/clear", {"threadId": thread_id})
+                else:
+                    remote_goal = (await client.request(
+                        "thread/goal/set",
+                        {"threadId": thread_id, "objective": objective, "status": task.get("goal_status") or "active"},
+                    )).get("goal") or {}
+                if remote_goal:
+                    db.execute("UPDATE tasks SET goal_status=?, goal_tokens_used=?, updated_at=? WHERE id=?", (remote_goal.get("status", task.get("goal_status")), int(remote_goal.get("tokensUsed", 0) or 0), now(), task_id))
+            except Exception as exc:
+                sync_error = f"Codex Goal sync failed: {exc}; local Goal is saved and will retry on next turn"
+        result = task_or_404(task_id)
+        if sync_error:
+            result["goal_sync_error"] = sync_error
     await broadcast_task(task_id, {"type": "task_status", "task": result, "source": {"kind": "goal"}})
     await broadcast_overview(task_id, {"kind": "goal"})
     return result
@@ -5806,7 +5835,8 @@ async def launch(
     resume_id = ""
     if mode in {"resume", "message", "auto-retry"}:
         resume_id = latest_codex_session(task)
-    cmd = command_for(task, provider, resume_id, message)
+    include_goal = not (message_id and not task.get("retry_forever"))
+    cmd = command_for(task, provider, resume_id, message, include_goal=include_goal)
     db.execute("INSERT INTO sessions (id,task_id,status,attempt,provider_id,command,started_at,codex_session_id) VALUES (?,?,?,?,?,?,?,?)", (session_id, task_id, "running", attempt, provider["id"] if provider else None, shlex.join(cmd), now(), resume_id))
     db.execute(
         "UPDATE tasks SET status='running',retry_count=?,active_session_id=?,execution_source='dashboard',execution_turn_id='',run_mode=?,last_error='',updated_at=? WHERE id=?",
@@ -5821,7 +5851,8 @@ async def supervise(task: dict, session_id: str, providers: list[Optional[dict]]
     task_id = task["id"]
     last_error = ""
     for index, provider in enumerate(providers):
-        cmd = initial_cmd if index == 0 else command_for(task, provider, resume_id, prompt_override)
+        include_goal = not (message_id and not task.get("retry_forever"))
+        cmd = initial_cmd if index == 0 else command_for(task, provider, resume_id, prompt_override, include_goal=include_goal)
         db.execute(
             "UPDATE sessions SET provider_id=?,command=? WHERE id=?",
             (provider["id"] if provider else None, shlex.join(cmd), session_id),
@@ -6494,6 +6525,28 @@ async def execute_slash_command(task: dict, command: str, arg_text: str, args: l
         return result_message(command, command_help(args[0] if args else ""))
 
     if command == "goal":
+        # Slash Goal updates share the same serialization boundary as the
+        # REST editor. This prevents a running turn from restoring an older
+        # objective after the command has returned.
+        async with goal_sync_lock(task["id"]):
+            return await execute_goal_slash_command(task, command, arg_text, args, confirmed)
+
+    return await execute_slash_command_unlocked(task, command, arg_text, args, confirmed)
+
+
+async def execute_goal_slash_command(task: dict, command: str, arg_text: str, args: list[str], confirmed: bool = False) -> dict:
+    """Execute Goal slash commands while holding the per-task Goal lock."""
+    # Keep the original command implementation below in one place. The
+    # function is split out so REST edits and slash edits use one lock.
+    return await _execute_slash_command_body(task, command, arg_text, args, confirmed)
+
+
+async def execute_slash_command_unlocked(task: dict, command: str, arg_text: str, args: list[str], confirmed: bool = False) -> dict:
+    return await _execute_slash_command_body(task, command, arg_text, args, confirmed)
+
+
+async def _execute_slash_command_body(task: dict, command: str, arg_text: str, args: list[str], confirmed: bool = False) -> dict:
+    if command == "goal":
         thread_id = latest_codex_session(task)
         client = None
         if thread_id:
@@ -6512,10 +6565,10 @@ async def execute_slash_command(task: dict, command: str, arg_text: str, args: l
                 return result_message(command, "当前线程没有设置 Goal。\n\n用法：`/goal <objective>`")
             return result_message(command, f"**Goal**\n{goal.get('objective')}\n\n状态：`{goal.get('status', 'active')}` · 已用 tokens：{goal.get('tokensUsed', 0)}", goal=goal)
         if first == "clear":
-            if client and thread_id:
-                await client.request("thread/goal/clear", {"threadId": thread_id})
             stamp = now()
             db.execute("UPDATE tasks SET goal='',goal_status='none',goal_tokens_used=0,goal_revision=goal_revision+1,goal_updated_at=?,retry_forever=0,retry_explicit=0,updated_at=? WHERE id=?", (stamp, stamp, task["id"]))
+            if client and thread_id:
+                await client.request("thread/goal/clear", {"threadId": thread_id})
             return result_message(command, "Goal 已清除。")
         if first == "budget":
             if len(args) != 2 or not args[1].isdigit():
@@ -6536,20 +6589,23 @@ async def execute_slash_command(task: dict, command: str, arg_text: str, args: l
             objective = task.get("goal", "")
             if not objective:
                 raise HTTPException(400, "当前线程还没有 Goal")
+            stamp = now()
+            db.execute("UPDATE tasks SET goal_status=?,goal_revision=goal_revision+1,goal_updated_at=?,updated_at=? WHERE id=?", (status, stamp, stamp, task["id"]))
             if client and thread_id:
                 goal = (await client.request("thread/goal/set", {"threadId": thread_id, "objective": objective, "status": status})).get("goal") or {}
                 status = goal.get("status", status)
-            db.execute("UPDATE tasks SET goal_status=?,updated_at=? WHERE id=?", (status, now(), task["id"]))
+                db.execute("UPDATE tasks SET goal_status=?,updated_at=? WHERE id=?", (status, now(), task["id"]))
             return result_message(command, f"Goal 状态已切换为 `{status}`。")
         objective = arg_text.strip()
         if not objective:
             raise HTTPException(400, "用法：/goal <objective>")
         status = "active"
+        stamp = now()
+        db.execute("UPDATE tasks SET goal=?,goal_status=?,goal_tokens_used=0,goal_revision=goal_revision+1,goal_updated_at=?,updated_at=? WHERE id=?", (objective, status, stamp, stamp, task["id"]))
         if client and thread_id:
             goal = (await client.request("thread/goal/set", {"threadId": thread_id, "objective": objective, "status": status})).get("goal") or {}
             status = goal.get("status", status)
-        stamp = now()
-        db.execute("UPDATE tasks SET goal=?,goal_status=?,goal_tokens_used=0,goal_revision=goal_revision+1,goal_updated_at=?,updated_at=? WHERE id=?", (objective, status, stamp, stamp, task["id"]))
+            db.execute("UPDATE tasks SET goal_status=?,updated_at=? WHERE id=?", (status, now(), task["id"]))
         return result_message(command, f"Goal 已设置：\n\n{objective}\n\n状态：`{status}`。", goal={"objective": objective, "status": status})
 
     if command == "status":

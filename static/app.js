@@ -330,14 +330,14 @@ $("#goal-clear").onclick = async () => {
   if (!state.selectedId || !state.selectedTask?.goal || !await appConfirm(uiLabel("clearGoalConfirm"), { danger: true })) return;
   try {
     const task = await api(`/tasks/${state.selectedId}/goal`, { method: "PUT", body: JSON.stringify({ objective: "" }) });
-    state.selectedTask = { ...state.selectedTask, ...task }; mergeTask(task); $("#goal-edit-form").hidden = true; $("#goal-text").hidden = false; renderConversation(); toast("Goal 已清空");
+    state.selectedTask = { ...state.selectedTask, ...task }; mergeTask(task); $("#goal-edit-form").hidden = true; $("#goal-text").hidden = false; renderConversation(); toast(task.goal_sync_error || "Goal 已清空");
   } catch (error) { toast(error.message); }
 };
 $("#goal-edit-form").onsubmit = async event => {
   event.preventDefault(); if (!state.selectedId) return;
   try {
     const task = await api(`/tasks/${state.selectedId}/goal`, { method: "PUT", body: JSON.stringify({ objective: $("#goal-input").value.trim() }) });
-    state.selectedTask = { ...state.selectedTask, ...task }; mergeTask(task); $("#goal-edit-form").hidden = true; $("#goal-text").hidden = false; renderConversation(); toast(task.goal ? "Goal 已更新" : "Goal 已清除");
+    state.selectedTask = { ...state.selectedTask, ...task }; mergeTask(task); $("#goal-edit-form").hidden = true; $("#goal-text").hidden = false; renderConversation(); toast(task.goal_sync_error || (task.goal ? "Goal 已更新" : "Goal 已清除"));
   } catch (error) { toast(error.message); }
 };
 async function changeSelectedRun(action, announce = true) {

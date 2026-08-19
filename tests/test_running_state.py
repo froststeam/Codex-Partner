@@ -1986,6 +1986,27 @@ process.stdout.write(JSON.stringify(browserMessages));
         finally:
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
+    def test_goal_edit_remains_committed_when_native_sync_fails(self):
+        task_id = "goal-sync-failure-thread"
+        self.make_task(task_id, "available")
+
+        class FailingClient:
+            async def request(self, method, params):
+                raise RuntimeError("native writer unavailable")
+
+        try:
+            with (
+                mock.patch.object(self.app, "appserver_for_task", new=mock.AsyncMock(return_value=(FailingClient(), None))),
+                mock.patch.object(self.app, "ensure_thread_loaded", new=mock.AsyncMock()),
+            ):
+                result = asyncio.run(self.app.patch_goal(task_id, self.app.GoalPatch(objective="new durable objective"), None))
+            self.assertEqual("new durable objective", result["goal"])
+            self.assertEqual(1, result["goal_revision"])
+            self.assertIn("local Goal is saved", result["goal_sync_error"])
+            self.assertEqual("new durable objective", self.app.task_or_404(task_id)["goal"])
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
     def test_health_counts_terminal_owned_task(self):
         task_id = "health-terminal-thread"
         self.make_task(task_id, "running")
@@ -3507,6 +3528,14 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertTrue(result["already_installed"])
         create.assert_not_awaited()
 
+
+    def test_legacy_manual_message_does_not_append_persistent_goal(self):
+        task = {"goal": "old exploration objective", "prompt": "", "context": "", "workspace": "/tmp", "yolo": False, "model": "", "reasoning_effort": ""}
+        with_goal = self.app.command_for(task, None, prompt_override="git clone the repository")
+        without_goal = self.app.command_for(task, None, prompt_override="git clone the repository", include_goal=False)
+        self.assertIn("old exploration objective", with_goal[-1])
+        self.assertNotIn("old exploration objective", without_goal[-1])
+        self.assertIn("git clone the repository", without_goal[-1])
 
 if __name__ == "__main__":
     unittest.main()
