@@ -64,37 +64,58 @@ function explorationTitle(node) {
   return node?.kind === "phase" ? title.replace(/^执行阶段[：:]\s*/, "") : title;
 }
 
-function explorationLayout(nodes) {
+function explorationLayout(nodes, graphEdges = []) {
   const ids = new Set(nodes.map(node => node.id));
-  const children = new Map(nodes.map(node => [node.id, []]));
-  const roots = [];
+  const nodeById = new Map(nodes.map(node => [node.id, node]));
+  const parent = new Map(nodes.map(node => [node.id, node.id]));
+  const find = id => {
+    let root = id;
+    while (parent.get(root) !== root) root = parent.get(root);
+    while (parent.get(id) !== id) { const next = parent.get(id); parent.set(id, root); id = next; }
+    return root;
+  };
+  const union = (left, right) => {
+    if (!ids.has(left) || !ids.has(right)) return;
+    const leftRoot = find(left); const rightRoot = find(right);
+    if (leftRoot !== rightRoot) parent.set(rightRoot, leftRoot);
+  };
+  for (const edge of graphEdges) {
+    const source = nodeById.get(edge.sourceId);
+    if (edge.kind !== "branch" || source?.parentId) union(edge.sourceId, edge.targetId);
+  }
   for (const node of nodes) {
-    if (node.parentId && ids.has(node.parentId) && node.parentId !== node.id) children.get(node.parentId).push(node);
-    else roots.push(node);
+    if (["phase", "plan"].includes(node.kind) && ids.has(node.parentId)) union(node.parentId, node.id);
+  }
+  const groups = new Map();
+  nodes.forEach((node, index) => {
+    const root = find(node.id);
+    if (!groups.has(root)) groups.set(root, []);
+    groups.get(root).push(index);
+  });
+  const intervals = [...groups.entries()].map(([id, indices]) => ({ id, start: Math.min(...indices), end: Math.max(...indices) })).sort((left, right) => left.start - right.start);
+  const laneEnds = [];
+  const lanes = new Map();
+  for (const interval of intervals) {
+    let lane = laneEnds.findIndex(end => end < interval.start);
+    if (lane < 0) { lane = laneEnds.length; laneEnds.push(interval.end); }
+    else laneEnds[lane] = interval.end;
+    lanes.set(interval.id, lane);
   }
   const positions = new Map();
-  const visiting = new Set();
-  let nextRow = 0;
-  const place = (node, depth) => {
-    if (positions.has(node.id) || visiting.has(node.id)) return positions.get(node.id)?.row ?? nextRow++;
-    visiting.add(node.id);
-    const branch = children.get(node.id) || [];
-    const rows = branch.map(child => place(child, depth + 1));
-    const row = rows.length ? rows.reduce((sum, value) => sum + value, 0) / rows.length : nextRow++;
-    positions.set(node.id, { depth, row });
-    visiting.delete(node.id);
-    return row;
-  };
-  roots.forEach(root => place(root, 0));
-  nodes.forEach(node => { if (!positions.has(node.id)) place(node, 0); });
+  nodes.forEach((node, index) => positions.set(node.id, {
+    depth: Math.floor(index / 3),
+    row: (lanes.get(find(node.id)) || 0) * 3 + index % 3,
+    lane: lanes.get(find(node.id)) || 0,
+  }));
   const maxRow = Math.max(0, ...[...positions.values()].map(position => position.row));
   const maxDepth = Math.max(0, ...[...positions.values()].map(position => position.depth));
-  return { positions, maxRow, maxDepth, width: Math.max(760, 90 + (maxDepth + 1) * 244), height: Math.max(430, 80 + (maxRow + 1) * 126) };
+  return { positions, laneCount: Math.max(1, laneEnds.length), maxRow, maxDepth, width: Math.max(760, 90 + (maxDepth + 1) * 244), height: Math.max(430, 80 + (maxRow + 1) * 126) };
 }
 
 function applyActivityMapSnapshot(snapshot = {}) {
   state.explorationPrecomputed = true;
   state.explorationNodes = Array.isArray(snapshot.nodes) ? snapshot.nodes : [];
+  state.explorationEdges = Array.isArray(snapshot.edges) ? snapshot.edges : [];
   state.explorationMapStatus = snapshot.status || "pending";
   state.explorationHistoryComplete = snapshot.status === "ready";
   state.explorationLoadedEventCount = Number(snapshot.event_count || 0);
@@ -134,6 +155,15 @@ function explorationEdgePath(parent, child) {
   return `M ${startX} ${startY} H ${junctionX} V ${endY} H ${endX}`;
 }
 
+function explorationRelations(nodeId) {
+  return (state.explorationEdges || []).filter(edge => edge.sourceId === nodeId || edge.targetId === nodeId);
+}
+
+function explorationRelationLabel(kind) {
+  const key = ({ contains: "explorationRelationContains", branch: "explorationRelationBranch", supports: "explorationRelationSupports", related: "explorationRelationRelated", supersedes: "explorationRelationSupersedes", fixed_by: "explorationRelationFixedBy", rollback: "explorationRelationRollback" })[kind];
+  return key ? uiLabel(key) : uiLabel("explorationRelationRelated");
+}
+
 function renderExplorationDetail(node) {
   const detail = $("#exploration-map-detail");
   if (!detail) return;
@@ -146,7 +176,14 @@ function renderExplorationDetail(node) {
   const files = (node.files || []).map(value => `<li><code>${esc(value)}</code></li>`).join("");
   const commands = (node.commands || []).map(value => `<li><code>${esc(value)}</code></li>`).join("");
   const typeLabel = uiLabel(explorationKindKey(node.kind));
-  detail.innerHTML = `<div class="exploration-detail-head"><span class="exploration-node-state ${esc(node.status)}">${meta.symbol} ${esc(meta.label)}</span><small>${esc(typeLabel)}</small></div><h3>${esc(explorationTitle(node))}</h3>${node.summary ? `<p class="exploration-detail-summary">${esc(node.summary)}</p>` : ""}<dl class="exploration-detail-facts"><div><dt>${esc(uiLabel("explorationTime"))}</dt><dd>${node.time ? esc(shortDate(node.time)) : esc(uiLabel("explorationCurrentSession"))}</dd></div><div><dt>${esc(uiLabel("explorationImportance"))}</dt><dd>${Number(node.score) || 0} / 10</dd></div><div><dt>${esc(uiLabel("explorationErrors"))}</dt><dd>${Number(node.failures) || 0}</dd></div></dl>${evidence ? `<section><h4>${esc(uiLabel("explorationEvidence"))}</h4><ul>${evidence}</ul></section>` : ""}${files ? `<section><h4>${esc(uiLabel("explorationFiles"))}</h4><ul>${files}</ul></section>` : ""}${commands ? `<details><summary>${esc(uiLabel("explorationCommands", { count: (node.commands || []).length }))}</summary><ul>${commands}</ul></details>` : ""}<div class="exploration-detail-actions"><button type="button" class="primary" data-exploration-jump="${esc(node.id)}">${esc(uiLabel("explorationJump"))}</button></div>`;
+  const relations = explorationRelations(node.id).map(edge => {
+    const otherId = edge.sourceId === node.id ? edge.targetId : edge.sourceId;
+    const other = explorationNodeById(otherId);
+    if (!other) return "";
+    const direction = edge.sourceId === node.id ? "→" : "←";
+    return `<button type="button" data-exploration-select="${esc(otherId)}"><small>${direction} ${esc(explorationRelationLabel(edge.kind))}</small><span>${esc(explorationTitle(other))}</span></button>`;
+  }).join("");
+  detail.innerHTML = `<div class="exploration-detail-head"><span class="exploration-node-state ${esc(node.status)}">${meta.symbol} ${esc(meta.label)}</span><small>${esc(typeLabel)}</small></div><h3>${esc(explorationTitle(node))}</h3>${node.summary ? `<p class="exploration-detail-summary">${esc(node.summary)}</p>` : ""}<dl class="exploration-detail-facts"><div><dt>${esc(uiLabel("explorationTime"))}</dt><dd>${node.time ? esc(shortDate(node.time)) : esc(uiLabel("explorationCurrentSession"))}</dd></div><div><dt>${esc(uiLabel("explorationImportance"))}</dt><dd>${Number(node.score) || 0} / 10</dd></div><div><dt>${esc(uiLabel("explorationErrors"))}</dt><dd>${Number(node.failures) || 0}</dd></div></dl>${relations ? `<section class="exploration-relations"><h4>${esc(uiLabel("explorationRelations"))}</h4><div>${relations}</div></section>` : ""}${evidence ? `<section><h4>${esc(uiLabel("explorationEvidence"))}</h4><ul>${evidence}</ul></section>` : ""}${files ? `<section><h4>${esc(uiLabel("explorationFiles"))}</h4><ul>${files}</ul></section>` : ""}${commands ? `<details><summary>${esc(uiLabel("explorationCommands", { count: (node.commands || []).length }))}</summary><ul>${commands}</ul></details>` : ""}<div class="exploration-detail-actions"><button type="button" class="primary" data-exploration-jump="${esc(node.id)}">${esc(uiLabel("explorationJump"))}</button></div>`;
 }
 
 function revealExplorationNode(id, smooth = false) {
@@ -232,7 +269,7 @@ function renderExplorationMap(options = {}) {
     return;
   }
 
-  const layout = explorationLayout(nodes);
+  const layout = explorationLayout(nodes, state.explorationEdges || []);
   const viewport = $("#exploration-map-viewport");
   const viewportHeight = viewport?.clientHeight || 0;
   const viewportWidth = viewport?.clientWidth || 0;
@@ -245,11 +282,18 @@ function renderExplorationMap(options = {}) {
     const position = layout.positions.get(node.id);
     coordinates.set(node.id, { x: horizontalOffset + position.depth * 244, y: verticalOffset + position.row * 126 });
   }
-  const edges = nodes.map(node => {
-    const parent = coordinates.get(node.parentId);
-    const child = coordinates.get(node.id);
+  const selectedRelations = new Set(explorationRelations(state.explorationSelectedNodeId).map(edge => edge.id));
+  const connectedIds = new Set([state.explorationSelectedNodeId]);
+  for (const edge of explorationRelations(state.explorationSelectedNodeId)) { connectedIds.add(edge.sourceId); connectedIds.add(edge.targetId); }
+  const graphEdges = state.explorationEdges?.length ? state.explorationEdges : nodes.filter(node => node.parentId).map(node => ({ id: `parent-${node.id}`, sourceId: node.parentId, targetId: node.id, kind: "branch" }));
+  const edges = graphEdges.map(edge => {
+    const parent = coordinates.get(edge.sourceId);
+    const child = coordinates.get(edge.targetId);
     if (!parent || !child) return "";
-    return `<path class="exploration-edge kind-${esc(node.kind)} ${esc(node.status)}" d="${explorationEdgePath(parent, child)}" />`;
+    const related = ["related", "supersedes", "fixed_by"].includes(edge.kind);
+    const path = related ? `M ${parent.x + 97} ${parent.y + 43} C ${parent.x + 150} ${parent.y - 48}, ${child.x + 44} ${child.y + 134}, ${child.x + 97} ${child.y + 43}` : explorationEdgePath(parent, child);
+    const focus = selectedRelations.has(edge.id) ? " focused" : state.explorationSelectedNodeId ? " muted" : "";
+    return `<path class="exploration-edge relation-${esc(edge.kind)}${focus}" d="${path}" />`;
   }).join("");
   const cards = nodes.map((node, index) => {
     const point = coordinates.get(node.id);
@@ -258,11 +302,13 @@ function renderExplorationMap(options = {}) {
     const time = node.time ? `<span class="exploration-node-time" style="left:${point.x}px;top:${Math.max(8, point.y - 22)}px">${esc(shortDate(node.time))}</span>` : "";
     const kindLabel = uiLabel(explorationKindKey(node.kind));
     const fileCount = node.files?.length ? ` · ${node.files.length} ${uiLabel("explorationFiles")}` : "";
-    return `${time}<button type="button" class="exploration-node kind-${esc(node.kind)} ${esc(node.status)}${selected ? " selected" : ""}" style="left:${point.x}px;top:${point.y}px" data-exploration-node="${esc(node.id)}" aria-pressed="${selected}"><span class="exploration-node-index">${String(index + 1).padStart(2, "0")}</span><span class="exploration-node-copy"><strong>${esc(explorationTitle(node))}</strong><small><b>${esc(kindLabel)}</b> · ${meta.symbol} ${esc(meta.label)}${esc(fileCount)}</small></span></button>`;
+    const relationClass = state.explorationSelectedNodeId && !connectedIds.has(node.id) ? " dimmed" : connectedIds.has(node.id) && !selected ? " connected" : "";
+    return `${time}<button type="button" class="exploration-node kind-${esc(node.kind)} ${esc(node.status)}${selected ? " selected" : ""}${relationClass}" style="left:${point.x}px;top:${point.y}px" data-exploration-node="${esc(node.id)}" aria-pressed="${selected}"><span class="exploration-node-index"><i></i><b>${String(index + 1).padStart(2, "0")}</b></span><span class="exploration-node-copy"><strong>${esc(explorationTitle(node))}</strong><small><b>${esc(kindLabel)}</b> · ${meta.symbol} ${esc(meta.label)}${esc(fileCount)}</small></span></button>`;
   }).join("");
   canvas.style.width = `${layout.width * explorationZoom}px`;
   canvas.style.height = `${layout.height * explorationZoom}px`;
-  canvas.innerHTML = `<div class="exploration-map-world" data-width="${layout.width}" data-height="${layout.height}" style="width:${layout.width}px;height:${layout.height}px;transform:scale(${explorationZoom})"><svg class="exploration-edges" width="${layout.width}" height="${layout.height}" aria-hidden="true">${edges}</svg>${cards}</div>`;
+  const lanes = Array.from({ length: layout.laneCount }, (_, lane) => `<i class="exploration-galaxy-lane" style="top:${verticalOffset + lane * 378 - 32}px;width:${layout.width - horizontalOffset * 2}px;left:${horizontalOffset}px"></i>`).join("");
+  canvas.innerHTML = `<div class="exploration-map-world" data-width="${layout.width}" data-height="${layout.height}" style="width:${layout.width}px;height:${layout.height}px;transform:scale(${explorationZoom})">${lanes}<svg class="exploration-edges" width="${layout.width}" height="${layout.height}" aria-hidden="true">${edges}</svg>${cards}</div>`;
   const zoomLabel = $("#exploration-zoom-reset");
   if (zoomLabel) zoomLabel.textContent = `${Math.round(explorationZoom * 100)}%`;
 
@@ -377,6 +423,13 @@ $("#exploration-map-canvas")?.addEventListener("click", event => {
   renderExplorationMap();
 });
 $("#exploration-map-detail")?.addEventListener("click", event => {
+  const select = event.target.closest("[data-exploration-select]");
+  if (select) {
+    state.explorationSelectedNodeId = select.dataset.explorationSelect;
+    $("#exploration-follow-current").checked = false;
+    renderExplorationMap({ reveal: true });
+    return;
+  }
   const button = event.target.closest("[data-exploration-jump]");
   if (button) jumpToExplorationNode(button.dataset.explorationJump);
 });

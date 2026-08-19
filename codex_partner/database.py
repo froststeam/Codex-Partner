@@ -106,6 +106,11 @@ class Database:
                   source_event_id TEXT DEFAULT '', event_time TEXT DEFAULT '',
                   PRIMARY KEY(task_id,node_id), FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS activity_edges (
+                  task_id TEXT NOT NULL, edge_id TEXT NOT NULL, source_id TEXT NOT NULL, target_id TEXT NOT NULL,
+                  kind TEXT NOT NULL, label TEXT DEFAULT '', score REAL NOT NULL DEFAULT 0,
+                  PRIMARY KEY(task_id,edge_id), FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+                );
                 CREATE TABLE IF NOT EXISTS activity_graph_seen (
                   task_id TEXT NOT NULL, event_key TEXT NOT NULL,
                   PRIMARY KEY(task_id,event_key), FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
@@ -120,6 +125,8 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_events_stream_id_session ON events(stream, id DESC, session_id);
                 CREATE INDEX IF NOT EXISTS idx_task_messages_task_status ON task_messages(task_id, status, created_at);
                 CREATE INDEX IF NOT EXISTS idx_activity_nodes_task_sequence ON activity_nodes(task_id, sequence);
+                CREATE INDEX IF NOT EXISTS idx_activity_edges_task_source ON activity_edges(task_id, source_id);
+                CREATE INDEX IF NOT EXISTS idx_activity_edges_task_target ON activity_edges(task_id, target_id);
                 """
             )
             self._migrate(connection)

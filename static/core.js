@@ -3,7 +3,7 @@ const DEFAULT_USER_AVATAR = "/default-user-avatar.webp?v=20260818";
 const state = {
   tasks: [], sessions: [], skills: [], providers: [], memories: [], generatedMemories: [], commands: [], sshHosts: [], sshConfig: "", activeSSHHost: localStorage.getItem("codex-dashboard-ssh-host") || "",
   selectedId: null, selectedTask: null, selectedEvents: [], selectedMessages: [], pendingApprovals: [], sessionRequestId: 0, sessionAbortController: null, workspacePath: "", workspaceFile: null, workspaceRequestId: 0, workspacePickerPath: "", workspaceUploading: false, inspectorClosed: false, filter: "all", query: "",
-  historyCursor: "", historyHasMore: false, historyLoading: false, chatBlocks: [], chatVirtualStart: null, chatAverageHeight: 112, activityVisibleCounts: {}, activityOutputOpen: {}, explorationNodes: [], explorationEvents: [], explorationOpen: false, explorationSelectedNodeId: "", explorationLoading: false, explorationHistoryComplete: false, explorationLoadedEventCount: 0, explorationLoadError: "", explorationRequestId: 0, explorationRevision: 0, explorationNeedsSync: false, explorationPrecomputed: false, explorationMapStatus: "pending", explorationProcessedEvents: 0,
+  historyCursor: "", historyHasMore: false, historyLoading: false, chatBlocks: [], chatVirtualStart: null, chatAverageHeight: 112, activityVisibleCounts: {}, activityOutputOpen: {}, explorationNodes: [], explorationEdges: [], explorationEvents: [], explorationOpen: false, explorationSelectedNodeId: "", explorationLoading: false, explorationHistoryComplete: false, explorationLoadedEventCount: 0, explorationLoadError: "", explorationRequestId: 0, explorationRevision: 0, explorationNeedsSync: false, explorationPrecomputed: false, explorationMapStatus: "pending", explorationProcessedEvents: 0,
   commandIndex: 0, rawActivity: true, composerHistory: [], historyIndex: -1, editingQueuedId: null, defaultWorkspace: "", codexAvailable: true, codexInstall: null, codexInfo: null,
   runtimeMetrics: { taskId: "", ttftMs: null, tpotMs: null, estimated: true, outputTokens: 0 }, serverInfo: { user: "", hostname: "" }, chatSnapToBottom: false, chatSelectionActive: false, chatPointerSelecting: false, chatPointerDragged: false, chatPointerStartX: 0, chatPointerStartY: 0, userAvatar: localStorage.getItem("codex-dashboard-user-avatar") || DEFAULT_USER_AVATAR,
 };
@@ -146,6 +146,14 @@ const UI_LABELS = {
   explorationImportance: { zh: "关键度", en: "Importance", fr: "Importance", ja: "重要度", ko: "중요도" },
   explorationErrors: { zh: "执行异常", en: "Execution errors", fr: "Erreurs d’exécution", ja: "実行エラー", ko: "실행 오류" },
   explorationEvidence: { zh: "方向证据", en: "Evidence", fr: "Éléments probants", ja: "方向の根拠", ko: "방향 근거" },
+  explorationRelations: { zh: "知识关系", en: "Knowledge relations", fr: "Relations de connaissance", ja: "知識関係", ko: "지식 관계" },
+  explorationRelationContains: { zh: "包含", en: "Contains", fr: "Contient", ja: "包含", ko: "포함" },
+  explorationRelationBranch: { zh: "发展方向", en: "Branch", fr: "Branche", ja: "発展方向", ko: "발전 방향" },
+  explorationRelationSupports: { zh: "形成结论", en: "Supports", fr: "Soutient", ja: "結論を形成", ko: "결론 형성" },
+  explorationRelationRelated: { zh: "语义关联", en: "Related", fr: "Lié", ja: "意味的関連", ko: "의미 연관" },
+  explorationRelationSupersedes: { zh: "替代", en: "Supersedes", fr: "Remplace", ja: "置換", ko: "대체" },
+  explorationRelationFixedBy: { zh: "后续修复", en: "Fixed by", fr: "Corrigé par", ja: "後続修正", ko: "후속 수정" },
+  explorationRelationRollback: { zh: "回退", en: "Rollback", fr: "Retour", ja: "ロールバック", ko: "롤백" },
   explorationFiles: { zh: "相关文件", en: "Related files", fr: "Fichiers associés", ja: "関連ファイル", ko: "관련 파일" },
   explorationCommands: { zh: "核心命令 · {{count}}", en: "Key commands · {{count}}", fr: "Commandes clés · {{count}}", ja: "主要コマンド · {{count}}", ko: "핵심 명령 · {{count}}" },
   explorationJump: { zh: "在对话中查看", en: "View in conversation", fr: "Voir dans la conversation", ja: "会話で表示", ko: "대화에서 보기" },

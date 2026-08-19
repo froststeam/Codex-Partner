@@ -57,7 +57,7 @@ except ImportError:  # Installed through the Windows-only pywinpty dependency.
 from PIL import Image, ImageOps, ImageSequence, UnidentifiedImageError
 
 from codex_partner import APP_NAME, APP_VERSION
-from codex_partner.activity_graph import ActivityGraphStore, PROJECTION_VERSION, project_events, semantic_event
+from codex_partner.activity_graph import ActivityGraphStore, PROJECTION_VERSION, project_events, recall_context, semantic_event
 from codex_partner.commands import SLASH_ALIASES, SLASH_COMMAND_BY_NAME, SLASH_COMMANDS, parse_slash_command
 from codex_partner.database import Database
 from codex_partner.app_server import AppServerClient
@@ -3670,6 +3670,11 @@ def appserver_turn_inputs(task: dict, message: str) -> list[dict[str, Any]]:
     clean_message = LEGACY_FILE_MARKER.sub(lambda match: collect(match, True), clean_message)
     inputs: list[dict[str, Any]] = []
     prompt = prompt_for(task, clean_message.strip())
+    if prompt and task.get("id") and task.get("memory_mode", "enabled") != "disabled":
+        snapshot = activity_graph_store.snapshot(task["id"])
+        memory = recall_context(clean_message, snapshot, task.get("goal", ""))
+        if memory:
+            prompt = f"{prompt}\n\n{memory}"
     if prompt:
         inputs.append({"type": "text", "text": prompt})
     seen: set[tuple[str, str]] = set()
@@ -3706,6 +3711,13 @@ def goal_status_for_resume(task: dict) -> str:
     if task.get("retry_forever") and status not in GOAL_TERMINAL_STATUSES:
         return "active"
     return "active" if status == "none" else status
+
+
+def goal_status_for_turn(task: dict, run_mode: str) -> str:
+    """Manual messages do not reactivate a durable Goal unless auto-resume owns the turn."""
+    if run_mode == "message" and not task.get("retry_forever"):
+        return "paused"
+    return goal_status_for_resume(task)
 
 
 def goal_auto_resume_enabled(task: dict) -> bool:

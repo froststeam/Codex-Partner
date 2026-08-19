@@ -72,7 +72,7 @@ async function syncQueuedMessages() {
     queueSyncInFlight = false;
   }
 }
-function showEmptyConversation() { if (terminalTaskId) destroyTerminal(); stopQueueSync(); state.sessionAbortController?.abort(); state.sessionAbortController = null; state.editingQueuedId = null; state.pendingApprovals = []; state.inspectorClosed = true; state.explorationNodes = []; state.explorationEvents = []; state.explorationPrecomputed = false; state.explorationRequestId += 1; if (typeof closeExplorationMap === "function") closeExplorationMap(); $("#empty-conversation").hidden = false; $("#conversation-view").hidden = true; $("#goal-bar").hidden = true; $("#queued-messages").hidden = true; $("#approval-center").hidden = true; setInspectorOpen(false); }
+function showEmptyConversation() { if (terminalTaskId) destroyTerminal(); stopQueueSync(); state.sessionAbortController?.abort(); state.sessionAbortController = null; state.editingQueuedId = null; state.pendingApprovals = []; state.inspectorClosed = true; state.explorationNodes = []; state.explorationEdges = []; state.explorationEvents = []; state.explorationPrecomputed = false; state.explorationRequestId += 1; if (typeof closeExplorationMap === "function") closeExplorationMap(); $("#empty-conversation").hidden = false; $("#conversation-view").hidden = true; $("#goal-bar").hidden = true; $("#queued-messages").hidden = true; $("#approval-center").hidden = true; setInspectorOpen(false); }
 function resetWorkspaceBrowser() {
   state.workspacePath = "";
   state.workspaceFile = null;
@@ -100,7 +100,7 @@ async function selectSession(id, openSocket = true) {
   const wasEmpty = $("#conversation-view").hidden;
   if (state.selectedId !== id) {
     resetWorkspaceBrowser(); state.titleExpanded = false; state.historyCursor = ""; state.historyHasMore = false;
-    state.historyLoading = false; state.chatBlocks = []; state.chatVirtualStart = null; state.activityVisibleCounts = {}; state.activityOutputOpen = {}; state.explorationNodes = []; state.explorationEvents = []; state.explorationSelectedNodeId = ""; state.explorationLoading = false; state.explorationHistoryComplete = false; state.explorationLoadedEventCount = 0; state.explorationLoadError = ""; state.explorationRequestId += 1; state.explorationRevision = 0; state.explorationNeedsSync = false; state.explorationPrecomputed = false; state.explorationMapStatus = "pending"; state.explorationProcessedEvents = 0; state.pendingApprovals = [];
+    state.historyLoading = false; state.chatBlocks = []; state.chatVirtualStart = null; state.activityVisibleCounts = {}; state.activityOutputOpen = {}; state.explorationNodes = []; state.explorationEdges = []; state.explorationEvents = []; state.explorationSelectedNodeId = ""; state.explorationLoading = false; state.explorationHistoryComplete = false; state.explorationLoadedEventCount = 0; state.explorationLoadError = ""; state.explorationRequestId += 1; state.explorationRevision = 0; state.explorationNeedsSync = false; state.explorationPrecomputed = false; state.explorationMapStatus = "pending"; state.explorationProcessedEvents = 0; state.pendingApprovals = [];
     state.selectedEvents = []; state.selectedMessages = []; state.composerHistory = []; state.historyIndex = -1;
     if (typeof renderExplorationMap === "function") renderExplorationMap();
     state.runtimeMetrics = { taskId: "", ttftMs: null, tpotMs: null, estimated: true, outputTokens: 0 };
@@ -1372,6 +1372,7 @@ function connectSocket(id, reconnect = false) {
       for (const node of data.upsert_nodes || []) nodes.set(node.id, node);
       for (const nodeId of data.remove_node_ids || []) nodes.delete(nodeId);
       state.explorationNodes = [...nodes.values()].sort((left, right) => Number(left.sequence || 0) - Number(right.sequence || 0));
+      if (Array.isArray(data.edges)) state.explorationEdges = data.edges;
       state.explorationRevision = Number(data.revision || state.explorationRevision);
       state.explorationMapStatus = "ready";
       renderExplorationMap({ liveUpdate: true });

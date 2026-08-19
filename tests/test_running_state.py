@@ -666,6 +666,15 @@ class RunningStateTests(unittest.TestCase):
             self.assertFalse(self.app.task_retry_allowed(task, 0))
             self.assertEqual(status, self.app.goal_status_for_resume(task))
 
+    def test_manual_message_pauses_goal_when_auto_resume_is_off(self):
+        task = {"goal": "build the activity galaxy", "goal_status": "active", "retry_forever": 0}
+        self.assertEqual("paused", self.app.goal_status_for_turn(task, "message"))
+        self.assertEqual("active", self.app.goal_status_for_turn(task, "goal_resume"))
+
+    def test_manual_message_keeps_goal_active_when_auto_resume_is_on(self):
+        task = {"goal": "build the activity galaxy", "goal_status": "paused", "retry_forever": 1}
+        self.assertEqual("active", self.app.goal_status_for_turn(task, "message"))
+
     def test_goal_cannot_be_paused_before_auto_resume_is_disabled(self):
         task_id = f"goal-pause-order-{time.time_ns()}"
         self.make_task(task_id, "available")
@@ -1355,6 +1364,8 @@ process.stdout.write(JSON.stringify(posts));
         self.assertNotIn("timeline?limit=500", tree)
         self.assertIn("activity_map_patch", conversation)
         self.assertIn("applyActivityMapSnapshot(activityMap)", conversation)
+        self.assertIn("function explorationLayout(nodes, graphEdges = [])", tree)
+        self.assertIn("exploration-galaxy-lane", tree)
 
     def test_activity_graph_plans_form_semantic_branches(self):
         from codex_partner.activity_graph import project_events
@@ -1389,7 +1400,7 @@ process.stdout.write(JSON.stringify(posts));
         self.assertEqual(2, len(children[second_phase["id"]]))
 
     def test_activity_graph_reconnects_related_topics_instead_of_flattening_time(self):
-        from codex_partner.activity_graph import project_events
+        from codex_partner.activity_graph import project_edges, project_events
 
         def user(event_id, text):
             return {"id": event_id, "ts": event_id, "stream": "native", "payload": {
@@ -1407,6 +1418,44 @@ process.stdout.write(JSON.stringify(posts));
         self.assertEqual(first["id"], pagination["parentId"])
         self.assertEqual(first["id"], musa["parentId"])
         self.assertEqual(pagination["id"], pagination_return["parentId"])
+        edges = project_edges(nodes)
+        relation = next(edge for edge in edges if edge["targetId"] == pagination_return["id"] and edge["kind"] == "related")
+        self.assertEqual(first["id"], relation["sourceId"])
+
+    def test_activity_graph_persists_typed_edges(self):
+        from codex_partner.activity_graph import project_edges, project_events
+
+        task_id = f"activity-edges-{time.time_ns()}"
+        self.make_task(task_id)
+        events = [
+            {"id": "u1", "ts": 1, "stream": "native", "payload": {"type": "userMessage", "text": "帮我实现知识图谱活动地图", "item_id": "u1", "turn_id": "t1"}},
+            {"id": "p1", "ts": 2, "stream": "native", "payload": {"type": "plan", "turn_id": "t1", "plan": [{"step": "实现多关系边", "status": "in_progress"}]}},
+        ]
+        nodes, seen = project_events(events, task_running=True, task_status="running")
+        expected = project_edges(nodes)
+        self.app.activity_graph_store.mark_building(task_id, self.app.now())
+        self.app.activity_graph_store.replace(task_id, nodes, seen, len(events), self.app.now())
+        snapshot = self.app.activity_graph_store.snapshot(task_id)
+        self.assertEqual(expected, snapshot["edges"])
+        self.assertIn("contains", {edge["kind"] for edge in snapshot["edges"]})
+
+    def test_activity_graph_recall_is_hidden_and_query_relevant(self):
+        from codex_partner.activity_graph import recall_context
+
+        snapshot = {"nodes": [
+            {"id": "map", "kind": "decision", "status": "completed", "title": "使用多关系知识图谱", "summary": "地图支持语义边", "score": 9, "files": ["static/exploration-tree.js"]},
+            {"id": "gpu", "kind": "direction", "status": "completed", "title": "分析 MUSA kernel spill", "summary": "检查寄存器", "score": 8},
+        ], "edges": []}
+        context = recall_context("继续实现探索地图关系", snapshot, "构建星系地图")
+        self.assertIn('<memory_context source="codex-partner-activity-graph">', context)
+        self.assertIn("使用多关系知识图谱", context)
+        self.assertNotIn("分析 MUSA kernel spill", context)
+
+        task = {"id": "recall-task", "prompt": "", "context": "", "goal": "构建星系地图", "memory_mode": "enabled"}
+        with mock.patch.object(self.app.activity_graph_store, "snapshot", return_value=snapshot):
+            inputs = self.app.appserver_turn_inputs(task, "继续实现探索地图关系")
+        self.assertIn("继续实现探索地图关系", inputs[0]["text"])
+        self.assertIn("<memory_context", inputs[0]["text"])
 
     def test_activity_history_expands_independently_from_message_history(self):
         static = Path(__file__).resolve().parents[1] / "static"
