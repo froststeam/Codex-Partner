@@ -5236,17 +5236,34 @@ def history_event_key(event: dict) -> tuple[str, str]:
     return stamp, str(event.get("id") or "")
 
 
+TIMELINE_SEMANTIC_TYPES = {
+    "usermessage", "browsermessage", "agentmessage", "reasoning", "commandexecution",
+    "mcptoolcall", "filechange", "websearch", "contextcompaction",
+}
+
+
+def semantic_timeline_rows(rows: list[dict], limit: int = 0) -> list[dict]:
+    result = []
+    for event in rows:
+        if event.get("stream") in {"system", "rollout"}:
+            result.append(event)
+        elif event.get("stream") == "app-server":
+            try:
+                payload = event.get("payload") if isinstance(event.get("payload"), dict) else json.loads(event.get("payload") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if str((payload or {}).get("type") or "").lower() in TIMELINE_SEMANTIC_TYPES:
+                result.append(event)
+        if limit and len(result) >= limit:
+            break
+    return result
+
+
 async def native_timeline_events(task: dict) -> tuple[list[dict], list[dict]]:
     """Merge one cached native snapshot with small live/persisted overlays."""
     native_events = list(await native_history_events(task))
-    persisted = db.all(
-        "SELECT * FROM (SELECT * FROM events WHERE task_id=? AND ("
-        "stream IN ('system','rollout') OR (stream='app-server' AND "
-        "lower(json_extract(payload,'$.type')) IN ('usermessage','browsermessage','agentmessage','reasoning','commandexecution','mcptoolcall','filechange','websearch','contextcompaction'))) "
-        "ORDER BY id DESC LIMIT 5000) "
-        "ORDER BY ts,id",
-        (task["id"],),
-    )
+    recent_persisted = db.all("SELECT * FROM events WHERE task_id=? ORDER BY id DESC LIMIT 5000", (task["id"],))
+    persisted = list(reversed(semantic_timeline_rows(recent_persisted)))
     metric_version_row = db.one(
         "SELECT id FROM events WHERE task_id=? AND stream='app-server' ORDER BY id DESC LIMIT 1",
         (task["id"],),
@@ -5424,12 +5441,11 @@ async def task_timeline(task_id: str, before: str = "", limit: int = 160, fast: 
     cursor = decode_history_cursor(before)
     if task.get("native"):
         if fast and not before:
-            rows = db.all(
-                "SELECT * FROM events WHERE task_id=? AND (stream IN ('system','rollout') OR (stream='app-server' AND "
-                "lower(json_extract(payload,'$.type')) IN ('usermessage','browsermessage','agentmessage','reasoning','commandexecution','mcptoolcall','filechange','websearch','contextcompaction'))) "
-                "ORDER BY id DESC LIMIT ?",
-                (task_id, limit),
+            candidates = db.all(
+                "SELECT * FROM events WHERE task_id=? ORDER BY id DESC LIMIT ?",
+                (task_id, min(5000, max(800, limit * 16))),
             )
+            rows = semantic_timeline_rows(candidates, limit)
             return {"items": list(reversed(rows)), "next_cursor": "", "has_more": True, "metrics": [], "fast": True}
         events, metrics = await native_timeline_events(task)
         if cursor:
