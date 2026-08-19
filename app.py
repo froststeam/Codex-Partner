@@ -4436,25 +4436,24 @@ async def ensure_thread_loaded(task: dict, client: AppServerClient, provider: Op
     thread_id = latest_codex_session(task)
     if not thread_id:
         return ""
-    try:
-        await client.request("thread/read", {"threadId": thread_id, "includeTurns": False})
-        return thread_id
-    except RuntimeError:
-        approval = "never" if task.get("yolo") else "on-request"
-        params: dict[str, Any] = {"threadId": thread_id, "cwd": task["workspace"], "approvalPolicy": approval, "excludeTurns": True}
-        if task.get("permission_profile"):
-            params["permissions"] = task["permission_profile"]
-        else:
-            params["sandbox"] = "danger-full-access" if task.get("yolo") else "workspace-write"
-        model = task.get("model") or (provider or {}).get("model")
-        if model:
-            params["model"] = model
-        if (provider or {}).get("model_provider"):
-            params["modelProvider"] = provider["model_provider"]
-        if task.get("personality"):
-            params["personality"] = task["personality"]
-        await client.request("thread/resume", params)
-        return thread_id
+    # thread/read can return a rollout stored on disk without loading it into
+    # this app-server process. Operations such as compact and fork require a
+    # loaded thread, so resume it even when thread/read would succeed.
+    approval = "never" if task.get("yolo") else "on-request"
+    params: dict[str, Any] = {"threadId": thread_id, "cwd": task["workspace"], "approvalPolicy": approval, "excludeTurns": True}
+    if task.get("permission_profile"):
+        params["permissions"] = task["permission_profile"]
+    else:
+        params["sandbox"] = "danger-full-access" if task.get("yolo") else "workspace-write"
+    model = task.get("model") or (provider or {}).get("model")
+    if model:
+        params["model"] = model
+    if (provider or {}).get("model_provider"):
+        params["modelProvider"] = provider["model_provider"]
+    if task.get("personality"):
+        params["personality"] = task["personality"]
+    await client.request("thread/resume", params)
+    return thread_id
 
 
 def task_is_running(task: dict) -> bool:
@@ -6450,7 +6449,7 @@ CODEX_OPERATIONS = {
 THREAD_RPC_OPERATIONS = {"archive", "unarchive", "delete", "fork", "rename", "compact", "memory-enable", "memory-disable"}
 
 
-async def run_thread_operation(task: dict, payload: OperationIn) -> dict:
+async def _run_thread_operation(task: dict, payload: OperationIn) -> dict:
     thread_id = latest_codex_session(task)
     operation = payload.operation
     if payload.operation == "delete":
@@ -6559,6 +6558,25 @@ async def run_thread_operation(task: dict, payload: OperationIn) -> dict:
         forked_task = task_or_404(fork_task_id)
         await broadcast_overview(fork_task_id, {"type": "created", "forked": True})
     return {"ok": True, "operation": operation, "thread_id": thread_id, "fork_thread_id": fork_id, "task": forked_task}
+
+
+async def run_thread_operation(task: dict, payload: OperationIn) -> dict:
+    """Run a thread RPC without leaving a temporary app-server writer behind."""
+    provider = db.one("SELECT * FROM providers WHERE id=?", (task.get("provider_id"),)) if task.get("provider_id") else None
+    key = appserver_key(provider, task)
+    active_turn_client = task["id"] in appserver_turn_tasks or task["id"] in running
+    try:
+        return await _run_thread_operation(task, payload)
+    finally:
+        client = app_servers.get(key)
+        if client and not active_turn_client:
+            thread_id = latest_codex_session(task)
+            if thread_id:
+                try:
+                    await asyncio.wait_for(client.request("thread/unsubscribe", {"threadId": thread_id}), timeout=3)
+                except Exception:
+                    pass
+            await close_task_appserver(provider, task, client)
 
 
 def create_command_task(source: dict, prompt: str, status: str = "queued") -> dict:

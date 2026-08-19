@@ -2468,7 +2468,7 @@ process.stdout.write(JSON.stringify(browserMessages));
 
         class FakeClient:
             async def request(self, method, _params):
-                if method == "thread/read":
+                if method == "thread/resume":
                     return {"thread": {"id": "remote-thread"}}
                 if method == "thread/fork":
                     return {"thread": {"id": "remote-forked-thread"}}
@@ -2487,6 +2487,52 @@ process.stdout.write(JSON.stringify(browserMessages));
             self.app.db.execute("DELETE FROM tasks WHERE id IN (?,?)", (task_id, forked["id"]))
 
         asyncio.run(exercise())
+
+    def test_thread_operation_resumes_rollout_before_compacting(self):
+        task_id = "compact-unloaded-thread"
+        self.make_task(task_id, "available")
+        self.app.db.execute(
+            "UPDATE tasks SET codex_session_id=? WHERE id=?",
+            (task_id, task_id),
+        )
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+                self.closed = False
+
+            async def request(self, method, params):
+                self.calls.append((method, params))
+                if method == "thread/resume":
+                    return {"thread": {"id": task_id}}
+                if method == "thread/compact/start":
+                    return {"ok": True}
+                if method == "thread/unsubscribe":
+                    return {"status": "unsubscribed"}
+                raise AssertionError(method)
+
+            async def close(self):
+                self.closed = True
+
+        async def exercise():
+            client = FakeClient()
+            task = self.app.task_or_404(task_id)
+            key = self.app.appserver_key(None, task)
+            self.app.app_servers[key] = client
+            with mock.patch.object(self.app, "appserver_for", new=mock.AsyncMock(return_value=client)):
+                result = await self.app.run_thread_operation(task, self.app.OperationIn(operation="compact"))
+            self.assertTrue(result["ok"])
+            self.assertEqual(
+                ["thread/resume", "thread/compact/start", "thread/unsubscribe"],
+                [method for method, _params in client.calls],
+            )
+            self.assertTrue(client.closed)
+            self.assertNotIn(key, self.app.app_servers)
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
     def test_running_thread_allows_rename_and_fork_metadata_operations(self):
         task_id = "running-thread-metadata-operations"
@@ -2512,7 +2558,7 @@ process.stdout.write(JSON.stringify(browserMessages));
 
         class FakeClient:
             async def request(self, method, params):
-                if method == "thread/read":
+                if method == "thread/resume":
                     return {"thread": {"id": task_id}}
                 if method == "thread/name/set":
                     self.name = params["name"]
