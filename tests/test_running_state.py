@@ -118,6 +118,36 @@ class RunningStateTests(unittest.TestCase):
         self.assertEqual(0, payload["exit_code"])
         self.assertEqual("completed", payload["status"])
 
+    def test_native_timeline_keeps_normalized_appserver_activity(self):
+        task_id = "native-appserver-activity"
+        self.make_task(task_id, "available")
+        self.app.db.execute("UPDATE tasks SET native=1,codex_session_id=? WHERE id=?", (task_id, task_id))
+        session_id = "native-appserver-session"
+        self.app.db.execute(
+            "INSERT INTO sessions (id,task_id,status,attempt,provider_id,command,started_at,codex_session_id) VALUES (?,?,?,?,?,?,?,?)",
+            (session_id, task_id, "imported", 0, None, "imported", self.app.now(), task_id),
+        )
+        for index, payload in enumerate((
+            {"type": "agent_delta", "delta": "partial", "turn_id": "turn-1"},
+            {"type": "codex", "method": "item/commandExecution/outputDelta", "params": {"turnId": "turn-1"}},
+            {"type": "commandExecution", "command": "pwd", "item_id": "call-1", "turn_id": "turn-1", "status": "completed"},
+            {"type": "mcpToolCall", "tool": "search", "item_id": "call-2", "turn_id": "turn-1", "status": "completed"},
+        )):
+            self.app.db.execute(
+                "INSERT INTO events (session_id,task_id,ts,stream,payload) VALUES (?,?,?,?,?)",
+                (session_id, task_id, f"2026-08-19T08:00:0{index}+00:00", "app-server", json.dumps(payload)),
+            )
+
+        async def exercise():
+            with mock.patch.object(self.app, "native_history_events", new=mock.AsyncMock(return_value=[])):
+                events, _metrics = await self.app.native_timeline_events(self.app.task_or_404(task_id))
+            return [json.loads(event["payload"])["type"] for event in events]
+
+        try:
+            self.assertEqual(["commandExecution", "mcpToolCall"], asyncio.run(exercise()))
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
     def test_rollout_plan_steps_extracts_wrapped_update_plan(self):
         payload = {
             "type": "custom_tool_call",
@@ -1109,8 +1139,8 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
 
         conversation = (worker.parent / "conversation.js").read_text(encoding="utf-8")
         html = (worker.parent / "index.html").read_text(encoding="utf-8")
-        self.assertIn('/chat-worker.js?v=20260818-full-exploration-graph', conversation)
-        self.assertIn('/conversation.js?v=20260818-running-session-dot', html)
+        self.assertIn('/chat-worker.js?v=20260819-activity-retention', conversation)
+        self.assertIn('/conversation.js?v=20260819-activity-retention', html)
 
     def test_worker_hides_native_media_tags(self):
         script = f"""
@@ -1229,6 +1259,27 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertEqual(1, len(blocks[0]["items"]))
         self.assertEqual("completed", blocks[0]["items"][0]["status"])
         self.assertEqual("done · python3 -m unittest", blocks[0]["items"][0]["text"])
+
+    def test_worker_completion_does_not_erase_started_activity_details(self):
+        worker = Path(__file__).resolve().parents[1] / "static/chat-worker.js"
+        script = f"""
+const fs = require("fs");
+const vm = require("vm");
+const context = {{ self: {{ postMessage() {{}} }} }};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync({json.dumps(str(worker))}, "utf8"), context);
+const blocks = context.buildBlocks([
+  {{ stream: "app-server", payload: {{ type: "commandExecution", item_id: "command-1", command: "python3 -m unittest", tool: "exec_command", arguments: "{{}}", status: "started" }} }},
+  {{ stream: "app-server", payload: {{ type: "commandExecution", item_id: "command-1", status: "completed" }} }}
+], true, {{ activityCommand: "running", activityCommandDone: "done", activityWorking: "working" }});
+process.stdout.write(JSON.stringify(blocks));
+"""
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
+        item = json.loads(result.stdout)[0]["items"][0]
+        self.assertEqual("python3 -m unittest", item["command"])
+        self.assertEqual("exec_command", item["tool"])
+        self.assertEqual("{}", item["arguments"])
+        self.assertEqual("completed", item["status"])
 
     def test_worker_hides_raw_codex_protocol_but_keeps_normalized_command(self):
         worker = Path(__file__).resolve().parents[1] / "static/chat-worker.js"
@@ -1560,7 +1611,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn('data-activity-output-key="${esc(outputKey)}"', conversation)
         self.assertIn("Object.prototype.hasOwnProperty.call(state.activityOutputOpen, outputKey)", conversation)
         self.assertIn("state.activityOutputOpen[output.dataset.activityOutputKey] = output.open", conversation)
-        self.assertIn('/conversation.js?v=20260818-running-session-dot', html)
+        self.assertIn('/conversation.js?v=20260819-activity-retention', html)
 
     def test_message_history_skips_activity_only_pages(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -1616,7 +1667,7 @@ const cursors = [];
         self.assertIn("HistoryPagination.fetchEarlierTimelinePages", conversation)
         self.assertIn("messageTarget: 12, maxPages: 8", conversation)
         self.assertIn('/history-pagination.js?v=20260817-message-history', html)
-        self.assertIn('/conversation.js?v=20260818-running-session-dot', html)
+        self.assertIn('/conversation.js?v=20260819-activity-retention', html)
 
     def test_sent_browser_messages_follow_the_loaded_timeline_boundary(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -1649,7 +1700,7 @@ process.stdout.write(JSON.stringify({{ recent: bodies(recentEvents), older: bodi
         self.assertEqual(["currently running message", "old sent message", "current sent message"], payload["older"])
 
         conversation = (worker.parent / "conversation.js").read_text(encoding="utf-8")
-        self.assertIn('/chat-worker.js?v=20260818-full-exploration-graph', conversation)
+        self.assertIn('/chat-worker.js?v=20260819-activity-retention', conversation)
 
     def test_metrics_user_event_does_not_hide_its_browser_message(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -3212,7 +3263,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260818-running-session-dot', html)
+        self.assertIn('/conversation.js?v=20260819-activity-retention', html)
         self.assertIn("/timeline?limit=160", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -3457,7 +3508,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260818-running-session-dot', html)
+        self.assertIn('/conversation.js?v=20260819-activity-retention', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
         self.assertIn('/app.js?v=20260818-fork-feedback', html)
@@ -3469,7 +3520,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn(".session-card.selected::before", styles)
         self.assertNotIn("renderSessionList(); renderConversation(); await loadWorkspace(\"\")", conversation_js)
         self.assertIn(".queued-messages { width: auto; height: auto; min-height: 0; max-height: none; align-self: stretch;", styles)
-        self.assertIn('/chat-worker.js?v=20260818-full-exploration-graph', conversation_js)
+        self.assertIn('/chat-worker.js?v=20260819-activity-retention', conversation_js)
         self.assertIn('data-live="true" open', conversation_js)
         self.assertIn("activity-event.current::after", styles)
         self.assertIn("function renderActivityEvent", conversation_js)
@@ -3522,7 +3573,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('const sessionList = $("#task-list")', conversation)
         self.assertIn("void selectSession(pointerSelectedSessionId)", conversation)
         self.assertIn('aria-current="${selected ? "true" : "false"}"', conversation)
-        self.assertIn('/conversation.js?v=20260818-running-session-dot', html)
+        self.assertIn('/conversation.js?v=20260819-activity-retention', html)
 
     def test_live_chat_rendering_coalesces_expensive_work(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -3541,7 +3592,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("if (current !== previous) scheduleRenderChat()", conversation)
         self.assertIn("renderConversation(false)", conversation)
         self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
-        self.assertIn('/conversation.js?v=20260818-running-session-dot', html)
+        self.assertIn('/conversation.js?v=20260819-activity-retention', html)
         styles = (static / "styles.css").read_text(encoding="utf-8")
         app_js = (static / "app.js").read_text(encoding="utf-8")
         self.assertNotIn("content-visibility: auto", styles)

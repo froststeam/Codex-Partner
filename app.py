@@ -5118,18 +5118,18 @@ def history_event_identity(event: dict) -> Optional[tuple[str, str, str]]:
 def merge_native_with_rollout(native_events: list[dict], persisted: list[dict]) -> list[dict]:
     """Keep rollout ordering while filling tool details from richer native items."""
     merged_persisted = [dict(event) for event in persisted]
-    rollout_indexes = {
+    persisted_indexes = {
         identity: index
         for index, event in enumerate(merged_persisted)
-        if event.get("stream") == "rollout" and (identity := history_event_identity(event))
+        if event.get("stream") in {"rollout", "app-server"} and (identity := history_event_identity(event))
     }
     remaining_native: list[dict] = []
     for native in native_events:
         identity = history_event_identity(native)
-        if identity not in rollout_indexes:
+        if identity not in persisted_indexes:
             remaining_native.append(native)
             continue
-        index = rollout_indexes[identity]
+        index = persisted_indexes[identity]
         rollout = merged_persisted[index]
         try:
             native_payload = native.get("payload") if isinstance(native.get("payload"), dict) else json.loads(native.get("payload") or "{}")
@@ -5239,8 +5239,10 @@ async def native_timeline_events(task: dict) -> tuple[list[dict], list[dict]]:
     """Merge one cached native snapshot with small live/persisted overlays."""
     native_events = list(await native_history_events(task))
     persisted = db.all(
-        "SELECT * FROM (SELECT * FROM events "
-        "WHERE task_id=? AND stream IN ('system','rollout') ORDER BY id DESC LIMIT 1500) "
+        "SELECT * FROM (SELECT * FROM events WHERE task_id=? AND ("
+        "stream IN ('system','rollout') OR (stream='app-server' AND "
+        "lower(json_extract(payload,'$.type')) IN ('reasoning','commandexecution','mcptoolcall','filechange','websearch','contextcompaction'))) "
+        "ORDER BY id DESC LIMIT 5000) "
         "ORDER BY ts,id",
         (task["id"],),
     )

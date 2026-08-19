@@ -296,7 +296,11 @@ function buildBlocks(events, rawActivity, labels) {
       const item = activityItem(payload, labels, event);
       if (item.hidden) continue;
       if (item.itemId && activityItems.has(item.itemId)) {
-        Object.assign(activityItems.get(item.itemId), item);
+        const existing = activityItems.get(item.itemId);
+        for (const [key, value] of Object.entries(item)) {
+          const empty = value == null || value === "" || (Array.isArray(value) && value.length === 0);
+          if (!empty || !existing[key]) existing[key] = value;
+        }
         current = null;
         continue;
       }
