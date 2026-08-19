@@ -5416,13 +5416,21 @@ async def task_activity_map(task_id: str, _: Any = Depends(auth)):
 
 
 @app.get("/api/tasks/{task_id}/timeline")
-async def task_timeline(task_id: str, before: str = "", limit: int = 160, _: Any = Depends(auth)):
+async def task_timeline(task_id: str, before: str = "", limit: int = 160, fast: bool = False, _: Any = Depends(auth)):
     """Return one newest-first cursor page, rendered oldest-to-newest by clients."""
     task = task_or_404(task_id)
     task_id = task["id"]
     limit = max(25, min(limit, 500))
     cursor = decode_history_cursor(before)
     if task.get("native"):
+        if fast and not before:
+            rows = db.all(
+                "SELECT * FROM events WHERE task_id=? AND (stream IN ('system','rollout') OR (stream='app-server' AND "
+                "lower(json_extract(payload,'$.type')) IN ('usermessage','browsermessage','agentmessage','reasoning','commandexecution','mcptoolcall','filechange','websearch','contextcompaction'))) "
+                "ORDER BY id DESC LIMIT ?",
+                (task_id, limit),
+            )
+            return {"items": list(reversed(rows)), "next_cursor": "", "has_more": True, "metrics": [], "fast": True}
         events, metrics = await native_timeline_events(task)
         if cursor:
             if cursor.get("kind") != "native" or not isinstance(cursor.get("ts"), str):

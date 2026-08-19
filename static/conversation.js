@@ -140,7 +140,7 @@ async function selectSession(id, openSocket = true) {
   }
   if (openSocket) connectSocket(id);
   const fullTaskPromise = api(`/tasks/${encodeURIComponent(id)}`, { signal: controller.signal });
-  const timelinePromise = api(`/tasks/${encodeURIComponent(id)}/timeline?limit=120`, { signal: controller.signal });
+  const timelinePromise = api(`/tasks/${encodeURIComponent(id)}/timeline?limit=120&fast=1`, { signal: controller.signal });
   const messagesPromise = api(`/tasks/${encodeURIComponent(id)}/messages`, { signal: controller.signal });
   const activityMapPromise = api(`/tasks/${encodeURIComponent(id)}/activity-map`, { signal: controller.signal });
   const detailsUpdate = Promise.all([fullTaskPromise, messagesPromise]).then(([fullTask, messages]) => {
@@ -167,6 +167,14 @@ async function selectSession(id, openSocket = true) {
   state.historyCursor = timeline.next_cursor || ""; state.historyHasMore = Boolean(timeline.has_more);
   state.chatSnapToBottom = !cached;
   renderConversation();
+  const refreshFullTimeline = () => api(`/tasks/${encodeURIComponent(id)}/timeline?limit=120`, { signal: controller.signal }).then(full => {
+    if (requestId !== state.sessionRequestId || state.selectedId !== id) return;
+    state.selectedEvents = [...(full.items || []), ...(full.metrics || [])];
+    state.historyCursor = full.next_cursor || ""; state.historyHasMore = Boolean(full.has_more);
+    renderChat();
+  }).catch(error => { if (error.name !== "AbortError") console.warn("timeline refresh failed", error); });
+  if (typeof requestIdleCallback === "function") requestIdleCallback(refreshFullTimeline, { timeout: 2500 });
+  else setTimeout(refreshFullTimeline, 250);
   $("#empty-conversation").hidden = true; $("#conversation-view").hidden = false;
   if (wasEmpty && window.innerWidth >= 861) state.inspectorClosed = false;
   setInspectorOpen(window.innerWidth >= 861 && !state.inspectorClosed);
