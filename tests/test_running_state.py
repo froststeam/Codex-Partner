@@ -725,7 +725,7 @@ class RunningStateTests(unittest.TestCase):
         )
         with mock.patch.object(self.app, "launch", new=mock.AsyncMock(return_value={"session_id": "next"})) as launch:
             asyncio.run(self.app.drain_task_messages(task_id))
-        launch.assert_awaited_once_with(task_id, "resume")
+        launch.assert_awaited_once_with(task_id, "goal-resume")
         self.assertEqual("queued", self.app.task_or_404(task_id)["status"])
 
     def test_blocked_goal_auto_resumes_but_paused_goal_requires_goal_start(self):
@@ -742,7 +742,7 @@ class RunningStateTests(unittest.TestCase):
                 task = self.app.task_or_404(task_id)
                 self.assertEqual(status, task["goal_status"])
                 if status == "blocked":
-                    launch.assert_awaited_once_with(task_id, "resume")
+                    launch.assert_awaited_once_with(task_id, "goal-resume")
                     self.assertEqual("queued", task["status"])
                     self.assertTrue(self.app.goal_auto_resume_enabled(task))
                 else:
@@ -795,8 +795,8 @@ class RunningStateTests(unittest.TestCase):
     def test_appserver_retry_waits_for_previous_turn_cleanup(self):
         source = Path(self.app.__file__).read_text(encoding="utf-8")
         self.assertIn("async def launch_after_turn_cleanup", source)
-        self.assertIn('asyncio.create_task(launch_after_turn_cleanup(task["id"], "resume"', source)
-        self.assertNotIn('await launch(task["id"], "resume", "", "", set())', source)
+        self.assertIn('asyncio.create_task(launch_after_turn_cleanup(task["id"], "goal-resume"', source)
+        self.assertNotIn('await launch(task["id"], "goal-resume", "", "", set())', source)
 
     def test_stop_clears_unowned_running_state(self):
         task_id = "orphan-thread"
@@ -1133,6 +1133,15 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
             self.assertEqual(3, updated["goal_tokens_used"])
         finally:
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_auto_resume_reloads_goal_before_starting_turn(self):
+        source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
+        self.assertIn('task = task_or_404(task["id"])\n        async with goal_sync_lock(task["id"]):', source)
+        self.assertIn('async with goal_sync_lock(task["id"]):\n            task = task_or_404(task["id"])\n            goal_revision_at_start', source)
+        self.assertIn('"objective": task["goal"]', source)
+        self.assertIn('"input": appserver_turn_inputs(task, message, include_goal_memory=run_mode == "goal_resume")', source)
+        self.assertIn('await launch(task_id, "goal-resume")', source)
+        self.assertIn('"goal-resume" if goal_auto_resume_enabled(latest)', source)
 
     def test_worker_hides_codex_environment_context_from_user_messages(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -3309,7 +3318,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn(".queued-messages[hidden] { display: block !important", (static / "styles.css").read_text(encoding="utf-8"))
         self.assertIn("min-height: 37px", (static / "styles.css").read_text(encoding="utf-8"))
         self.assertNotIn("未设置 Goal，点击修改后让 Codex 持续追踪目标", conversation_js)
-        self.assertIn('launch_after_turn_cleanup(task["id"], "resume", "", "", set())', (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8"))
+        self.assertIn('launch_after_turn_cleanup(task["id"], "goal-resume", "", "", set())', (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8"))
         self.assertIn("flex-wrap: nowrap", (static / "styles.css").read_text(encoding="utf-8"))
 
     def test_composer_model_picker_survives_realtime_status_renders(self):

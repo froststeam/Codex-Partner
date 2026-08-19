@@ -570,7 +570,7 @@ async def lifespan(_: FastAPI):
                 continue
             try:
                 task = task_or_404(row["id"])
-                await launch(row["id"], "resume" if latest_codex_session(task) else "start")
+                await launch(row["id"], "goal-resume" if goal_auto_resume_enabled(task) else ("resume" if latest_codex_session(task) else "start"))
             except Exception:
                 continue
     drain_task_ids = {
@@ -2918,24 +2918,13 @@ async def supervise_appserver_turn(
         cached_history = native_history_cache.get(task["id"])
         if mode == "start" or (cached_history and cached_history.get("thread_id") != thread_id):
             native_history_cache.pop(task["id"], None)
+        # Auto-resume can be scheduled from an older task snapshot while the
+        # user is editing the Goal. Always reload before binding Goal state.
+        task = task_or_404(task["id"])
         async with goal_sync_lock(task["id"]):
             goal_task = task_or_404(task["id"])
+            task = goal_task
             goal_revision_at_start = int(goal_task.get("goal_revision") or 0)
-            # A manual message must be independent from a durable Goal. Keep
-            # the Goal in our database, but clear the native app-server Goal
-            # for this turn so an old objective cannot hijack the message.
-            independent_turn = run_mode != "goal_resume"
-            if independent_turn and goal_task.get("goal"):
-                await client.request("thread/goal/clear", {"threadId": thread_id})
-            elif goal_task.get("goal"):
-                goal_result = await client.request(
-                    "thread/goal/set",
-                    {"threadId": thread_id, "objective": goal_task["goal"], "status": goal_status_for_turn(goal_task, run_mode)},
-                )
-                goal = goal_result.get("goal") or {}
-                current = task_or_404(task["id"])
-                if int(current.get("goal_revision") or 0) == goal_revision_at_start:
-                    db.execute("UPDATE tasks SET goal_status=?, goal_tokens_used=?, updated_at=? WHERE id=?", (goal.get("status", "active"), goal.get("tokensUsed", 0), now(), task["id"]))
         codex_label = f"ssh {task['ssh_host']} codex" if task.get("ssh_host") else CODEX_BIN
         command = shlex.join([codex_label, "app-server", "thread/resume" if mode != "start" else "thread/start", thread_id, "turn/start"])
         db.execute("UPDATE sessions SET command=?, codex_session_id=? WHERE id=?", (command, thread_id, session_id))
@@ -2943,15 +2932,28 @@ async def supervise_appserver_turn(
         running[task["id"]] = client.process  # owner marker; browsers never spawn a second resume
         waiter = asyncio.get_running_loop().create_future()
         turn_waiters[thread_id] = waiter
-        turn_params = {
-            "threadId": thread_id,
-            "cwd": task["workspace"],
-            "input": appserver_turn_inputs(task, message, include_goal_memory=run_mode == "goal_resume"),
-            "approvalPolicy": approval,
-            "clientUserMessageId": message_id or None,
-            **turn_settings(task, provider, sandbox_policy),
-        }
-        turn_result = await client.request("turn/start", turn_params)
+        # Do not allow a Goal edit between thread/goal/set and turn/start.
+        # Both the native Goal and the structured input must use one latest
+        # revision, otherwise auto-resume can send the previous objective.
+        async with goal_sync_lock(task["id"]):
+            task = task_or_404(task["id"])
+            goal_revision_at_start = int(task.get("goal_revision") or 0)
+            if task.get("goal") and run_mode == "goal_resume":
+                await client.request(
+                    "thread/goal/set",
+                    {"threadId": thread_id, "objective": task["goal"], "status": goal_status_for_turn(task, run_mode)},
+                )
+            elif run_mode != "goal_resume":
+                await client.request("thread/goal/clear", {"threadId": thread_id})
+            turn_params = {
+                "threadId": thread_id,
+                "cwd": task["workspace"],
+                "input": appserver_turn_inputs(task, message, include_goal_memory=run_mode == "goal_resume"),
+                "approvalPolicy": approval,
+                "clientUserMessageId": message_id or None,
+                **turn_settings(task, provider, sandbox_policy),
+            }
+            turn_result = await client.request("turn/start", turn_params)
         turn_id = (turn_result.get("turn") or {}).get("id") or ""
         if message_id:
             db.execute("UPDATE task_messages SET status='running', session_id=?, error='' WHERE id=?", (session_id, message_id))
@@ -3116,7 +3118,7 @@ async def supervise_appserver_turn(
                 return
             db.execute("UPDATE tasks SET status='queued',execution_source='dashboard',updated_at=? WHERE id=?", (now(), task["id"]))
             if goal_continues:
-                asyncio.create_task(launch_after_turn_cleanup(task["id"], "resume", "", "", set()))
+                asyncio.create_task(launch_after_turn_cleanup(task["id"], "goal-resume", "", "", set()))
             else:
                 asyncio.create_task(launch_after_turn_cleanup(task["id"], "message" if message_id else "resume", message, message_id, set()))
             return
@@ -4224,7 +4226,7 @@ async def drain_task_messages(task_id: str) -> None:
                 (now(), task_id),
             )
             try:
-                await launch(task_id, "resume")
+                await launch(task_id, "goal-resume")
             except Exception as exc:
                 if not is_task_busy_error(exc):
                     db.execute("UPDATE tasks SET status='failed',last_error=?,updated_at=? WHERE id=?", (str(exc), now(), task_id))
@@ -6080,7 +6082,7 @@ async def supervise(task: dict, session_id: str, providers: list[Optional[dict]]
         await broadcast_task(task_id, {"type": "session", "session_id": session_id, "status": "retrying", "error": last_error})
         await asyncio.sleep(min(30, 2 ** min(retries, 4)))
         try:
-            await launch(task_id, "resume" if goal_auto_resume_enabled(latest) else "auto-retry")
+            await launch(task_id, "goal-resume" if goal_auto_resume_enabled(latest) else "auto-retry")
         except Exception:
             pass
     else:
