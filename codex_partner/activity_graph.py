@@ -186,26 +186,45 @@ def project_edges(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return edges
 
 
+RECALL_GENERIC_TERMS = {
+    "帮忙", "分析", "继续", "一下", "问题", "处理", "看看", "这个", "那个", "需要", "可以", "进行",
+    "please", "help", "continue", "again", "check", "look",
+}
+
+
 def recall_context(query: Any, snapshot: dict[str, Any], goal: Any = "", limit: int = 7) -> str:
     """Select a small, provenance-friendly graph neighborhood for the next turn."""
     nodes = list(snapshot.get("nodes") or [])
     edges = list(snapshot.get("edges") or [])
     if not nodes:
         return ""
-    query_terms = semantic_terms(f"{query} {goal}")
+    query_text = clean_text(query)
+    normalized_query = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", query_text.lower())
+    query_terms = semantic_terms(query_text)
+    goal_terms = semantic_terms(goal)
+    search_terms = query_terms | goal_terms
+    meaningful_terms = search_terms - RECALL_GENERIC_TERMS
+    continuation = bool(CONTINUE_RE.search(query_text)) and len(meaningful_terms) <= 2
+    if not meaningful_terms and not continuation:
+        return ""
     ranked: list[tuple[float, dict[str, Any]]] = []
     for index, node in enumerate(nodes):
+        normalized_title = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", clean_text(node.get("title")).lower())
+        if normalized_query and normalized_title == normalized_query:
+            continue
         node_terms = semantic_terms(f"{node.get('title', '')} {node.get('summary', '')} {' '.join(node.get('files') or [])}")
-        overlap = query_terms & node_terms
-        lexical = (2 * len(overlap)) / max(3, len(query_terms) + len(node_terms)) if query_terms else 0.0
+        overlap = meaningful_terms & (node_terms - RECALL_GENERIC_TERMS)
+        lexical = (2 * len(overlap)) / max(3, len(meaningful_terms) + len(node_terms)) if meaningful_terms else 0.0
         state_bonus = 0.35 if node.get("status") == "active" else 0.15 if node.get("status") == "completed" else 0.0
         recency = 0.25 * ((index + 1) / len(nodes))
         importance = min(0.4, float(node.get("score") or 0) / 25)
         score = lexical * 8 + state_bonus + recency + importance
-        if lexical or node.get("status") == "active":
+        strong_term = any(re.fullmatch(r"[a-z][a-z0-9_.+-]{2,}", term) for term in overlap)
+        relevant = bool(overlap) and (len(overlap) >= 2 or strong_term or lexical >= 0.12)
+        if relevant or (continuation and (node.get("status") == "active" or index >= len(nodes) - 2)):
             ranked.append((score, node))
     if not ranked:
-        ranked = [(float(node.get("score") or 0) / 10, node) for node in nodes[-3:]]
+        return ""
 
     selected: dict[str, tuple[float, dict[str, Any]]] = {}
     for score, node in sorted(ranked, key=lambda item: item[0], reverse=True)[:max(2, limit - 2)]:

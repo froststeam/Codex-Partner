@@ -1454,12 +1454,25 @@ process.stdout.write(JSON.stringify(posts));
         self.assertIn('<memory_context source="codex-partner-activity-graph">', context)
         self.assertIn("使用多关系知识图谱", context)
         self.assertNotIn("分析 MUSA kernel spill", context)
+        self.assertEqual("", recall_context("交互修复验证：只回答 OK", snapshot))
+        current_snapshot = {"nodes": snapshot["nodes"] + [
+            {"id": "current", "kind": "steering", "status": "active", "title": "交互修复验证：只回答 OK", "summary": "当前 turn", "score": 10},
+        ], "edges": [{"id": "current-edge", "sourceId": "gpu", "targetId": "current", "kind": "branch", "score": 1}]}
+        self.assertEqual("", recall_context("交互修复验证：只回答 OK", current_snapshot))
 
         task = {"id": "recall-task", "prompt": "", "context": "", "goal": "构建星系地图", "memory_mode": "enabled"}
         with mock.patch.object(self.app.activity_graph_store, "snapshot", return_value=snapshot):
             inputs = self.app.appserver_turn_inputs(task, "继续实现探索地图关系")
         self.assertIn("继续实现探索地图关系", inputs[0]["text"])
         self.assertIn("<memory_context", inputs[0]["text"])
+
+        task["goal"] = "分析 MUSA kernel spill"
+        with mock.patch.object(self.app.activity_graph_store, "snapshot", return_value=snapshot):
+            manual_inputs = self.app.appserver_turn_inputs(task, "交互修复验证：只回答 OK")
+            goal_inputs = self.app.appserver_turn_inputs(task, "继续", include_goal_memory=True)
+        self.assertNotIn("<memory_context", manual_inputs[0]["text"])
+        self.assertIn("分析 MUSA kernel spill", goal_inputs[0]["text"])
+        self.assertNotIn("使用多关系知识图谱", goal_inputs[0]["text"])
 
     def test_activity_history_expands_independently_from_message_history(self):
         static = Path(__file__).resolve().parents[1] / "static"

@@ -2941,7 +2941,7 @@ async def supervise_appserver_turn(
         turn_params = {
             "threadId": thread_id,
             "cwd": task["workspace"],
-            "input": appserver_turn_inputs(task, message),
+            "input": appserver_turn_inputs(task, message, include_goal_memory=run_mode == "goal_resume"),
             "approvalPolicy": approval,
             "clientUserMessageId": message_id or None,
             **turn_settings(task, provider, sandbox_policy),
@@ -3653,7 +3653,7 @@ def appserver_attachment_path(task: dict, encoded_path: str) -> tuple[str, str] 
     return normalized, str(candidate)
 
 
-def appserver_turn_inputs(task: dict, message: str) -> list[dict[str, Any]]:
+def appserver_turn_inputs(task: dict, message: str, include_goal_memory: bool = False) -> list[dict[str, Any]]:
     """Translate durable chat markers into the structured app-server input protocol."""
     attachments: list[tuple[str, str]] = []
 
@@ -3672,7 +3672,7 @@ def appserver_turn_inputs(task: dict, message: str) -> list[dict[str, Any]]:
     prompt = prompt_for(task, clean_message.strip())
     if prompt and task.get("id") and task.get("memory_mode", "enabled") != "disabled":
         snapshot = activity_graph_store.snapshot(task["id"])
-        memory = recall_context(clean_message, snapshot, task.get("goal", ""))
+        memory = recall_context(clean_message, snapshot, task.get("goal", "") if include_goal_memory else "")
         if memory:
             prompt = f"{prompt}\n\n{memory}"
     if prompt:
@@ -6251,7 +6251,7 @@ async def steer_task_message(task_id: str, payload: TaskMessageIn, _: Any = Depe
             {
                 "threadId": thread_id,
                 "expectedTurnId": turn_id,
-                "input": appserver_turn_inputs(task, message_body),
+                "input": appserver_turn_inputs(task, message_body, include_goal_memory=False),
                 "clientUserMessageId": message_id,
             },
         )
