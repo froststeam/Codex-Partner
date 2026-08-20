@@ -3580,6 +3580,17 @@ def public_goal_status(task: dict) -> str:
     return status
 
 
+def attach_external_task_state(task: dict, task_id: str) -> dict:
+    """Expose external-turn state on every snapshot, including its cleared state."""
+    external = external_turns.get(task_id)
+    task["external_running"] = bool(external)
+    task["external_started_at"] = external.get("started_at") if external else None
+    task["external_phase"] = external.get("phase") if external else None
+    task["external_turn_id"] = external.get("turn_id") if external else None
+    task["external_turn_count"] = len(external_turn_sets.get(task_id) or {}) if external else 0
+    return task
+
+
 def task_or_404(task_id: str) -> dict:
     canonical_id = task_id_aliases.get(task_id, task_id)
     task = db.one("SELECT * FROM tasks WHERE id=?", (canonical_id,))
@@ -3595,13 +3606,7 @@ def task_or_404(task_id: str) -> dict:
     task["archived"] = bool(task.get("archived", 0))
     task["trashed"] = bool(task.get("trashed", 0))
     task["goal_status"] = public_goal_status(task)
-    if external := external_turns.get(task_id):
-        task["external_running"] = True
-        task["external_started_at"] = external.get("started_at")
-        task["external_phase"] = external.get("phase")
-        task["external_turn_id"] = external.get("turn_id")
-        task["external_turn_count"] = len(external_turn_sets.get(task_id) or {})
-    return task
+    return attach_external_task_state(task, canonical_id)
 
 
 def provider_rows() -> list[dict]:
@@ -4122,13 +4127,7 @@ def task_summary(task_id: str) -> Optional[dict]:
     row["archived"] = bool(row.get("archived", 0))
     row["trashed"] = bool(row.get("trashed", 0))
     row["goal_status"] = public_goal_status(row)
-    if external := external_turns.get(task_id):
-        row["external_running"] = True
-        row["external_started_at"] = external.get("started_at")
-        row["external_phase"] = external.get("phase")
-        row["external_turn_id"] = external.get("turn_id")
-        row["external_turn_count"] = len(external_turn_sets.get(task_id) or {})
-    return row
+    return attach_external_task_state(row, task_id)
 
 
 def all_task_summaries() -> list[dict]:
@@ -5040,6 +5039,7 @@ async def list_tasks(_: Any = Depends(auth)):
         r["archived"] = bool(r.get("archived", 0))
         r["trashed"] = bool(r.get("trashed", 0))
         r["goal_status"] = public_goal_status(r)
+        attach_external_task_state(r, r["id"])
     return rows
 
 

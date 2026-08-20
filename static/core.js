@@ -1035,8 +1035,9 @@ async function reconcileSelectedTaskStatus() {
 }
 function isUserEvent(event) { const payload = eventValue(event.payload); return payload?.type === "userMessage" || payload?.type === "browserMessage" || payload?.type === "slashCommand" || event.stream === "user"; }
 function isAssistantEvent(event) { const payload = eventValue(event.payload); return payload?.type === "agentMessage" || payload?.type === "agent_delta" || payload?.type === "commandResult" || event.stream === "assistant"; }
-function taskMatches(task) { if (state.filter === "running" && !["running", "retrying", "queued"].includes(task.status)) return false; if (state.filter !== "all" && state.filter !== "running" && task.status !== state.filter) return false; if (!state.query) return true; const haystack = `${task.name} ${task.prompt} ${task.goal} ${task.workspace}`.toLowerCase(); return haystack.includes(state.query.toLowerCase()); }
-function taskIsRunningGroup(task) { return ["running", "retrying", "queued"].includes(task?.status); }
+function taskHasLiveExecution(task) { return ["running", "retrying"].includes(task?.status) || Boolean(task?.external_running); }
+function taskIsRunningGroup(task) { return taskHasLiveExecution(task) || task?.status === "queued"; }
+function taskMatches(task) { if (state.filter === "running" && !taskIsRunningGroup(task)) return false; if (state.filter !== "all" && state.filter !== "running" && task.status !== state.filter) return false; if (!state.query) return true; const haystack = `${task.name} ${task.prompt} ${task.goal} ${task.workspace}`.toLowerCase(); return haystack.includes(state.query.toLowerCase()); }
 function taskSortName(task) { return String(task?.name || task?.prompt || task?.id || "").trim().toLocaleLowerCase() || String(task?.id || ""); }
 function taskSortTime(task) { return String(task?.updated_at || task?.created_at || ""); }
 function sortTasks(tasks) {

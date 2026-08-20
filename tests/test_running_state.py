@@ -2966,6 +2966,29 @@ process.stdout.write(JSON.stringify([
         finally:
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
+    def test_task_snapshots_expose_and_clear_external_running_state(self):
+        task_id = "external-running-sidebar-state"
+        self.make_task(task_id, "stopped")
+        self.app.external_turns[task_id] = {
+            "turn_id": "terminal-turn",
+            "started_at": "2026-08-20T10:00:00+00:00",
+            "phase": "running",
+        }
+        self.app.external_turn_sets[task_id] = {"terminal-turn": self.app.external_turns[task_id]}
+        try:
+            listed = asyncio.run(self.app.list_tasks(None))
+            row = next(item for item in listed if item["id"] == task_id)
+            self.assertTrue(row["external_running"])
+            self.assertEqual("terminal-turn", row["external_turn_id"])
+            self.app.clear_external_turns(task_id)
+            cleared = self.app.task_summary(task_id)
+            self.assertFalse(cleared["external_running"])
+            self.assertIsNone(cleared["external_turn_id"])
+            self.assertEqual(0, cleared["external_turn_count"])
+        finally:
+            self.app.clear_external_turns(task_id)
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
     def test_slash_command_catalog_only_advertises_implemented_commands(self):
         source = inspect.getsource(self.app.execute_slash_command) + inspect.getsource(self.app._execute_slash_command_body)
         for entry in self.app.SLASH_COMMANDS:
@@ -3995,6 +4018,9 @@ process.stdout.write(JSON.stringify([
         self.assertIn("data-queue-dispatch", conversation_js)
         self.assertIn("queued-error", conversation_js)
         self.assertIn("function taskIsRunningGroup", core_js)
+        self.assertIn("function taskHasLiveExecution", core_js)
+        self.assertIn("Boolean(task?.external_running)", core_js)
+        self.assertIn("const active = taskIsRunningGroup(task)", conversation_js)
         self.assertIn('["running", "retrying", "queued"].includes', core_js)
         self.assertIn("taskSortName(a).localeCompare", core_js)
         self.assertIn("taskSortTime(b).localeCompare(taskSortTime(a))", core_js)
