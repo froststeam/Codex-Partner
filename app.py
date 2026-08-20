@@ -880,6 +880,79 @@ def native_rollout_path(thread_id: str) -> str:
     return str(row[0]) if row and row[0] else ""
 
 
+def native_rollout_seed(thread_id: str, path: str) -> Optional[dict[str, Any]]:
+    """Read enough metadata to index a live exec thread absent from thread/list."""
+    thread_id = safe_thread_id(thread_id)
+    rollout = Path(path).expanduser().resolve()
+    sessions_root = (CODEX_HOME / "sessions").resolve()
+    if not thread_id or not rollout.is_file() or sessions_root not in rollout.parents:
+        return None
+    metadata: dict[str, Any] = {}
+    prompt = ""
+    approval_policy = ""
+    try:
+        with rollout.open("r", encoding="utf-8", errors="replace") as handle:
+            for index, line in enumerate(handle):
+                if index >= 64:
+                    break
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = record.get("payload") or {}
+                if record.get("type") == "session_meta":
+                    metadata = payload
+                elif record.get("type") == "turn_context":
+                    approval_policy = str(payload.get("approval_policy") or approval_policy)
+                elif record.get("type") == "event_msg" and payload.get("type") == "user_message":
+                    prompt = str(payload.get("message") or "").strip()
+                if metadata and prompt and approval_policy:
+                    break
+    except OSError:
+        return None
+    recorded_id = safe_thread_id(str(metadata.get("id") or metadata.get("session_id") or ""))
+    if recorded_id != thread_id:
+        return None
+    created = native_stamp(metadata.get("timestamp"), datetime.fromtimestamp(rollout.stat().st_mtime, timezone.utc).isoformat())
+    return {
+        "thread_id": thread_id,
+        "created_at": created,
+        "workspace": str(Path(metadata.get("cwd") or str(Path.home())).expanduser().resolve()),
+        "model_provider": str(metadata.get("model_provider") or ""),
+        "prompt": prompt or "Codex session",
+        "yolo": approval_policy.lower() in {"never", "off"},
+    }
+
+
+def import_active_native_rollout(thread_id: str, path: str) -> Optional[str]:
+    """Index one verified live native rollout before app-server lists it."""
+    existing = db.one("SELECT id FROM tasks WHERE codex_session_id=?", (thread_id,))
+    if existing:
+        return existing["id"]
+    seed = native_rollout_seed(thread_id, path)
+    if not seed:
+        return None
+    task_id = thread_id if not db.one("SELECT id FROM tasks WHERE id=?", (thread_id,)) else str(uuid.uuid4())
+    provider = db.one("SELECT id FROM providers WHERE model_provider=?", (seed["model_provider"],))
+    title = seed["prompt"][:160]
+    db.execute(
+        "INSERT INTO tasks (id,name,prompt,goal,workspace,status,yolo,max_retries,retry_forever,provider_id,model,context,"
+        "codex_session_id,goal_status,created_at,updated_at,last_interaction_at,native,archived,memory_mode) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (task_id, title, seed["prompt"], "", seed["workspace"], "available", int(seed["yolo"]), 3, 0,
+         provider["id"] if provider else None, "", "", thread_id, "none", seed["created_at"], seed["created_at"],
+         seed["created_at"], 1, 0, "enabled"),
+    )
+    db.execute(
+        "INSERT INTO sessions (id,task_id,status,attempt,provider_id,command,started_at,finished_at,exit_code,summary,codex_session_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (thread_id, task_id, "imported", 0, seed["model_provider"] or None,
+         shlex.join([CODEX_BIN, "exec", thread_id]), seed["created_at"], seed["created_at"], 0,
+         "Imported from active local Codex", thread_id),
+    )
+    return task_id
+
+
 def rollout_record_phase(record: dict) -> str:
     record_type = str(record.get("type") or "")
     payload = record.get("payload") or {}
@@ -1729,6 +1802,16 @@ async def refresh_native_rollouts() -> None:
         for task in tasks:
             if task["id"] not in before:
                 await broadcast_overview(task["id"], {"kind": "native_import"})
+        for row in rows:
+            if row["thread_id"] in task_by_thread or not row.get("path"):
+                continue
+            writers = await asyncio.to_thread(native_rollout_writer_pids, row["path"], True)
+            if not writers:
+                continue
+            task_id = await asyncio.to_thread(import_active_native_rollout, row["thread_id"], row["path"])
+            if task_id:
+                task_by_thread[row["thread_id"]] = task_id
+                await broadcast_overview(task_id, {"kind": "active_native_import"})
     live_paths = set()
     for row in rows:
         task_id = task_by_thread.get(row["thread_id"])

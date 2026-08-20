@@ -343,6 +343,42 @@ class RunningStateTests(unittest.TestCase):
         self.assertEqual(1, len(lines))
         self.assertEqual(2 * 1024 * 1024, len(json.loads(lines[0])["result"]["text"]))
 
+    def test_rollout_watcher_imports_live_exec_thread_missing_from_app_server(self):
+        thread_id = "01a00000-0000-7000-8000-000000000001"
+        rollout = Path(self.app.CODEX_HOME) / "sessions" / "2026" / "08" / "20" / f"rollout-{thread_id}.jsonl"
+        rollout.parent.mkdir(parents=True, exist_ok=True)
+        records = [
+            {"timestamp": "2026-08-20T10:00:00Z", "type": "session_meta", "payload": {
+                "id": thread_id, "session_id": thread_id, "timestamp": "2026-08-20T10:00:00Z",
+                "cwd": self.temp.name, "model_provider": "mtcode",
+            }},
+            {"timestamp": "2026-08-20T10:00:01Z", "type": "event_msg", "payload": {
+                "type": "task_started", "turn_id": "live-turn", "started_at": "2026-08-20T10:00:01Z",
+            }},
+            {"timestamp": "2026-08-20T10:00:02Z", "type": "event_msg", "payload": {
+                "type": "user_message", "message": "Continue the live native task",
+            }},
+        ]
+        rollout.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+        self.app.native_import_attempt_at = 0
+        try:
+            with mock.patch.object(self.app, "USE_APP_SERVER", True), \
+                 mock.patch.object(self.app, "native_rollout_rows", return_value=[{"thread_id": thread_id, "path": str(rollout)}]), \
+                 mock.patch.object(self.app, "sync_native_threads", new=mock.AsyncMock(return_value={"imported": 0})), \
+                 mock.patch.object(self.app, "native_rollout_writer_pids", return_value={4242}):
+                asyncio.run(self.app.refresh_native_rollouts())
+            task = self.app.task_or_404(thread_id)
+            self.assertEqual("running", task["status"])
+            self.assertTrue(task["external_running"])
+            self.assertEqual("Continue the live native task", task["prompt"])
+        finally:
+            self.app.clear_external_turns(thread_id)
+            self.app.native_rollout_offsets.pop(str(rollout), None)
+            self.app.native_rollout_remainders.pop(str(rollout), None)
+            self.app.db.execute("DELETE FROM events WHERE task_id=?", (thread_id,))
+            self.app.db.execute("DELETE FROM sessions WHERE task_id=?", (thread_id,))
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (thread_id,))
+
     def test_native_sync_preserves_dashboard_model_and_name_overrides(self):
         task_id = f"native-model-{time.time_ns()}"
         thread_id = f"thread-{time.time_ns()}"
