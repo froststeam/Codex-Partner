@@ -2617,6 +2617,28 @@ process.stdout.write(JSON.stringify(browserMessages));
         finally:
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
+    def test_absolute_workspace_artifact_can_be_previewed_but_not_edited(self):
+        task_id = "absolute-artifact-preview"
+        self.make_task(task_id, "available")
+        external_root = Path(tempfile.mkdtemp(prefix="codex-partner-artifacts-"))
+        artifact = external_root / "server.log"
+        artifact.write_text("external artifact", encoding="utf-8")
+        original_roots = self.app.WORKSPACE_ROOTS
+        self.app.WORKSPACE_ROOTS = (external_root,)
+        absolute = str(artifact)
+        try:
+            preview = asyncio.run(self.app.task_workspace(task_id, absolute))
+            self.assertEqual(absolute, preview["entry"]["path"])
+            self.assertEqual("external artifact", preview["content"])
+            with self.assertRaises(self.app.HTTPException) as edited:
+                asyncio.run(self.app.update_workspace_file(task_id, self.app.WorkspaceFileUpdate(content="nope"), absolute))
+            self.assertEqual(400, edited.exception.status_code)
+        finally:
+            self.app.WORKSPACE_ROOTS = original_roots
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+            artifact.unlink(missing_ok=True)
+            external_root.rmdir()
+
     def test_media_byte_ranges_support_seeking(self):
         self.assertEqual((0, 99), self.app.parse_byte_range("bytes=0-99", 1000))
         self.assertEqual((900, 999), self.app.parse_byte_range("bytes=-100", 1000))

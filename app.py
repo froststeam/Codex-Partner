@@ -1817,11 +1817,14 @@ def memory_file(name: str) -> Path:
     return path
 
 
-def workspace_path(task: dict, relative: str = "") -> tuple[Path, Path]:
-    """Resolve a browser workspace path without allowing traversal."""
+def workspace_path(task: dict, relative: str = "", allow_external_read: bool = False) -> tuple[Path, Path]:
+    """Resolve a browser path while keeping writes inside the task workspace."""
     root = Path(task["workspace"]).expanduser().resolve()
-    candidate = (root / (relative or "")).resolve()
-    if candidate != root and root not in candidate.parents:
+    requested = Path(relative).expanduser() if relative else Path()
+    candidate = (requested if requested.is_absolute() else root / requested).resolve()
+    in_task_workspace = candidate == root or root in candidate.parents
+    in_configured_root = any(candidate == boundary or boundary in candidate.parents for boundary in WORKSPACE_ROOTS)
+    if not in_task_workspace and not (allow_external_read and requested.is_absolute() and in_configured_root):
         raise HTTPException(400, "Workspace path escapes the task workspace")
     return root, candidate
 
@@ -1851,7 +1854,7 @@ def legacy_staging_workspace_file(task: dict, relative: str) -> Optional[Path]:
 
 
 def existing_workspace_file(task: dict, relative: str, missing_message: str) -> tuple[Path, Path]:
-    root, candidate = workspace_path(task, relative)
+    root, candidate = workspace_path(task, relative, allow_external_read=True)
     if candidate.exists():
         return root, candidate
     legacy = legacy_staging_workspace_file(task, relative)
@@ -1902,7 +1905,10 @@ def workspace_entry(path: Path, root: Path) -> dict:
         stat = path.stat()
     except OSError:
         return {"name": path.name, "path": path.relative_to(root).as_posix(), "kind": "unavailable"}
-    relative = path.relative_to(root).as_posix()
+    try:
+        relative = path.relative_to(root).as_posix()
+    except ValueError:
+        relative = path.as_posix()
     return {
         "name": path.name,
         "path": "" if relative == "." else relative,
