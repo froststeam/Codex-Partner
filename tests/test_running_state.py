@@ -2666,7 +2666,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         absolute = str(artifact)
         try:
             preview = asyncio.run(self.app.task_workspace(task_id, absolute))
-            self.assertEqual(absolute, preview["entry"]["path"])
+            self.assertEqual(artifact.resolve(), Path(preview["entry"]["path"]).resolve())
             self.assertEqual("external artifact", preview["content"])
             with self.assertRaises(self.app.HTTPException) as edited:
                 asyncio.run(self.app.update_workspace_file(task_id, self.app.WorkspaceFileUpdate(content="nope"), absolute))
