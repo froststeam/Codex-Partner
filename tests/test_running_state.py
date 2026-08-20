@@ -1193,7 +1193,7 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
         conversation = (worker.parent / "conversation.js").read_text(encoding="utf-8")
         html = (worker.parent / "index.html").read_text(encoding="utf-8")
         self.assertIn('/chat-worker.js?v=20260819-activity-retention', conversation)
-        self.assertIn('/conversation.js?v=20260820-command-navigation', html)
+        self.assertIn('/conversation.js?v=20260820-large-file-viewer', html)
 
     def test_worker_hides_native_media_tags(self):
         script = f"""
@@ -1664,7 +1664,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn('data-activity-output-key="${esc(outputKey)}"', conversation)
         self.assertIn("Object.prototype.hasOwnProperty.call(state.activityOutputOpen, outputKey)", conversation)
         self.assertIn("state.activityOutputOpen[output.dataset.activityOutputKey] = output.open", conversation)
-        self.assertIn('/conversation.js?v=20260820-command-navigation', html)
+        self.assertIn('/conversation.js?v=20260820-large-file-viewer', html)
 
     def test_message_history_skips_activity_only_pages(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -1720,7 +1720,7 @@ const cursors = [];
         self.assertIn("HistoryPagination.fetchEarlierTimelinePages", conversation)
         self.assertIn("messageTarget: 12, maxPages: 8", conversation)
         self.assertIn('/history-pagination.js?v=20260817-message-history', html)
-        self.assertIn('/conversation.js?v=20260820-command-navigation', html)
+        self.assertIn('/conversation.js?v=20260820-large-file-viewer', html)
 
     def test_sent_browser_messages_follow_the_loaded_timeline_boundary(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -2539,7 +2539,7 @@ process.stdout.write(JSON.stringify(browserMessages));
                 )
                 self.assertEqual(7, edited["entry"]["size"])
                 self.assertEqual("edited\n", target.read_text(encoding="utf-8"))
-                response = await self.app.download_workspace_file(task_id, f"{relative}/result.txt")
+                response = await self.app.download_workspace_file(task_id, mock.Mock(headers={}), f"{relative}/result.txt")
                 self.assertEqual(str(target.resolve()), str(response.path))
 
                 with self.assertRaises(self.app.HTTPException) as invalid_name:
@@ -2551,7 +2551,7 @@ process.stdout.write(JSON.stringify(browserMessages));
                 secret = Path(directory) / ".env"
                 secret.write_text("SECRET=value", encoding="utf-8")
                 with self.assertRaises(self.app.HTTPException) as hidden:
-                    await self.app.download_workspace_file(task_id, f"{relative}/.env")
+                    await self.app.download_workspace_file(task_id, mock.Mock(headers={}), f"{relative}/.env")
                 self.assertEqual(403, hidden.exception.status_code)
                 with self.assertRaises(self.app.HTTPException) as hidden_edit:
                     await self.app.update_workspace_file(
@@ -2585,6 +2585,59 @@ process.stdout.write(JSON.stringify(browserMessages));
                     self.assertLessEqual(max(generated.size), 320)
 
         asyncio.run(exercise())
+
+    def test_large_workspace_text_is_paged_and_media_is_not_read_as_text(self):
+        task_id = "workspace-large-preview"
+        self.make_task(task_id, "available")
+        try:
+            text = Path(self.temp.name) / "large.log"
+            text.write_text("A" * 1_100_000 + "B" * 1_100_000, encoding="utf-8")
+            first = asyncio.run(self.app.task_workspace(task_id, "large.log", limit=1_048_576))
+            self.assertEqual("text", first["preview_kind"])
+            self.assertTrue(first["truncated"])
+            self.assertEqual(1_048_576, first["next_offset"])
+            self.assertFalse(first["editable"])
+            second = asyncio.run(self.app.task_workspace(task_id, "large.log", offset=first["next_offset"], limit=1_048_576))
+            self.assertEqual(first["next_offset"], second["offset"])
+            self.assertTrue(second["content"].startswith("A"))
+
+            unicode_text = Path(self.temp.name) / "unicode.log"
+            unicode_text.write_text("你" * 400_000, encoding="utf-8")
+            unicode_first = asyncio.run(self.app.task_workspace(task_id, "unicode.log", limit=1_048_576))
+            unicode_second = asyncio.run(self.app.task_workspace(task_id, "unicode.log", offset=unicode_first["next_offset"], limit=1_048_576))
+            self.assertNotIn("�", unicode_first["content"] + unicode_second["content"])
+            self.assertEqual(400_000, len(unicode_first["content"] + unicode_second["content"]))
+
+            video = Path(self.temp.name) / "large.mp4"
+            video.write_bytes(b"\0" * (2 * 1024 * 1024))
+            preview = asyncio.run(self.app.task_workspace(task_id, "large.mp4"))
+            self.assertEqual("video", preview["preview_kind"])
+            self.assertEqual("", preview["content"])
+            self.assertFalse(preview["editable"])
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_media_byte_ranges_support_seeking(self):
+        self.assertEqual((0, 99), self.app.parse_byte_range("bytes=0-99", 1000))
+        self.assertEqual((900, 999), self.app.parse_byte_range("bytes=-100", 1000))
+        self.assertEqual((900, 999), self.app.parse_byte_range("bytes=900-", 1000))
+        with self.assertRaises(ValueError):
+            self.app.parse_byte_range("bytes=2000-", 1000)
+        with self.assertRaises(ValueError):
+            self.app.parse_byte_range("bytes=0-0", 0)
+
+    def test_large_media_frontend_uses_streaming_urls_instead_of_blobs(self):
+        source = (Path(__file__).resolve().parents[1] / "static" / "conversation.js").read_text(encoding="utf-8")
+        hydrate = source[source.index("async function hydrateChatFiles"):source.index("function chatFileExtension")]
+        streaming_media = hydrate[hydrate.index('} else if (["audio", "video"].includes(mediaKind)'):hydrate.index("} else {", hydrate.index('} else if (["audio", "video"].includes(mediaKind)'))]
+        viewer = source[source.index("async function openChatFileViewer"):source.index("function localizeInspectorText")]
+        downloader = source[source.index("async function downloadWorkspaceFile"):source.index("function openWorkspaceFileEditor")]
+        self.assertIn("const url = chatDownloadUrl(taskId, path)", hydrate)
+        self.assertIn("const url = chatDownloadUrl(taskId, path)", viewer)
+        self.assertNotIn("response.blob()", streaming_media)
+        self.assertNotIn("chatFileObjectUrl", viewer)
+        self.assertNotIn("response.blob()", downloader)
+        self.assertIn("加载后续内容", source)
 
     def test_legacy_staging_attachment_is_restored_to_session_workspace(self):
         task_id = "legacy-attachment-thread"
@@ -3029,7 +3082,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('disabled title="${esc(uiLabel("protectedSkillDelete"))}"', settings)
         self.assertIn(".panel-item button.danger-text:not(:disabled)", styles)
         self.assertNotIn(".panel-item button:last-child", styles)
-        self.assertIn('/styles.css?v=20260819-chat-layout-stability', html)
+        self.assertIn('/styles.css?v=20260820-large-file-viewer', html)
         self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
         self.assertIn('/settings.js?v=20260817-skill-actions', html)
 
@@ -3637,11 +3690,11 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('forkCreated ? "会话已复制，但打开副本失败" : "复制会话失败"', app_js)
         self.assertIn('uiLabel("sessionRenamed")', app_js)
         self.assertIn('uiLabel("sessionDuplicated")', app_js)
-        self.assertIn('/app.js?v=20260820-command-navigation', html)
+        self.assertIn('/app.js?v=20260820-large-file-viewer', html)
         self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260820-command-navigation', html)
+        self.assertIn('/conversation.js?v=20260820-large-file-viewer', html)
         self.assertIn("/timeline?limit=120", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -3886,12 +3939,12 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260820-command-navigation', html)
+        self.assertIn('/conversation.js?v=20260820-large-file-viewer', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
-        self.assertIn('/app.js?v=20260820-command-navigation', html)
+        self.assertIn('/app.js?v=20260820-large-file-viewer', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
-        self.assertIn('/styles.css?v=20260819-chat-layout-stability', html)
+        self.assertIn('/styles.css?v=20260820-large-file-viewer', html)
         self.assertIn('/vendor/katex/katex.min.css', html)
         self.assertIn('<span id="goal-run-label">暂停</span>', html)
         self.assertNotIn('id="goal-run-label" class="sr-only"', html)
@@ -3956,7 +4009,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('const sessionList = $("#task-list")', conversation)
         self.assertIn("void selectSession(pointerSelectedSessionId)", conversation)
         self.assertIn('aria-current="${selected ? "true" : "false"}"', conversation)
-        self.assertIn('/conversation.js?v=20260820-command-navigation', html)
+        self.assertIn('/conversation.js?v=20260820-large-file-viewer', html)
 
     def test_live_chat_rendering_coalesces_expensive_work(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -3984,7 +4037,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         timeline_wait = conversation.index("timeline = await timelinePromise", select_start)
         self.assertLess(socket_start, timeline_wait)
         self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
-        self.assertIn('/conversation.js?v=20260820-command-navigation', html)
+        self.assertIn('/conversation.js?v=20260820-large-file-viewer', html)
         styles = (static / "styles.css").read_text(encoding="utf-8")
         app_js = (static / "app.js").read_text(encoding="utf-8")
         self.assertNotIn("content-visibility: auto", styles)
@@ -4001,8 +4054,8 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("if (chatIsNearBottom(stream))", conversation)
         self.assertNotIn("stream.scrollTop = target * state.chatAverageHeight", conversation)
         self.assertIn("function syncPageVisibility", app_js)
-        self.assertIn('/styles.css?v=20260819-chat-layout-stability', html)
-        self.assertIn('/app.js?v=20260820-command-navigation', html)
+        self.assertIn('/styles.css?v=20260820-large-file-viewer', html)
+        self.assertIn('/app.js?v=20260820-large-file-viewer', html)
 
     def test_optimistic_queue_messages_survive_authoritative_refresh(self):
         static = Path(__file__).resolve().parents[1] / "static"

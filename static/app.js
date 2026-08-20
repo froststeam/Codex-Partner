@@ -93,6 +93,7 @@ document.addEventListener("click", async event => {
       const input = $("#workspace-upload-input"); input.dataset.path = state.workspacePath; input.click(); return;
     }
     if (button.dataset.workspaceDownload !== undefined) return downloadWorkspaceFile(button.dataset.workspaceDownload);
+    if (button.dataset.workspacePreview !== undefined) return openChatFileViewer({ taskId: state.selectedId, path: button.dataset.workspacePreview, kind: button.dataset.previewKind || chatViewerKind(button.dataset.workspacePreview) });
     if (button.dataset.workspaceEdit !== undefined) return openWorkspaceFileEditor(button.dataset.workspaceEdit);
     if (button.dataset.copyThread) { await copyText(button.dataset.copyThread); return toast("Thread ID 已复制"); }
     if (button.dataset.sshUse !== undefined) { state.activeSSHHost = button.dataset.sshUse; if (state.activeSSHHost) localStorage.setItem("codex-dashboard-ssh-host", state.activeSSHHost); else localStorage.removeItem("codex-dashboard-ssh-host"); drawSSHPanel(); return toast(state.activeSSHHost ? `新会话将使用 ${state.activeSSHHost}` : "新会话将使用本机"); }

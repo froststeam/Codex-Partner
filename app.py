@@ -1912,6 +1912,85 @@ def workspace_entry(path: Path, root: Path) -> dict:
     }
 
 
+TEXT_PREVIEW_CHUNK_BYTES = 1024 * 1024
+TEXT_PREVIEW_MAX_BYTES = 2 * 1024 * 1024
+TEXT_FILE_SUFFIXES = {
+    ".txt", ".md", ".markdown", ".json", ".jsonl", ".yaml", ".yml", ".toml", ".ini",
+    ".csv", ".tsv", ".log", ".py", ".js", ".ts", ".tsx", ".jsx", ".css", ".html",
+    ".xml", ".sh", ".rs", ".go", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".sql",
+}
+
+
+def workspace_preview_kind(name: str) -> str:
+    media_type = mimetypes.guess_type(name)[0] or ""
+    suffix = Path(name).suffix.lower()
+    if media_type.startswith("image/"):
+        return "image"
+    if media_type.startswith("audio/"):
+        return "audio"
+    if media_type.startswith("video/"):
+        return "video"
+    if media_type == "application/pdf" or suffix == ".pdf":
+        return "pdf"
+    if media_type.startswith("text/") or suffix in TEXT_FILE_SUFFIXES:
+        return "text"
+    return "file"
+
+
+def workspace_text_chunk(path: Path, offset: int, limit: int) -> dict[str, Any]:
+    size = path.stat().st_size
+    offset = max(0, min(offset, size))
+    limit = max(4096, min(limit, TEXT_PREVIEW_MAX_BYTES))
+    with path.open("rb") as handle:
+        sample = handle.read(8192)
+        if b"\0" in sample:
+            return {"content": "", "editable": False, "offset": 0, "next_offset": None, "truncated": False}
+        handle.seek(offset)
+        raw = handle.read(limit)
+    try:
+        content = raw.decode("utf-8")
+        utf8 = True
+    except UnicodeDecodeError as exc:
+        split_character = offset + len(raw) < size and exc.reason == "unexpected end of data" and exc.end == len(raw)
+        if split_character:
+            raw = raw[:exc.start]
+            content = raw.decode("utf-8")
+            utf8 = True
+        else:
+            content = raw.decode("utf-8", errors="replace")
+            utf8 = False
+    if b"\0" in raw:
+        return {"content": "", "editable": False, "offset": offset, "next_offset": None, "truncated": False}
+    next_offset = offset + len(raw)
+    return {
+        "content": content,
+        "editable": utf8 and offset == 0 and next_offset >= size,
+        "offset": offset,
+        "next_offset": next_offset if next_offset < size else None,
+        "truncated": next_offset < size,
+    }
+
+
+def parse_byte_range(value: str, total_size: int) -> tuple[int, int] | None:
+    if not value:
+        return None
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", value.strip())
+    if not match or "," in value or total_size <= 0:
+        raise ValueError("Invalid byte range")
+    first, last = match.groups()
+    if not first and not last:
+        raise ValueError("Invalid byte range")
+    if first:
+        start = int(first)
+        end = min(int(last), total_size - 1) if last else total_size - 1
+    else:
+        length = min(int(last), total_size)
+        start, end = total_size - length, total_size - 1
+    if start >= total_size or end < start:
+        raise ValueError("Byte range is outside the file")
+    return start, end
+
+
 def workspace_hidden(path: Path) -> bool:
     name = path.name.lower()
     return name in {".env", "credentials", "credentials.json", "secrets.json"} or path.suffix.lower() in {".key", ".pem", ".p12", ".pfx"}
@@ -2239,6 +2318,8 @@ def entry(path, root):
     }
 
 action, root_value, path_value = sys.argv[1:4]
+offset = max(0, int(sys.argv[4])) if len(sys.argv) > 4 else 0
+limit = max(4096, min(int(sys.argv[5]), 2097152)) if len(sys.argv) > 5 else 1048576
 root = Path(root_value).expanduser().resolve()
 if action == "picker":
     candidate = Path(path_value).expanduser().resolve()
@@ -2267,14 +2348,29 @@ if hidden(target): fail(403, "Sensitive workspace files are not available in the
 if action == "browse":
     if target.is_file():
         size = target.stat().st_size
-        if size > 512000: fail(413, "File is too large for the browser preview")
-        raw = target.read_bytes()
-        editable = b"\0" not in raw
+        suffix = target.suffix.lower()
+        media_type = __import__('mimetypes').guess_type(target.name)[0] or ''
+        kind = 'image' if media_type.startswith('image/') else 'audio' if media_type.startswith('audio/') else 'video' if media_type.startswith('video/') else 'pdf' if media_type == 'application/pdf' or suffix == '.pdf' else 'text' if media_type.startswith('text/') or suffix in {'.txt','.md','.markdown','.json','.jsonl','.yaml','.yml','.toml','.ini','.csv','.tsv','.log','.py','.js','.ts','.tsx','.jsx','.css','.html','.xml','.sh','.rs','.go','.java','.c','.cc','.cpp','.h','.hpp','.sql'} else 'file'
+        if kind != 'text':
+            print(json.dumps({"root": str(root), "entry": entry(target, root), "content": "", "editable": False, "preview_kind": kind, "offset": 0, "next_offset": None, "truncated": False}, ensure_ascii=False))
+            raise SystemExit(0)
+        with target.open('rb') as handle:
+            sample = handle.read(8192)
+            handle.seek(min(offset, size))
+            raw = handle.read(limit)
+        editable = b"\0" not in raw and b"\0" not in sample
         try: content = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            content = raw.decode("utf-8", errors="replace")
-            editable = False
-        print(json.dumps({"root": str(root), "entry": entry(target, root), "content": content, "editable": editable}, ensure_ascii=False))
+        except UnicodeDecodeError as exc:
+            split_character = min(offset, size) + len(raw) < size and exc.reason == 'unexpected end of data' and exc.end == len(raw)
+            if split_character:
+                raw = raw[:exc.start]
+                content = raw.decode('utf-8')
+            else:
+                content = raw.decode("utf-8", errors="replace")
+                editable = False
+        next_offset = min(offset, size) + len(raw)
+        truncated = next_offset < size
+        print(json.dumps({"root": str(root), "entry": entry(target, root), "content": content, "editable": editable and not truncated and offset == 0 and b"\0" not in sample, "preview_kind": "text", "offset": min(offset, size), "next_offset": next_offset if truncated else None, "truncated": truncated}, ensure_ascii=False))
     else:
         rows = []
         for child in sorted(target.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower())):
@@ -2334,14 +2430,14 @@ print(json.dumps({"ok": True, "entry": entry, "bytes": total}, ensure_ascii=Fals
 '''.strip()
 
 
-async def remote_fs_json(task: dict, action: str, path: str = "") -> dict[str, Any]:
+async def remote_fs_json(task: dict, action: str, path: str = "", offset: int = 0, limit: int = TEXT_PREVIEW_CHUNK_BYTES) -> dict[str, Any]:
     host = task.get("ssh_host") or ""
     connection = await require_ssh_connection(host)
     python_bin = connection.get("python_bin")
     if not python_bin:
         raise HTTPException(503, f"Python 3 was not found on SSH host {host}")
     root = task["workspace"]
-    command = shlex.join([python_bin, "-c", REMOTE_FS_SCRIPT, action, root, path])
+    command = shlex.join([python_bin, "-c", REMOTE_FS_SCRIPT, action, root, path, str(offset), str(limit)])
     result = await asyncio.to_thread(ssh_capture, host, command, 20)
     try:
         payload = json.loads(result.stdout)
@@ -5741,10 +5837,16 @@ async def task_events(task_id: str, session_id: Optional[str] = None, history_li
 
 
 @app.get("/api/tasks/{task_id}/workspace")
-async def task_workspace(task_id: str, path: str = "", _: Any = Depends(auth)):
+async def task_workspace(
+    task_id: str,
+    path: str = "",
+    offset: int = 0,
+    limit: int = TEXT_PREVIEW_CHUNK_BYTES,
+    _: Any = Depends(auth),
+):
     task = task_or_404(task_id)
     if task.get("ssh_host"):
-        return await remote_fs_json(task, "browse", path)
+        return await remote_fs_json(task, "browse", path, offset, limit)
     if path:
         root, candidate = existing_workspace_file(task, path, "Workspace path not found")
     else:
@@ -5754,19 +5856,18 @@ async def task_workspace(task_id: str, path: str = "", _: Any = Depends(auth)):
     if candidate.is_file():
         if workspace_hidden(candidate):
             raise HTTPException(403, "Sensitive workspace files are not available in browser preview")
-        if candidate.stat().st_size > 512_000:
-            raise HTTPException(413, "File is too large for the browser preview")
+        kind = workspace_preview_kind(candidate.name)
+        entry = workspace_entry(candidate, root)
+        if kind != "text":
+            return {
+                "root": str(root), "entry": entry, "content": "", "editable": False,
+                "preview_kind": kind, "offset": 0, "next_offset": None, "truncated": False,
+            }
         try:
-            raw = candidate.read_bytes()
+            chunk = workspace_text_chunk(candidate, offset, limit)
         except OSError as exc:
             raise HTTPException(400, f"Unable to read workspace file: {exc}")
-        editable = b"\0" not in raw
-        try:
-            content = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            content = raw.decode("utf-8", errors="replace")
-            editable = False
-        return {"root": str(root), "entry": workspace_entry(candidate, root), "content": content, "editable": editable}
+        return {"root": str(root), "entry": entry, "preview_kind": "text", **chunk}
     entries = []
     try:
         children = sorted(candidate.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower()))
@@ -5922,7 +6023,12 @@ async def update_workspace_file(task_id: str, payload: WorkspaceFileUpdate, path
 
 
 @app.get("/api/tasks/{task_id}/workspace/download")
-async def download_workspace_file(task_id: str, path: str, _: Any = Depends(auth)):
+async def download_workspace_file(
+    task_id: str,
+    request: Request,
+    path: str,
+    _: Any = Depends(auth),
+):
     task = task_or_404(task_id)
     if task.get("ssh_host"):
         metadata = await remote_fs_json(task, "stat", path)
@@ -5932,8 +6038,17 @@ async def download_workspace_file(task_id: str, path: str, _: Any = Depends(auth
         python_bin = connection.get("python_bin")
         if not python_bin:
             raise HTTPException(503, f"Python 3 was not found on SSH host {task['ssh_host']}")
-        read_script = "from pathlib import Path; import shutil,sys; r=Path(sys.argv[1]).resolve(); p=(r/sys.argv[2]).resolve(); (p==r or r in p.parents) or sys.exit(4); shutil.copyfileobj(p.open('rb'),sys.stdout.buffer,1024*1024)"
-        command = shlex.join([python_bin, "-c", read_script, task["workspace"], path])
+        total_size = int(metadata["entry"].get("size") or 0)
+        start, end = 0, total_size - 1
+        range_header = request.headers.get("range", "")
+        if range_header:
+            try:
+                start, end = parse_byte_range(range_header, total_size) or (start, end)
+            except ValueError as exc:
+                raise HTTPException(416, str(exc), headers={"Content-Range": f"bytes */{total_size}"}) from exc
+        length = max(0, end - start + 1)
+        read_script = "from pathlib import Path; import sys; r=Path(sys.argv[1]).resolve(); p=(r/sys.argv[2]).resolve(); (p==r or r in p.parents) or sys.exit(4); start=int(sys.argv[3]); left=int(sys.argv[4]); f=p.open('rb'); f.seek(start); out=sys.stdout.buffer;\nwhile left:\n b=f.read(min(left,1048576));\n if not b: break\n out.write(b); left-=len(b)"
+        command = shlex.join([python_bin, "-c", read_script, task["workspace"], path, str(start), str(length)])
         process = await asyncio.create_subprocess_exec(
             *ssh_options(task["ssh_host"], batch=True), ssh_destination(task["ssh_host"]), command,
             stdout=asyncio.subprocess.PIPE,
@@ -5957,7 +6072,19 @@ async def download_workspace_file(task_id: str, path: str, _: Any = Depends(auth
         media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
         mode = "inline" if media_type.startswith(("image/", "audio/", "video/")) or media_type == "application/pdf" else "attachment"
         disposition = f"{mode}; filename*=UTF-8''{urllib.parse.quote(filename)}"
-        return StreamingResponse(stream_remote_file(), media_type=media_type, headers={"Content-Disposition": disposition})
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Disposition": disposition,
+            "Content-Length": str(length),
+        }
+        if range_header:
+            headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
+        return StreamingResponse(
+            stream_remote_file(),
+            status_code=206 if range_header else 200,
+            media_type=media_type,
+            headers=headers,
+        )
     _root, candidate = existing_workspace_file(task, path, "Workspace file not found")
     if not candidate.is_file():
         raise HTTPException(400, "Only files can be downloaded")
@@ -5968,9 +6095,10 @@ async def download_workspace_file(task_id: str, path: str, _: Any = Depends(auth
     return FileResponse(candidate, media_type=media_type, content_disposition_type=disposition, filename=candidate.name)
 
 
-def image_thumbnail(data: bytes, size: int) -> bytes:
+def image_thumbnail(data: bytes | Path, size: int) -> bytes:
     try:
-        with Image.open(io.BytesIO(data)) as source:
+        source_value = io.BytesIO(data) if isinstance(data, bytes) else data
+        with Image.open(source_value) as source:
             image = ImageOps.exif_transpose(source)
             image.thumbnail((size, size), Image.Resampling.LANCZOS)
             if image.mode not in {"RGB", "RGBA"}:
@@ -6025,7 +6153,7 @@ async def thumbnail_workspace_file(task_id: str, path: str, size: int = 640, _: 
         cache_file = cache_dir / f"{cache_key}.webp"
         if not cache_file.is_file():
             cache_dir.mkdir(parents=True, exist_ok=True)
-            cache_file.write_bytes(image_thumbnail(candidate.read_bytes(), size))
+            cache_file.write_bytes(image_thumbnail(candidate, size))
     return FileResponse(cache_file, media_type="image/webp", headers={"Cache-Control": "private, max-age=86400"})
 
 

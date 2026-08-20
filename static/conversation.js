@@ -909,13 +909,7 @@ async function hydrateChatFiles() {
         preview.hidden = false;
         preview.innerHTML = `<a class="chat-image-link" href="#" aria-label="${esc(path.split("/").pop() || path)}"><img src="${url}" alt="${esc(path.split("/").pop() || path)}" /></a>`;
       } else if (["audio", "video"].includes(mediaKind) && preview) {
-        let url = chatFileObjectUrls.get(cacheKey) || "";
-        if (!url) {
-          const response = await workspaceFetch(`/tasks/${encodeURIComponent(taskId)}/workspace/download?path=${encodeURIComponent(path)}`);
-          if (!response.ok) throw new Error("media load failed");
-          url = URL.createObjectURL(await response.blob());
-          chatFileObjectUrls.set(cacheKey, url);
-        }
+        const url = chatDownloadUrl(taskId, path);
         preview.hidden = false;
         preview.classList.add("chat-media-preview");
         preview.innerHTML = mediaKind === "audio"
@@ -989,23 +983,17 @@ document.addEventListener("keydown", event => {
   }
 });
 async function renderTextFileViewer(taskId, path) {
-  const previewResponse = await workspaceFetch(`/tasks/${encodeURIComponent(taskId)}/workspace?path=${encodeURIComponent(path)}`);
-  let content = "";
-  if (previewResponse.ok) {
-    const response = await previewResponse.json();
-    content = response.content ?? "";
-  } else if (previewResponse.status === 413) {
-    const downloadResponse = await workspaceFetch(`/tasks/${encodeURIComponent(taskId)}/workspace/download?path=${encodeURIComponent(path)}`);
-    if (!downloadResponse.ok) throw await workspaceResponseError(downloadResponse);
-    const blob = await downloadResponse.blob();
-    if (blob.size > 2_000_000) throw new Error("文本文件过大，请下载后查看");
-    content = await blob.text();
-  } else {
-    throw await workspaceResponseError(previewResponse);
-  }
+  const loadChunk = async offset => {
+    const query = new URLSearchParams({ path, offset: String(offset), limit: String(1024 * 1024) });
+    const response = await workspaceFetch(`/tasks/${encodeURIComponent(taskId)}/workspace?${query}`);
+    if (!response.ok) throw await workspaceResponseError(response);
+    return response.json();
+  };
+  const response = await loadChunk(0);
+  const content = response.content ?? "";
   const body = $("#media-viewer-body");
   const ext = chatFileExtension(path);
-  if (["md", "markdown"].includes(ext) && window.toastui?.Editor) {
+  if (!response.truncated && ["md", "markdown"].includes(ext) && window.toastui?.Editor) {
     body.innerHTML = `<div id="media-viewer-markdown" class="media-viewer-markdown"></div>`;
     mediaViewerMarkdown = toastui.Editor.factory({
       el: $("#media-viewer-markdown"),
@@ -1016,8 +1004,27 @@ async function renderTextFileViewer(taskId, path) {
     });
     return;
   }
-  body.innerHTML = `<pre class="media-viewer-text"></pre>`;
-  $(".media-viewer-text", body).textContent = content;
+  body.innerHTML = `<div class="media-viewer-text-shell"><pre class="media-viewer-text"></pre><button type="button" class="secondary media-viewer-load-more" ${response.next_offset == null ? "hidden" : ""}>加载后续内容</button></div>`;
+  const output = $(".media-viewer-text", body);
+  const more = $(".media-viewer-load-more", body);
+  output.textContent = content;
+  let nextOffset = response.next_offset;
+  more.onclick = async () => {
+    if (nextOffset == null || more.disabled) return;
+    more.disabled = true;
+    more.textContent = "正在加载…";
+    try {
+      const chunk = await loadChunk(nextOffset);
+      output.append(document.createTextNode(chunk.content ?? ""));
+      nextOffset = chunk.next_offset;
+      more.hidden = nextOffset == null;
+      more.textContent = "加载后续内容";
+    } catch (error) {
+      more.textContent = error.message || "加载失败，重试";
+    } finally {
+      more.disabled = false;
+    }
+  };
 }
 async function openChatFileViewer({ taskId, path, kind }) {
   const viewer = $("#media-viewer");
@@ -1038,7 +1045,7 @@ async function openChatFileViewer({ taskId, path, kind }) {
     if (kind === "text") {
       await renderTextFileViewer(taskId, path);
     } else if (["image", "audio", "video", "pdf"].includes(kind)) {
-      const url = await chatFileObjectUrl(taskId, path, kind);
+      const url = chatDownloadUrl(taskId, path);
       if (kind === "image") body.innerHTML = `<img class="media-viewer-image" src="${url}" alt="${esc(filename)}" />`;
       else if (kind === "audio") body.innerHTML = `<audio class="media-viewer-audio" controls autoplay preload="metadata" src="${url}"></audio>`;
       else if (kind === "video") body.innerHTML = `<video class="media-viewer-video" controls autoplay preload="metadata" src="${url}"></video>`;
@@ -1136,9 +1143,9 @@ function renderWorkspace(data, taskId = state.selectedTask?.id || "") {
     breadcrumbs.push(`<span class="workspace-crumb-separator">/</span><button class="workspace-crumb ${index === parts.length - 1 ? "current" : ""}" data-browse="${esc(target)}">${esc(part)}</button>`);
   });
   const parent = parts.slice(0, -1).join("/");
-  const toolbar = `<div class="workspace-toolbar"><button type="button" class="workspace-tool" data-workspace-change title="${workspaceLocked ? "停止当前 Codex turn 后更改工作目录" : "选择工作目录"}" ${workspaceLocked ? "disabled" : ""}><span aria-hidden="true">▰</span> 更改目录</button>${isDirectory ? `<button type="button" class="workspace-tool" data-workspace-upload title="上传文件到当前目录"><span aria-hidden="true">↑</span> 上传</button>` : `${data.editable === true ? `<button type="button" class="workspace-tool" data-workspace-edit="${esc(path)}" title="编辑当前文件"><span aria-hidden="true">✎</span> 编辑</button>` : ""}<button type="button" class="workspace-tool" data-workspace-download="${esc(path)}" title="下载当前文件"><span aria-hidden="true">↓</span> 下载</button>`}</div>`;
+  const toolbar = `<div class="workspace-toolbar"><button type="button" class="workspace-tool" data-workspace-change title="${workspaceLocked ? "停止当前 Codex turn 后更改工作目录" : "选择工作目录"}" ${workspaceLocked ? "disabled" : ""}><span aria-hidden="true">▰</span> 更改目录</button>${isDirectory ? `<button type="button" class="workspace-tool" data-workspace-upload title="上传文件到当前目录"><span aria-hidden="true">↑</span> 上传</button>` : `<button type="button" class="workspace-tool" data-workspace-preview="${esc(path)}" data-preview-kind="${esc(data.preview_kind || chatViewerKind(path))}" title="预览当前文件"><span aria-hidden="true">⌕</span> 预览</button>${data.editable === true ? `<button type="button" class="workspace-tool" data-workspace-edit="${esc(path)}" title="编辑当前文件"><span aria-hidden="true">✎</span> 编辑</button>` : ""}<button type="button" class="workspace-tool" data-workspace-download="${esc(path)}" title="下载当前文件"><span aria-hidden="true">↓</span> 下载</button>`}</div>`;
   const entries = data.entry.kind === "file"
-    ? `<div class="file-preview"><div class="file-preview-head"><span>▣ ${esc(data.entry.name)}</span><small>${formatBytes(data.entry.size)}</small></div><pre>${esc(data.content || "")}</pre></div>`
+    ? `<div class="file-preview"><div class="file-preview-head"><span>▣ ${esc(data.entry.name)}</span><small>${formatBytes(data.entry.size)}${data.truncated ? " · 已显示前 1 MB" : ""}</small></div>${data.preview_kind === "text" ? `<pre>${esc(data.content || "")}</pre>` : `<button type="button" class="file-preview-open" data-workspace-preview="${esc(path)}" data-preview-kind="${esc(data.preview_kind || chatViewerKind(path))}">打开${chatViewerLabel(data.preview_kind || chatViewerKind(path))}预览</button>`}</div>`
     : `<div class="workspace-browser" id="workspace-browser">${(data.entries || []).map(entry => `<div class="file-row ${entry.kind}"><button type="button" class="file-open" data-browse="${esc(entry.path)}"><span>${entry.kind === "directory" ? "▰" : "▤"}</span><span>${esc(entry.name)}</span><small>${entry.kind === "directory" ? "目录" : formatBytes(entry.size)}</small></button>${entry.kind === "file" ? `<button type="button" class="file-download" data-workspace-download="${esc(entry.path)}" title="下载 ${esc(entry.name)}" aria-label="下载 ${esc(entry.name)}">↓</button>` : ""}</div>`).join("") || `<p class="muted">目录为空，可将文件拖到这里上传。</p>`}</div>`;
   $("#inspector-content").insertAdjacentHTML("beforeend", `<section class="inspector-section workspace-section" id="workspace-section" data-task-id="${esc(taskId)}" data-entry-kind="${esc(data.entry.kind)}" data-path="${esc(path)}"><span class="inspector-label">WORKSPACE FILES</span>${toolbar}<nav class="workspace-breadcrumbs" aria-label="工作区路径">${breadcrumbs.join("")}</nav>${path ? `<button class="file-up" data-browse="${esc(parent)}">‹ 返回上级</button>` : ""}${entries}</section>`);
   const workspace = $("#workspace-section");
@@ -1241,14 +1248,9 @@ async function uploadWorkspaceFiles(files, destination = state.workspacePath) {
 
 async function downloadWorkspaceFile(path) {
   if (!state.selectedId) return;
-  const response = await workspaceFetch(`/tasks/${state.selectedId}/workspace/download?path=${encodeURIComponent(path)}`);
-  if (!response.ok) throw await workspaceResponseError(response);
-  const blob = await response.blob();
-  const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
-  link.href = url; link.download = path.split("/").filter(Boolean).pop() || "download";
+  link.href = chatDownloadUrl(state.selectedId, path); link.download = path.split("/").filter(Boolean).pop() || "download";
   document.body.append(link); link.click(); link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 function openWorkspaceFileEditor(path) {
   const file = state.workspaceFile;
