@@ -322,7 +322,8 @@ function buildBlocks(events, rawActivity, labels) {
       else current.text = text;
       continue;
     }
-    if (!current || current.role !== role || role === "user" || commandBlock || current.commandBlock) {
+    const distinctItem = Boolean(itemId && current && itemId !== current.itemId);
+    if (!current || current.role !== role || role === "user" || commandBlock || current.commandBlock || distinctItem) {
       current = { role, text: "", session: event.session_id, commandBlock, itemId, eventId: String(event.id || ""), turnId: String(payload?.turn_id || payload?.turnId || ""), delivery: payload?.type === "browserMessage" ? payload.status : "", error: payload?.error || "", streaming: payload?.type === "agent_delta", origin: event.stream === "rollout" ? "terminal" : "web", time: event.ts || event.created_at || "" };
       blocks.push(current); if (itemId) itemMap.set(itemId, current);
     }

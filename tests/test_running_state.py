@@ -1188,12 +1188,49 @@ const blocks = context.buildBlocks([
 process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
 """
         result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
-        self.assertEqual(["keep this request", "visible answer\nafter"], json.loads(result.stdout))
+        self.assertEqual(["keep this request", "visible answer", "after"], json.loads(result.stdout))
 
         conversation = (worker.parent / "conversation.js").read_text(encoding="utf-8")
         html = (worker.parent / "index.html").read_text(encoding="utf-8")
-        self.assertIn('/chat-worker.js?v=20260819-activity-retention', conversation)
+        self.assertIn('/chat-worker.js?v=20260820-distinct-agent-items', conversation)
         self.assertIn('/conversation.js?v=20260820-source-location-viewer', html)
+
+    def test_worker_keeps_distinct_agent_items_in_separate_markdown_blocks(self):
+        worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
+        first = "远端节点没有目标目录输出。"
+        final = """可以，已经按这个方向改了：
+
+- `sglang-omni` 里已恢复：
+  ```python
+  torch.load(codec_path, map_location=device)
+  ```
+- `torchada` 新增设备映射。"""
+        script = f"""
+const fs = require("fs");
+const path = require("path");
+const vm = require("vm");
+const staticRoot = {json.dumps(str(worker.parent))};
+const context = {{ console, atob, self: {{ postMessage() {{}} }} }};
+vm.createContext(context);
+context.importScripts = (...urls) => {{
+  for (const url of urls) vm.runInContext(fs.readFileSync(path.join(staticRoot, url), "utf8"), context, {{ filename: url }});
+}};
+vm.runInContext(fs.readFileSync({json.dumps(str(worker))}, "utf8"), context);
+const blocks = context.buildBlocks([
+  {{ id: "first", stream: "app-server", payload: JSON.stringify({{ type: "agentMessage", item_id: "agent-1", text: {json.dumps(first)} }}) }},
+  {{ id: "delta-1", stream: "app-server", payload: JSON.stringify({{ type: "agent_delta", item_id: "agent-2", delta: "可以，" }}) }},
+  {{ id: "delta-2", stream: "app-server", payload: JSON.stringify({{ type: "agent_delta", item_id: "agent-2", delta: "已经按这个方向改了：" }}) }},
+  {{ id: "final", stream: "app-server", payload: JSON.stringify({{ type: "agentMessage", item_id: "agent-2", text: {json.dumps(final)} }}) }},
+], false, {{}});
+process.stdout.write(JSON.stringify(blocks.map(block => ({{ itemId: block.itemId, text: block.text, html: block.html }}))));
+"""
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
+        blocks = json.loads(result.stdout)
+        self.assertEqual(["agent-1", "agent-2"], [block["itemId"] for block in blocks])
+        self.assertEqual(first, blocks[0]["text"])
+        self.assertEqual(final, blocks[1]["text"])
+        self.assertEqual(1, blocks[1]["html"].count("<pre>"))
+        self.assertEqual(1, blocks[1]["html"].count("</pre>"))
 
     def test_worker_hides_native_media_tags(self):
         script = f"""
@@ -1753,7 +1790,7 @@ process.stdout.write(JSON.stringify({{ recent: bodies(recentEvents), older: bodi
         self.assertEqual(["currently running message", "old sent message", "current sent message"], payload["older"])
 
         conversation = (worker.parent / "conversation.js").read_text(encoding="utf-8")
-        self.assertIn('/chat-worker.js?v=20260819-activity-retention', conversation)
+        self.assertIn('/chat-worker.js?v=20260820-distinct-agent-items', conversation)
 
     def test_metrics_user_event_does_not_hide_its_browser_message(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -4008,7 +4045,7 @@ process.stdout.write(JSON.stringify([
         self.assertIn(".exploration-node.selected .exploration-node-copy", styles)
         self.assertNotIn("renderSessionList(); renderConversation(); await loadWorkspace(\"\")", conversation_js)
         self.assertIn(".queued-messages { width: auto; height: auto; min-height: 0; max-height: none; align-self: stretch;", styles)
-        self.assertIn('/chat-worker.js?v=20260819-activity-retention', conversation_js)
+        self.assertIn('/chat-worker.js?v=20260820-distinct-agent-items', conversation_js)
         self.assertIn('data-live="true" open', conversation_js)
         self.assertIn("activity-event.current::after", styles)
         self.assertIn("function renderActivityEvent", conversation_js)

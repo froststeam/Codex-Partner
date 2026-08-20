@@ -2,7 +2,7 @@
 const chatFileObjectUrls = new Map();
 const chatThumbnailObjectUrls = new Map();
 const chatThumbnailLoads = new Map();
-const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260819-activity-retention") : null;
+const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260820-distinct-agent-items") : null;
 const conversationSnapshots = new Map();
 let chatBuildRequestId = 0;
 let chatBuildInFlight = false;
