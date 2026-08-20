@@ -33,7 +33,7 @@ import urllib.request
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -1267,34 +1267,43 @@ def inspect_rollout_boundary(path: str) -> tuple[int, Optional[dict], str]:
         return 0, None, ""
 
 
-def rollout_writer_pids(path: str, refresh: bool = False) -> set[int]:
-    """Find live processes that currently hold a rollout file open for writing."""
-    target = os.path.realpath(path)
+def rollout_writer_pid_map(paths: Iterable[str], refresh: bool = False) -> dict[str, set[int]]:
+    """Find writers for many rollout files with one process table scan."""
+    targets = {os.path.realpath(path) for path in paths if path}
     stamp = time.monotonic()
-    cached = rollout_writer_cache.get(target)
-    if cached and not refresh and stamp - cached[0] < 2:
-        return set(cached[1])
-    writers: set[int] = set()
+    writers: dict[str, set[int]] = {}
+    unresolved: set[str] = set()
+    for target in targets:
+        cached = rollout_writer_cache.get(target)
+        if cached and not refresh and stamp - cached[0] < 2:
+            writers[target] = set(cached[1])
+        else:
+            writers[target] = set()
+            unresolved.add(target)
+    if not unresolved:
+        return writers
     try:
         processes = os.scandir("/proc")
     except OSError:
         lsof = shutil.which("lsof")
         if lsof:
-            try:
-                result = subprocess.run(
-                    [lsof, "-t", "--", target],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=2,
-                    check=False,
-                )
-                writers = {int(value) for value in result.stdout.splitlines() if value.isdigit()}
-            except (OSError, subprocess.SubprocessError, ValueError):
-                pass
-        rollout_writer_cache[target] = (stamp, writers)
-        return set(writers)
+            for target in unresolved:
+                try:
+                    result = subprocess.run(
+                        [lsof, "-t", "--", target],
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=2,
+                        check=False,
+                    )
+                    writers[target] = {int(value) for value in result.stdout.splitlines() if value.isdigit()}
+                except (OSError, subprocess.SubprocessError, ValueError):
+                    pass
+        for target in unresolved:
+            rollout_writer_cache[target] = (stamp, writers[target])
+        return writers
     with processes:
         for process in processes:
             if not process.name.isdigit():
@@ -1310,18 +1319,25 @@ def rollout_writer_pids(path: str, refresh: bool = False) -> set[int]:
                         linked = os.readlink(descriptor.path)
                         if linked.endswith(" (deleted)"):
                             linked = linked[:-10]
-                        if os.path.realpath(linked) != target:
+                        target = os.path.realpath(linked)
+                        if target not in unresolved:
                             continue
                         with open(f"/proc/{process.name}/fdinfo/{descriptor.name}", encoding="ascii") as info:
                             flags_line = next((line for line in info if line.startswith("flags:")), "")
                         if not flags_line or int(flags_line.split()[1], 8) & os.O_ACCMODE == os.O_RDONLY:
                             continue
-                        writers.add(int(process.name))
-                        break
+                        writers[target].add(int(process.name))
                     except (OSError, ValueError, StopIteration):
                         continue
-    rollout_writer_cache[target] = (stamp, writers)
-    return set(writers)
+    for target in unresolved:
+        rollout_writer_cache[target] = (stamp, writers[target])
+    return writers
+
+
+def rollout_writer_pids(path: str, refresh: bool = False) -> set[int]:
+    """Find live processes that currently hold a rollout file open for writing."""
+    target = os.path.realpath(path)
+    return rollout_writer_pid_map([path], refresh).get(target, set())
 
 
 def process_tree_pids(roots: set[int]) -> set[int]:
@@ -1802,10 +1818,16 @@ async def refresh_native_rollouts() -> None:
         for task in tasks:
             if task["id"] not in before:
                 await broadcast_overview(task["id"], {"kind": "native_import"})
-        for row in rows:
+        missing_rows = [row for row in rows if row["thread_id"] not in task_by_thread and row.get("path")]
+        writer_map = await asyncio.to_thread(
+            rollout_writer_pid_map,
+            [row["path"] for row in missing_rows],
+            True,
+        )
+        for row in missing_rows:
             if row["thread_id"] in task_by_thread or not row.get("path"):
                 continue
-            writers = await asyncio.to_thread(native_rollout_writer_pids, row["path"], True)
+            writers = writer_map.get(os.path.realpath(row["path"]), set())
             if not writers:
                 continue
             task_id = await asyncio.to_thread(import_active_native_rollout, row["thread_id"], row["path"])

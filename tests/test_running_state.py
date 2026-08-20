@@ -365,6 +365,7 @@ class RunningStateTests(unittest.TestCase):
             with mock.patch.object(self.app, "USE_APP_SERVER", True), \
                  mock.patch.object(self.app, "native_rollout_rows", return_value=[{"thread_id": thread_id, "path": str(rollout)}]), \
                  mock.patch.object(self.app, "sync_native_threads", new=mock.AsyncMock(return_value={"imported": 0})), \
+                 mock.patch.object(self.app, "rollout_writer_pid_map", return_value={os.path.realpath(rollout): {4242}}), \
                  mock.patch.object(self.app, "native_rollout_writer_pids", return_value={4242}):
                 asyncio.run(self.app.refresh_native_rollouts())
             task = self.app.task_or_404(thread_id)
