@@ -432,6 +432,19 @@ class RunningStateTests(unittest.TestCase):
         resolved_workspace = workspace.resolve()
         self.assertTrue(all(resolved_workspace in Path(item["path"]).resolve().parents for item in inputs[1:]))
 
+    def test_goal_resume_does_not_replay_the_original_prompt(self):
+        task = {
+            "workspace": self.temp.name,
+            "prompt": "stale original prompt",
+            "context": "",
+            "goal": "write a novel",
+            "memory_mode": "disabled",
+            "ssh_host": "",
+        }
+        inputs = self.app.appserver_turn_inputs(task, "", include_goal_memory=True)
+        self.assertEqual("Continue working toward the active thread goal.", inputs[0]["text"])
+        self.assertNotIn("stale original prompt", inputs[0]["text"])
+
     def test_attachment_frontend_uses_structured_appserver_inputs(self):
         static = Path(__file__).resolve().parents[1] / "static"
         app_js = (static / "app.js").read_text(encoding="utf-8")
@@ -2150,6 +2163,67 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertTrue(self.app.is_provider_failure(RuntimeError("transport failed")))
         with mock.patch.object(self.app, "app_shutting_down", True):
             self.assertFalse(self.app.is_provider_failure(RuntimeError("app-server exited")))
+
+    def test_dashboard_restart_queues_active_appserver_turn(self):
+        task_id = "restart-active-appserver"
+        session_id = "restart-active-session"
+        message_id = "restart-active-message"
+        self.make_task(task_id, "running")
+        stamp = self.app.now()
+        self.app.db.execute(
+            "UPDATE tasks SET active_session_id=?,execution_source='dashboard',execution_turn_id='turn-live' WHERE id=?",
+            (session_id, task_id),
+        )
+        self.app.db.execute(
+            "INSERT INTO sessions (id,task_id,status,attempt,command,started_at) VALUES (?,?,?,?,?,?)",
+            (session_id, task_id, "running", 1, "codex app-server", stamp),
+        )
+        self.app.db.execute(
+            "INSERT INTO task_messages (id,task_id,body,status,session_id,created_at,started_at) VALUES (?,?,?,?,?,?,?)",
+            (message_id, task_id, "continue", "running", session_id, stamp, stamp),
+        )
+        try:
+            self.app.queue_appserver_turn_for_restart(task_id, session_id, message_id)
+            task = self.app.task_or_404(task_id)
+            session = self.app.db.one("SELECT * FROM sessions WHERE id=?", (session_id,))
+            message = self.app.db.one("SELECT * FROM task_messages WHERE id=?", (message_id,))
+            self.assertEqual("queued", task["status"])
+            self.assertEqual("dashboard", task["execution_source"])
+            self.assertEqual("", task["execution_turn_id"])
+            self.assertEqual("interrupted", session["status"])
+            self.assertEqual("queued", message["status"])
+            self.assertIsNone(message["session_id"])
+        finally:
+            self.app.db.execute("DELETE FROM task_messages WHERE task_id=?", (task_id,))
+            self.app.db.execute("DELETE FROM sessions WHERE task_id=?", (task_id,))
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_goal_supervisor_follows_consecutive_native_turns(self):
+        async def exercise():
+            class Client:
+                reader_error = None
+
+                def __init__(self):
+                    self.reader_task = asyncio.create_task(asyncio.sleep(60))
+
+            client = Client()
+            events = asyncio.Queue()
+            try:
+                await events.put({"method": "turn/completed", "turn": {"id": "turn-1", "status": "completed"}})
+                await events.put({"method": "turn/started", "turn": {"id": "turn-2", "status": "inProgress"}})
+                await events.put({"method": "turn/completed", "turn": {"id": "turn-2", "status": "completed"}})
+                first = await self.app.wait_for_appserver_turn(client, events, "turn-1")
+                second_id = await self.app.wait_for_next_appserver_turn(client, events, "turn-1")
+                second = await self.app.wait_for_appserver_turn(client, events, second_id)
+                return first, second_id, second
+            finally:
+                client.reader_task.cancel()
+                await asyncio.gather(client.reader_task, return_exceptions=True)
+
+        first, second_id, second = asyncio.run(exercise())
+        self.assertEqual("turn-1", first["id"])
+        self.assertEqual("turn-2", second_id)
+        self.assertEqual("turn-2", second["id"])
 
     def test_clearing_goal_uses_native_clear_and_disables_retry(self):
         task_id = "clear-native-goal-thread"

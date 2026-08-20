@@ -10,6 +10,7 @@ from .platform_support import prepare_subprocess_command
 
 
 NotificationHandler = Callable[[str, dict], Awaitable[None]]
+MAX_APP_SERVER_MESSAGE_BYTES = 512 * 1024 * 1024
 
 
 class AppServerClient:
@@ -53,6 +54,7 @@ class AppServerClient:
         self.write_lock = asyncio.Lock()
         self.pending: dict[int, asyncio.Future] = {}
         self.next_id = 1
+        self.reader_error: Optional[BaseException] = None
 
     async def start(self) -> None:
         if self.local and self.require_codex:
@@ -61,9 +63,13 @@ class AppServerClient:
             if self.websocket:
                 return
             self.websocket = (
-                await websockets.unix_connect(self.unix_socket, uri="ws://localhost", max_size=64 * 1024 * 1024)
+                await websockets.unix_connect(
+                    self.unix_socket,
+                    uri="ws://localhost",
+                    max_size=MAX_APP_SERVER_MESSAGE_BYTES,
+                )
                 if self.unix_socket
-                else await websockets.connect(self.websocket_url, max_size=64 * 1024 * 1024)
+                else await websockets.connect(self.websocket_url, max_size=MAX_APP_SERVER_MESSAGE_BYTES)
             )
             self.reader_task = asyncio.create_task(self._reader())
             await self._initialize()
@@ -99,6 +105,7 @@ class AppServerClient:
         await self.notify("initialized")
 
     async def _reader(self) -> None:
+        self.reader_error = None
         try:
             source = self.websocket if self.websocket else self._message_lines()
             async for raw in source:
@@ -128,9 +135,14 @@ class AppServerClient:
                         continue
         except asyncio.CancelledError:
             return
+        except Exception as exc:
+            # The pending request and turn waiters receive this failure below.
+            # Keep it on the client instead of leaking an unobserved task error.
+            self.reader_error = exc
         finally:
             self.websocket = None
-            error = RuntimeError("Codex app-server exited")
+            detail = f": {self.reader_error}" if self.reader_error else ""
+            error = RuntimeError(f"Codex app-server exited{detail}")
             for future in self.pending.values():
                 if not future.done():
                     future.set_exception(error)

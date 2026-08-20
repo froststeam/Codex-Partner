@@ -631,6 +631,7 @@ activity_graph_backlog: dict[str, list[dict[str, Any]]] = {}
 app_servers: dict[str, "AppServerClient"] = {}
 app_thread_bindings: dict[str, tuple[str, str, str]] = {}
 turn_waiters: dict[str, asyncio.Future] = {}
+turn_event_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
 compaction_waiters: dict[str, asyncio.Future] = {}
 goal_sync_locks: dict[str, asyncio.Lock] = {}
 
@@ -2677,6 +2678,10 @@ async def handle_appserver_notification(server_key: str, message: dict) -> None:
     if not binding:
         return
     task_id, session_id = binding
+    if method in {"turn/started", "turn/completed"}:
+        queue = turn_event_queues.get(thread_id)
+        if queue:
+            queue.put_nowait({"method": method, "turn": params.get("turn") or {}})
     if method == "item/agentMessage/delta":
         payload = {
             "type": "agent_delta",
@@ -2781,7 +2786,12 @@ async def handle_appserver_notification(server_key: str, message: dict) -> None:
     elif method == "turn/completed":
         turn = params.get("turn") or {}
         turn_status = turn.get("status") or "completed"
-        payload = {"type": "turn_completed", "status": turn_status, "thread_id": thread_id}
+        payload = {
+            "type": "turn_completed",
+            "status": turn_status,
+            "turn_id": turn.get("id", ""),
+            "thread_id": thread_id,
+        }
         waiter = turn_waiters.pop(thread_id, None)
         if waiter and not waiter.done():
             if turn_status in {"failed", "interrupted"}:
@@ -2918,6 +2928,74 @@ async def launch_appserver(
     return task_or_404(task["id"]) | {"session_id": session_id, "mode": mode, "message_id": message_id, "thread_id": resume_id, "shared_owner": True}
 
 
+def queue_appserver_turn_for_restart(task_id: str, session_id: str, message_id: str = "") -> None:
+    """Persist a dashboard turn for recovery while its daemon stays alive."""
+    stamp = now()
+    db.execute(
+        "UPDATE sessions SET status='interrupted',finished_at=?,exit_code=130,summary='Dashboard is restarting' WHERE id=?",
+        (stamp, session_id),
+    )
+    db.execute(
+        "UPDATE tasks SET status='queued',execution_source='dashboard',execution_turn_id='',last_error='Dashboard is restarting; task queued for resume',updated_at=? WHERE id=?",
+        (stamp, task_id),
+    )
+    if message_id:
+        db.execute(
+            "UPDATE task_messages SET status='queued',started_at=NULL,finished_at=NULL,session_id=NULL,error='Dashboard is restarting' WHERE id=?",
+            (message_id,),
+        )
+
+
+async def next_appserver_turn_event(client: AppServerClient, queue: asyncio.Queue[dict[str, Any]]) -> dict[str, Any]:
+    """Wait for one lifecycle event while also observing transport death."""
+    if client.reader_task and client.reader_task.done() and queue.empty():
+        detail = f": {client.reader_error}" if client.reader_error else ""
+        raise RuntimeError(f"Codex app-server exited{detail}")
+    event_task = asyncio.create_task(queue.get())
+    reader_task = client.reader_task
+    waiters = {event_task}
+    if reader_task and not reader_task.done():
+        waiters.add(reader_task)
+    done, _pending = await asyncio.wait(waiters, timeout=86400, return_when=asyncio.FIRST_COMPLETED)
+    if event_task in done:
+        return event_task.result()
+    event_task.cancel()
+    await asyncio.gather(event_task, return_exceptions=True)
+    if not done:
+        raise RuntimeError("Codex turn timed out")
+    detail = f": {client.reader_error}" if client.reader_error else ""
+    raise RuntimeError(f"Codex app-server exited{detail}")
+
+
+async def wait_for_appserver_turn(
+    client: AppServerClient,
+    queue: asyncio.Queue[dict[str, Any]],
+    turn_id: str,
+) -> dict[str, Any]:
+    while True:
+        event = await next_appserver_turn_event(client, queue)
+        turn = event.get("turn") or {}
+        if event.get("method") != "turn/completed" or str(turn.get("id") or "") != turn_id:
+            continue
+        status = str(turn.get("status") or "completed")
+        if status in {"failed", "interrupted"}:
+            raise RuntimeError(json.dumps(turn.get("error") or {"status": status}, ensure_ascii=False))
+        return turn
+
+
+async def wait_for_next_appserver_turn(
+    client: AppServerClient,
+    queue: asyncio.Queue[dict[str, Any]],
+    previous_turn_id: str,
+) -> str:
+    while True:
+        event = await next_appserver_turn_event(client, queue)
+        turn = event.get("turn") or {}
+        turn_id = str(turn.get("id") or "")
+        if event.get("method") == "turn/started" and turn_id and turn_id != previous_turn_id:
+            return turn_id
+
+
 async def supervise_appserver_turn(
     task: dict,
     provider: Optional[dict],
@@ -2932,6 +3010,7 @@ async def supervise_appserver_turn(
     thread_id = ""
     turn_id = ""
     waiter: Optional[asyncio.Future] = None
+    turn_events: Optional[asyncio.Queue[dict[str, Any]]] = None
     goal_revision_at_start: Optional[int] = None
     resume_goal_after_cleanup = False
     try:
@@ -3000,8 +3079,8 @@ async def supervise_appserver_turn(
         db.execute("UPDATE sessions SET command=?, codex_session_id=? WHERE id=?", (command, thread_id, session_id))
         app_thread_bindings[task["id"]] = (key, thread_id, session_id)
         running[task["id"]] = client.owner  # owner marker; browsers never spawn a second resume
-        waiter = asyncio.get_running_loop().create_future()
-        turn_waiters[thread_id] = waiter
+        turn_events = asyncio.Queue()
+        turn_event_queues[thread_id] = turn_events
         # Do not allow a Goal edit between thread/goal/set and turn/start.
         # Both the native Goal and the structured input must use one latest
         # revision, otherwise auto-resume can send the previous objective.
@@ -3046,11 +3125,27 @@ async def supervise_appserver_turn(
                 "UPDATE tasks SET execution_source=?,execution_turn_id=?,updated_at=? WHERE id=?",
                 ("mixed" if external_live else "dashboard", turn_id, now(), task["id"]),
             )
-            try:
-                await asyncio.wait_for(waiter, timeout=86400)
-            except asyncio.TimeoutError:
-                await client.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
-                raise RuntimeError("Codex turn timed out")
+            while True:
+                await wait_for_appserver_turn(client, turn_events, turn_id)
+                goal_task = task_or_404(task["id"])
+                revision_changed = int(goal_task.get("goal_revision") or 0) != int(goal_revision_at_start or 0)
+                if not (goal_task.get("goal") and run_mode == "goal_resume" and not revision_changed):
+                    break
+                goal_result = await client.request("thread/goal/get", {"threadId": thread_id})
+                goal = goal_result.get("goal") or {}
+                goal_status = goal.get("status", "active")
+                db.execute(
+                    "UPDATE tasks SET goal_status=?,goal_tokens_used=?,updated_at=? WHERE id=?",
+                    (goal_status, goal.get("tokensUsed", 0), now(), task["id"]),
+                )
+                if goal_status != "active":
+                    break
+                turn_id = await wait_for_next_appserver_turn(client, turn_events, turn_id)
+                appserver_turn_ids[task["id"]] = turn_id
+                db.execute(
+                    "UPDATE tasks SET status='running',execution_source='dashboard',execution_turn_id=?,last_error='',updated_at=? WHERE id=?",
+                    (turn_id, now(), task["id"]),
+                )
         if task_or_404(task["id"])["status"] == "stopped":
             raise asyncio.CancelledError
         goal_task = task_or_404(task["id"])
@@ -3060,7 +3155,7 @@ async def supervise_appserver_turn(
             goal = goal_result.get("goal") or {}
             goal_status = goal.get("status", "active")
             db.execute("UPDATE tasks SET goal_status=?, goal_tokens_used=?, updated_at=? WHERE id=?", (goal_status, goal.get("tokensUsed", 0), now(), task["id"]))
-            if goal_status != "complete" and not revision_changed:
+            if goal_status == "active" and not revision_changed:
                 record_provider_outcome(provider, True, "Codex turn completed; Goal continues")
                 raise GoalIncompleteError(f"Codex goal is not complete: {goal_status}")
         record_provider_outcome(provider, True, "Codex app-server turn completed")
@@ -3097,16 +3192,16 @@ async def supervise_appserver_turn(
                 await broadcast_task(task["id"], {"type": "message", "message_id": message_id, "status": "failed", "error": "Stopped by user", "session_id": session_id})
             await broadcast_task(task["id"], {"type": "session", "session_id": session_id, "status": "stopped"})
             return
+        if app_shutting_down:
+            queue_appserver_turn_for_restart(task["id"], session_id, message_id)
+            return
         raise
     except Exception as exc:
         error = str(exc)
         stopped = task_or_404(task["id"])["status"] == "stopped"
         provider_failed = is_provider_failure(exc)
         if app_shutting_down and not stopped:
-            db.execute("UPDATE sessions SET status='interrupted',finished_at=?,exit_code=130,summary='Dashboard is restarting' WHERE id=?", (now(), session_id))
-            db.execute("UPDATE tasks SET status='queued',execution_source='dashboard',execution_turn_id='',last_error='Dashboard is restarting; task queued for resume',updated_at=? WHERE id=?", (now(), task["id"]))
-            if message_id:
-                db.execute("UPDATE task_messages SET status='queued',started_at=NULL,finished_at=NULL,session_id=NULL,error='Dashboard is restarting' WHERE id=?", (message_id,))
+            queue_appserver_turn_for_restart(task["id"], session_id, message_id)
             return
         external = refresh_external_primary(task["id"])
         if external and not stopped:
@@ -3216,6 +3311,8 @@ async def supervise_appserver_turn(
                 pass
         if thread_id and turn_waiters.get(thread_id) is waiter:
             turn_waiters.pop(thread_id, None)
+        if thread_id and turn_event_queues.get(thread_id) is turn_events:
+            turn_event_queues.pop(thread_id, None)
         if turn_id and appserver_turn_ids.get(task["id"]) == turn_id:
             appserver_turn_ids.pop(task["id"], None)
         if appserver_turn_tasks.get(task["id"]) is asyncio.current_task():
@@ -3764,7 +3861,10 @@ def appserver_turn_inputs(task: dict, message: str, include_goal_memory: bool = 
     clean_message = CODEX_INPUT_MARKER.sub(collect, message)
     clean_message = LEGACY_FILE_MARKER.sub(lambda match: collect(match, True), clean_message)
     inputs: list[dict[str, Any]] = []
-    prompt = prompt_for(task, clean_message.strip())
+    clean_message = clean_message.strip()
+    if include_goal_memory and not clean_message:
+        clean_message = "Continue working toward the active thread goal."
+    prompt = prompt_for(task, clean_message)
     if prompt and task.get("id") and task.get("memory_mode", "enabled") != "disabled":
         snapshot = activity_graph_store.snapshot(task["id"])
         memory = recall_context(clean_message, snapshot, task.get("goal", "") if include_goal_memory else "")

@@ -38,6 +38,31 @@ class AppServerTransportTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_websocket_transport_accepts_full_history_larger_than_64_mib(self):
+        async def exercise():
+            history = "x" * (65 * 1024 * 1024)
+
+            async def handler(connection):
+                async for raw in connection:
+                    request = json.loads(raw)
+                    if "id" not in request:
+                        continue
+                    result = {} if request["method"] == "initialize" else {"history": history}
+                    await connection.send(json.dumps({"id": request["id"], "result": result}))
+
+            async with websockets.serve(handler, "127.0.0.1", 0) as server:
+                port = server.sockets[0].getsockname()[1]
+                client = AppServerClient({}, "large-history", websocket_url=f"ws://127.0.0.1:{port}")
+                try:
+                    await client.start()
+                    result = await client.request("thread/read", {"includeTurns": True})
+                    self.assertEqual(len(history), len(result["history"]))
+                    self.assertIsNone(client.reader_error)
+                finally:
+                    await client.close()
+
+        asyncio.run(exercise())
+
 
 if __name__ == "__main__":
     unittest.main()
