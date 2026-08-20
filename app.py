@@ -1823,7 +1823,8 @@ def workspace_path(task: dict, relative: str = "", allow_external_read: bool = F
     requested = Path(relative).expanduser() if relative else Path()
     candidate = (requested if requested.is_absolute() else root / requested).resolve()
     in_task_workspace = candidate == root or root in candidate.parents
-    in_configured_root = any(candidate == boundary or boundary in candidate.parents for boundary in WORKSPACE_ROOTS)
+    configured_roots = tuple(Path(boundary).expanduser().resolve() for boundary in WORKSPACE_ROOTS)
+    in_configured_root = any(candidate == boundary or boundary in candidate.parents for boundary in configured_roots)
     if not in_task_workspace and not (allow_external_read and requested.is_absolute() and in_configured_root):
         raise HTTPException(400, "Workspace path escapes the task workspace")
     return root, candidate

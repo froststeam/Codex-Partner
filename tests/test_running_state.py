@@ -2661,7 +2661,8 @@ process.stdout.write(JSON.stringify(browserMessages));
         artifact = external_root / "server.log"
         artifact.write_text("external artifact", encoding="utf-8")
         original_roots = self.app.WORKSPACE_ROOTS
-        self.app.WORKSPACE_ROOTS = (external_root,)
+        configured_root = external_root / ".." / external_root.name
+        self.app.WORKSPACE_ROOTS = (configured_root,)
         absolute = str(artifact)
         try:
             preview = asyncio.run(self.app.task_workspace(task_id, absolute))
