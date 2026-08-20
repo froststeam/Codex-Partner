@@ -3371,6 +3371,15 @@ async def auth(request: Request):
     return session
 
 
+def public_goal_status(task: dict) -> str:
+    status = task.get("goal_status") or ("active" if task.get("goal") else "none")
+    # Codex may report paused/blocked before Partner schedules the next turn.
+    # With auto-retry enabled the user-facing Goal remains active until done.
+    if task.get("goal") and task.get("retry_forever") and status != "complete":
+        return "active"
+    return status
+
+
 def task_or_404(task_id: str) -> dict:
     canonical_id = task_id_aliases.get(task_id, task_id)
     task = db.one("SELECT * FROM tasks WHERE id=?", (canonical_id,))
@@ -3385,7 +3394,7 @@ def task_or_404(task_id: str) -> dict:
     task["native"] = bool(task.get("native", 0))
     task["archived"] = bool(task.get("archived", 0))
     task["trashed"] = bool(task.get("trashed", 0))
-    task["goal_status"] = task.get("goal_status") or ("active" if task.get("goal") else "none")
+    task["goal_status"] = public_goal_status(task)
     if external := external_turns.get(task_id):
         task["external_running"] = True
         task["external_started_at"] = external.get("started_at")
@@ -3909,7 +3918,7 @@ def task_summary(task_id: str) -> Optional[dict]:
     row["native"] = bool(row.get("native", 0))
     row["archived"] = bool(row.get("archived", 0))
     row["trashed"] = bool(row.get("trashed", 0))
-    row["goal_status"] = row.get("goal_status") or ("active" if row.get("goal") else "none")
+    row["goal_status"] = public_goal_status(row)
     if external := external_turns.get(task_id):
         row["external_running"] = True
         row["external_started_at"] = external.get("started_at")
@@ -4827,6 +4836,7 @@ async def list_tasks(_: Any = Depends(auth)):
         r["native"] = bool(r.get("native", 0))
         r["archived"] = bool(r.get("archived", 0))
         r["trashed"] = bool(r.get("trashed", 0))
+        r["goal_status"] = public_goal_status(r)
     return rows
 
 
@@ -5019,8 +5029,12 @@ async def patch_task(task_id: str, payload: TaskPatch, _: Any = Depends(auth)):
     if "model" in values:
         persist_native_thread_model(result.get("codex_session_id") or task_id, str(values.get("model") or ""))
     await broadcast_overview(task_id, {"type": "updated"})
-    if values.get("retry_forever") and goal_auto_resume_enabled(result):
-        schedule_task_drain(task_id)
+    if values.get("retry_forever") and result.get("goal") and result.get("goal_status") != "complete":
+        raw_goal_status = (db.one("SELECT goal_status FROM tasks WHERE id=?", (task_id,)) or {}).get("goal_status") or "none"
+        if raw_goal_status != "active":
+            return await start_goal(task_id, None)
+        if goal_auto_resume_enabled(result):
+            schedule_task_drain(task_id)
     return result
 
 
@@ -5140,6 +5154,7 @@ async def start_goal(task_id: str, _: Any = Depends(auth)):
             raise HTTPException(409, "Set a Goal before starting it")
         if task.get("goal_status") == "complete":
             raise HTTPException(409, "Completed Goal cannot be restarted; edit it first")
+        previous_goal_status = (db.one("SELECT goal_status FROM tasks WHERE id=?", (task_id,)) or {}).get("goal_status") or "paused"
         stamp = now()
         db.execute(
             "UPDATE tasks SET goal_status='active',goal_revision=goal_revision+1,goal_updated_at=?,last_error='',updated_at=? WHERE id=?",
@@ -5150,7 +5165,7 @@ async def start_goal(task_id: str, _: Any = Depends(auth)):
         task = task_or_404(task_id)
     external_live = await refresh_live_external_turn(task_id)
     task = task_or_404(task_id)
-    if dashboard_owns_task(task_id) or task.get("status") == "running" or external_live:
+    if dashboard_owns_task(task_id) or external_live:
         db.execute("UPDATE tasks SET run_mode='goal_resume',updated_at=? WHERE id=?", (now(), task_id))
         result = task_or_404(task_id)
     else:
@@ -5159,7 +5174,19 @@ async def start_goal(task_id: str, _: Any = Depends(auth)):
             result = await launch(task_id, "goal-resume")
         except Exception as exc:
             if not is_task_busy_error(exc):
+                db.execute(
+                    "UPDATE tasks SET goal_status=?,status='stopped',run_mode='',last_error=?,updated_at=? WHERE id=?",
+                    (previous_goal_status, str(exc), now(), task_id),
+                )
                 raise
+            await release_completed_dashboard_owner(task_id)
+            external_live = await refresh_live_external_turn(task_id)
+            if not dashboard_owns_task(task_id) and not external_live:
+                db.execute(
+                    "UPDATE tasks SET goal_status=?,status='stopped',run_mode='',last_error=?,updated_at=? WHERE id=?",
+                    (previous_goal_status, str(exc), now(), task_id),
+                )
+                raise HTTPException(409, f"Goal could not start: {exc}") from exc
             db.execute("UPDATE tasks SET run_mode='goal_resume',last_error='',updated_at=? WHERE id=?", (now(), task_id))
             result = task_or_404(task_id)
     if sync_error:

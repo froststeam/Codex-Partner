@@ -729,7 +729,7 @@ class RunningStateTests(unittest.TestCase):
         launch.assert_awaited_once_with(task_id, "goal-resume")
         self.assertEqual("queued", self.app.task_or_404(task_id)["status"])
 
-    def test_blocked_goal_auto_resumes_but_paused_goal_requires_goal_start(self):
+    def test_paused_or_blocked_goal_auto_resumes_when_retry_is_enabled(self):
         for status in ("paused", "blocked"):
             task_id = f"external-goal-{status}-{time.time_ns()}"
             self.make_task(task_id, "available")
@@ -741,15 +741,11 @@ class RunningStateTests(unittest.TestCase):
                 with mock.patch.object(self.app, "launch", new=mock.AsyncMock(return_value={"session_id": "next"})) as launch:
                     asyncio.run(self.app.drain_task_messages(task_id))
                 task = self.app.task_or_404(task_id)
-                self.assertEqual(status, task["goal_status"])
-                if status == "blocked":
-                    launch.assert_awaited_once_with(task_id, "goal-resume")
-                    self.assertEqual("queued", task["status"])
-                    self.assertTrue(self.app.goal_auto_resume_enabled(task))
-                else:
-                    launch.assert_not_awaited()
-                    self.assertFalse(self.app.goal_auto_resume_enabled(task))
-                self.assertEqual(status, self.app.goal_status_for_resume(task))
+                self.assertEqual("active", task["goal_status"])
+                launch.assert_awaited_once_with(task_id, "goal-resume")
+                self.assertEqual("queued", task["status"])
+                self.assertTrue(self.app.goal_auto_resume_enabled(task))
+                self.assertEqual("active", self.app.goal_status_for_resume(task))
             finally:
                 self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
@@ -787,17 +783,19 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn('$("#goal-run-toggle").disabled = !goal || goalPauseBlocked;', source)
         self.assertIn('uiLabel("goalPauseRetryEnabled")', source)
 
-    def test_enabling_auto_resume_does_not_wake_a_paused_goal(self):
+    def test_enabling_auto_resume_starts_a_paused_goal(self):
         task_id = f"goal-retry-enable-{time.time_ns()}"
         self.make_task(task_id, "available")
         self.app.db.execute(
             "UPDATE tasks SET goal='finish it',goal_status='paused',retry_forever=0 WHERE id=?",
             (task_id,),
         )
-        with mock.patch.object(self.app, "schedule_task_drain") as schedule:
+        started = {**self.app.task_or_404(task_id), "goal_status": "active", "retry_forever": True}
+        with mock.patch.object(self.app, "start_goal", new=mock.AsyncMock(return_value=started)) as start:
             result = asyncio.run(self.app.patch_task(task_id, self.app.TaskPatch(retry_forever=True), None))
         self.assertTrue(result["retry_forever"])
-        schedule.assert_not_called()
+        self.assertEqual("active", result["goal_status"])
+        start.assert_awaited_once_with(task_id, None)
 
     def test_appserver_retry_waits_for_previous_turn_cleanup(self):
         source = Path(self.app.__file__).read_text(encoding="utf-8")
@@ -2085,11 +2083,15 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertFalse(result["retry_forever"])
         self.assertEqual(0, result["retry_explicit"])
 
-        result = asyncio.run(self.app.patch_task(task_id, self.app.TaskPatch(retry_forever=True)))
+        started = {**self.app.task_or_404(task_id), "goal_status": "active", "retry_forever": True, "retry_explicit": 1}
+        with mock.patch.object(self.app, "start_goal", new=mock.AsyncMock(return_value=started)) as start:
+            result = asyncio.run(self.app.patch_task(task_id, self.app.TaskPatch(retry_forever=True)))
         self.assertTrue(result["retry_forever"])
         self.assertEqual(1, result["retry_explicit"])
+        start.assert_awaited_once_with(task_id, None)
 
-        result = asyncio.run(self.app.patch_goal(task_id, self.app.GoalPatch(objective="finish it better")))
+        with mock.patch.object(self.app, "schedule_task_drain"):
+            result = asyncio.run(self.app.patch_goal(task_id, self.app.GoalPatch(objective="finish it better")))
         self.assertTrue(result["retry_forever"])
         self.assertEqual(1, result["retry_explicit"])
 
@@ -2248,7 +2250,7 @@ process.stdout.write(JSON.stringify(browserMessages));
             self.app.clear_external_turns(task_id)
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
-    def test_goal_start_adopts_a_launch_race_and_keeps_goal_resume_pending(self):
+    def test_goal_start_reports_a_launch_race_without_a_real_owner(self):
         task_id = f"goal-start-race-{time.time_ns()}"
         self.make_task(task_id, "stopped")
         self.app.db.execute("UPDATE tasks SET goal='latest objective',goal_status='paused' WHERE id=?", (task_id,))
@@ -2260,10 +2262,33 @@ process.stdout.write(JSON.stringify(browserMessages));
                 mock.patch.object(self.app, "broadcast_task", new=mock.AsyncMock()),
                 mock.patch.object(self.app, "broadcast_overview", new=mock.AsyncMock()),
             ):
+                with self.assertRaises(self.app.HTTPException) as caught:
+                    asyncio.run(self.app.start_goal(task_id, None))
+            self.assertEqual(409, caught.exception.status_code)
+            result = self.app.task_or_404(task_id)
+            self.assertEqual("paused", result["goal_status"])
+            self.assertEqual("", result["run_mode"])
+            self.assertIn("already running", result["last_error"])
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_goal_start_ignores_stale_running_status_without_an_owner(self):
+        task_id = f"stale-running-goal-{time.time_ns()}"
+        self.make_task(task_id, "running")
+        self.app.db.execute("UPDATE tasks SET goal='latest objective',goal_status='paused' WHERE id=?", (task_id,))
+        launched = {"id": task_id, "status": "running", "goal_status": "active", "run_mode": "goal_resume"}
+        try:
+            with (
+                mock.patch.object(self.app, "sync_current_goal", new=mock.AsyncMock(return_value="")),
+                mock.patch.object(self.app, "refresh_live_external_turn", new=mock.AsyncMock(return_value=False)),
+                mock.patch.object(self.app, "dashboard_owns_task", return_value=False),
+                mock.patch.object(self.app, "launch", new=mock.AsyncMock(return_value=launched)) as launch,
+                mock.patch.object(self.app, "broadcast_task", new=mock.AsyncMock()),
+                mock.patch.object(self.app, "broadcast_overview", new=mock.AsyncMock()),
+            ):
                 result = asyncio.run(self.app.start_goal(task_id, None))
-            self.assertEqual("active", result["goal_status"])
-            self.assertEqual("goal_resume", result["run_mode"])
-            self.assertEqual("", result["last_error"])
+            launch.assert_awaited_once_with(task_id, "goal-resume")
+            self.assertEqual("running", result["status"])
         finally:
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
@@ -2702,6 +2727,25 @@ process.stdout.write(JSON.stringify(browserMessages));
 
         try:
             asyncio.run(exercise())
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_auto_retry_exposes_unfinished_goal_as_active(self):
+        task_id = "auto-retry-public-goal-status"
+        self.make_task(task_id, "stopped")
+        self.app.db.execute(
+            "UPDATE tasks SET goal=?,goal_status='blocked',retry_forever=1,retry_explicit=1 WHERE id=?",
+            ("Keep working", task_id),
+        )
+        try:
+            self.assertEqual("active", self.app.task_or_404(task_id)["goal_status"])
+            self.assertEqual("active", self.app.task_summary(task_id)["goal_status"])
+            listed = asyncio.run(self.app.list_tasks(None))
+            self.assertEqual("active", next(row for row in listed if row["id"] == task_id)["goal_status"])
+            raw = self.app.db.one("SELECT goal_status FROM tasks WHERE id=?", (task_id,))
+            self.assertEqual("blocked", raw["goal_status"])
+            self.app.db.execute("UPDATE tasks SET goal_status='complete' WHERE id=?", (task_id,))
+            self.assertEqual("complete", self.app.task_or_404(task_id)["goal_status"])
         finally:
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
