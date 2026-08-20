@@ -2,6 +2,7 @@ import asyncio
 import ast
 import base64
 import importlib
+import inspect
 import io
 import json
 import os
@@ -1181,7 +1182,7 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
         conversation = (worker.parent / "conversation.js").read_text(encoding="utf-8")
         html = (worker.parent / "index.html").read_text(encoding="utf-8")
         self.assertIn('/chat-worker.js?v=20260819-activity-retention', conversation)
-        self.assertIn('/conversation.js?v=20260819-chat-layout-stability', html)
+        self.assertIn('/conversation.js?v=20260820-command-navigation', html)
 
     def test_worker_hides_native_media_tags(self):
         script = f"""
@@ -1652,7 +1653,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn('data-activity-output-key="${esc(outputKey)}"', conversation)
         self.assertIn("Object.prototype.hasOwnProperty.call(state.activityOutputOpen, outputKey)", conversation)
         self.assertIn("state.activityOutputOpen[output.dataset.activityOutputKey] = output.open", conversation)
-        self.assertIn('/conversation.js?v=20260819-chat-layout-stability', html)
+        self.assertIn('/conversation.js?v=20260820-command-navigation', html)
 
     def test_message_history_skips_activity_only_pages(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -1708,7 +1709,7 @@ const cursors = [];
         self.assertIn("HistoryPagination.fetchEarlierTimelinePages", conversation)
         self.assertIn("messageTarget: 12, maxPages: 8", conversation)
         self.assertIn('/history-pagination.js?v=20260817-message-history', html)
-        self.assertIn('/conversation.js?v=20260819-chat-layout-stability', html)
+        self.assertIn('/conversation.js?v=20260820-command-navigation', html)
 
     def test_sent_browser_messages_follow_the_loaded_timeline_boundary(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -2633,6 +2634,7 @@ process.stdout.write(JSON.stringify(browserMessages));
 
     def test_thread_operation_resumes_rollout_before_compacting(self):
         task_id = "compact-unloaded-thread"
+        app = self.app
         self.make_task(task_id, "available")
         self.app.db.execute(
             "UPDATE tasks SET codex_session_id=? WHERE id=?",
@@ -2649,6 +2651,9 @@ process.stdout.write(JSON.stringify(browserMessages));
                 if method == "thread/resume":
                     return {"thread": {"id": task_id}}
                 if method == "thread/compact/start":
+                    waiter = app.compaction_waiters.get(task_id)
+                    if waiter and not waiter.done():
+                        waiter.set_result({"threadId": task_id})
                     return {"ok": True}
                 if method == "thread/unsubscribe":
                     return {"status": "unsubscribed"}
@@ -2671,6 +2676,123 @@ process.stdout.write(JSON.stringify(browserMessages));
             )
             self.assertTrue(client.closed)
             self.assertNotIn(key, self.app.app_servers)
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_goal_pause_and_resume_slash_commands_use_button_semantics(self):
+        task_id = "goal-slash-lifecycle"
+        self.make_task(task_id, "available")
+        self.app.db.execute("UPDATE tasks SET goal=?,goal_status='active' WHERE id=?", ("Finish the task", task_id))
+
+        async def exercise():
+            task = self.app.task_or_404(task_id)
+            with mock.patch.object(self.app, "pause_goal", new=mock.AsyncMock(return_value={"goal_status": "paused"})) as pause, mock.patch.object(
+                self.app, "start_goal", new=mock.AsyncMock(return_value={"goal_status": "active"})
+            ) as start:
+                paused = await self.app.execute_slash_command(task, "goal", "pause", ["pause"])
+                resumed = await self.app.execute_slash_command(task, "goal", "resume", ["resume"])
+            self.assertTrue(paused["ok"])
+            self.assertIn("自动重试已关闭", paused["message"])
+            self.assertTrue(resumed["ok"])
+            pause.assert_awaited_once_with(task_id, None)
+            start.assert_awaited_once_with(task_id, None)
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_slash_command_catalog_only_advertises_implemented_commands(self):
+        source = inspect.getsource(self.app.execute_slash_command) + inspect.getsource(self.app._execute_slash_command_body)
+        for entry in self.app.SLASH_COMMANDS:
+            self.assertIn(f'"{entry["name"]}"', source, entry["name"])
+        advertised = {entry["name"] for entry in self.app.SLASH_COMMANDS}
+        self.assertNotIn("vim", advertised)
+        self.assertTrue(set(self.app.SLASH_ALIASES.values()).issubset(advertised))
+        static = Path(__file__).resolve().parents[1] / "static"
+        conversation = (static / "conversation.js").read_text(encoding="utf-8")
+        frontend = (static / "app.js").read_text(encoding="utf-8")
+        self.assertIn("palette.innerHTML = matches.map", conversation)
+        self.assertNotIn("matches.slice(0, 18)", conversation)
+        self.assertIn("palette.scrollTop += activeRect.bottom - paletteRect.bottom + 8", conversation)
+        self.assertIn("event.stopPropagation(); state.commandIndex", frontend)
+
+    def test_slash_toggle_arguments_reject_silent_misconfiguration(self):
+        task_id = "slash-invalid-toggle"
+        self.make_task(task_id, "available")
+
+        async def exercise():
+            task = self.app.task_or_404(task_id)
+            for command, argument in (("fast", "maybe"), ("plan", "maybe"), ("raw", "maybe"), ("title", "maybe")):
+                with self.assertRaises(self.app.HTTPException, msg=command):
+                    await self.app.execute_slash_command(task, command, argument, [argument])
+            with self.assertRaises(self.app.HTTPException):
+                await self.app.execute_slash_command(task, "model", "effort=impossible", ["effort=impossible"])
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_slash_approve_resolves_latest_pending_approval(self):
+        task_id = "slash-approve-pending"
+        self.make_task(task_id, "running")
+
+        async def exercise():
+            future = asyncio.get_running_loop().create_future()
+            self.app.pending_appserver_requests["approval-1"] = {
+                "id": "approval-1",
+                "task_id": task_id,
+                "method": "item/commandExecution/requestApproval",
+                "params": {},
+                "future": future,
+            }
+            result = await self.app.execute_slash_command(self.app.task_or_404(task_id), "approve", "", [])
+            self.assertTrue(result["ok"])
+            self.assertEqual({"decision": "accept"}, future.result())
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            self.app.pending_appserver_requests.pop("approval-1", None)
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_thread_control_compact_can_confirm_interrupting_active_turn(self):
+        task_id = "compact-active-turn-confirmed"
+        self.make_task(task_id, "running")
+
+        async def stop(task_id_arg):
+            self.assertEqual(task_id, task_id_arg)
+            self.app.db.execute("UPDATE tasks SET status='stopped' WHERE id=?", (task_id,))
+            return self.app.task_or_404(task_id)
+
+        async def exercise():
+            payload = self.app.OperationIn(operation="compact", args=["interrupt-active-turn"])
+            with mock.patch.object(self.app, "stop_task_run", new=mock.AsyncMock(side_effect=stop)) as stopped, mock.patch.object(
+                self.app, "run_thread_operation", new=mock.AsyncMock(return_value={"ok": True, "operation": "compact"})
+            ) as compacted:
+                result = await self.app.codex_operation(task_id, payload, None)
+            self.assertTrue(result["ok"])
+            stopped.assert_awaited_once()
+            forwarded = compacted.await_args.args[1]
+            self.assertNotIn("interrupt-active-turn", forwarded.args)
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_thread_control_compact_does_not_interrupt_without_confirmation(self):
+        task_id = "compact-active-turn-unconfirmed"
+        self.make_task(task_id, "running")
+
+        async def exercise():
+            with self.assertRaises(self.app.HTTPException) as caught:
+                await self.app.codex_operation(task_id, self.app.OperationIn(operation="compact"), None)
+            self.assertEqual(409, caught.exception.status_code)
 
         try:
             asyncio.run(exercise())
@@ -3051,6 +3173,52 @@ process.stdout.write(JSON.stringify(browserMessages));
             self.app.db.execute("DELETE FROM task_messages WHERE id=?", (message_id,))
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
+    def test_completed_appserver_owner_does_not_block_queued_message(self):
+        task_id = "dispatch-after-completed-owner"
+        message_id = "dispatch-after-completed-owner-message"
+        self.make_task(task_id, "stopped")
+        stamp = self.app.now()
+        self.app.db.execute(
+            "INSERT INTO task_messages (id,task_id,body,status,created_at) VALUES (?,?,?,?,?)",
+            (message_id, task_id, "run after stale owner", "queued", stamp),
+        )
+
+        class FakeClient:
+            def __init__(self):
+                self.process = object()
+                self.calls = []
+
+            async def request(self, method, params):
+                self.calls.append((method, params))
+                return {"status": "unsubscribed"}
+
+        async def exercise():
+            client = FakeClient()
+            completed = asyncio.create_task(asyncio.sleep(0))
+            await completed
+            self.app.app_servers["stale-owner"] = client
+            self.app.appserver_turn_tasks[task_id] = completed
+            self.app.appserver_turn_ids[task_id] = "stale-turn"
+            self.app.app_thread_bindings[task_id] = ("stale-owner", task_id, "stale-session")
+            self.app.running[task_id] = client.process
+            with mock.patch.object(self.app, "launch", new=mock.AsyncMock(return_value={"session_id": "fresh-session"})):
+                result = await self.app.dispatch_task_message(task_id, message_id, None)
+            self.assertEqual("dispatching", result["status"])
+            self.assertEqual([("thread/unsubscribe", {"threadId": task_id})], client.calls)
+            self.assertNotIn(task_id, self.app.appserver_turn_tasks)
+            self.assertNotIn(task_id, self.app.running)
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            self.app.app_servers.pop("stale-owner", None)
+            self.app.appserver_turn_tasks.pop(task_id, None)
+            self.app.appserver_turn_ids.pop(task_id, None)
+            self.app.app_thread_bindings.pop(task_id, None)
+            self.app.running.pop(task_id, None)
+            self.app.db.execute("DELETE FROM task_messages WHERE task_id=?", (task_id,))
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
     def test_queued_message_waits_for_active_turn_then_dispatches(self):
         task_id = "queued-message-auto-dispatch"
         message_id = "queued-message-auto-dispatch-1"
@@ -3351,11 +3519,11 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('forkCreated ? "会话已复制，但打开副本失败" : "复制会话失败"', app_js)
         self.assertIn('uiLabel("sessionRenamed")', app_js)
         self.assertIn('uiLabel("sessionDuplicated")', app_js)
-        self.assertIn('/app.js?v=20260818-fork-feedback', html)
+        self.assertIn('/app.js?v=20260820-command-navigation', html)
         self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260819-chat-layout-stability', html)
+        self.assertIn('/conversation.js?v=20260820-command-navigation', html)
         self.assertIn("/timeline?limit=120", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -3600,10 +3768,10 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260819-chat-layout-stability', html)
+        self.assertIn('/conversation.js?v=20260820-command-navigation', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
-        self.assertIn('/app.js?v=20260818-fork-feedback', html)
+        self.assertIn('/app.js?v=20260820-command-navigation', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
         self.assertIn('/styles.css?v=20260819-chat-layout-stability', html)
         self.assertIn('/vendor/katex/katex.min.css', html)
@@ -3670,7 +3838,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('const sessionList = $("#task-list")', conversation)
         self.assertIn("void selectSession(pointerSelectedSessionId)", conversation)
         self.assertIn('aria-current="${selected ? "true" : "false"}"', conversation)
-        self.assertIn('/conversation.js?v=20260819-chat-layout-stability', html)
+        self.assertIn('/conversation.js?v=20260820-command-navigation', html)
 
     def test_live_chat_rendering_coalesces_expensive_work(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -3698,7 +3866,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         timeline_wait = conversation.index("timeline = await timelinePromise", select_start)
         self.assertLess(socket_start, timeline_wait)
         self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
-        self.assertIn('/conversation.js?v=20260819-chat-layout-stability', html)
+        self.assertIn('/conversation.js?v=20260820-command-navigation', html)
         styles = (static / "styles.css").read_text(encoding="utf-8")
         app_js = (static / "app.js").read_text(encoding="utf-8")
         self.assertNotIn("content-visibility: auto", styles)
@@ -3706,14 +3874,17 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("min-width: min(180px, calc(100% - 49px))", styles)
         self.assertIn(".message.user .message-content { display: block; box-sizing: border-box; width: 100%", styles)
         self.assertIn(".message.assistant .message-body { flex: 1 1 auto; width: min(780px, calc(100% - 49px));", styles)
-        self.assertIn("streamWidth > 0 && streamWidth < 240 && chatLayoutRetryCount < 5", conversation)
+        self.assertIn("function chatStreamUsableWidth", conversation)
+        self.assertIn("usableWidth > 0 && usableWidth < 240 && chatLayoutRetryCount < 5", conversation)
+        self.assertIn("parseFloat(style.paddingLeft", conversation)
+        self.assertIn('if (String(data.payload?.type || "").toLowerCase() === "agent_delta") appendStreamingDelta(data.payload);', conversation)
         self.assertIn("}, 40);", conversation)
         self.assertIn(".message.assistant .message-content, .message.assistant .message-content > p", styles)
         self.assertIn("if (chatIsNearBottom(stream))", conversation)
         self.assertNotIn("stream.scrollTop = target * state.chatAverageHeight", conversation)
         self.assertIn("function syncPageVisibility", app_js)
         self.assertIn('/styles.css?v=20260819-chat-layout-stability', html)
-        self.assertIn('/app.js?v=20260818-fork-feedback', html)
+        self.assertIn('/app.js?v=20260820-command-navigation', html)
 
     def test_optimistic_queue_messages_survive_authoritative_refresh(self):
         static = Path(__file__).resolve().parents[1] / "static"

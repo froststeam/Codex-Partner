@@ -555,6 +555,12 @@ function chatIsNearBottom(stream = $("#chat-log")) {
   return !stream || stream.scrollHeight - stream.scrollTop - stream.clientHeight < 96;
 }
 
+function chatStreamUsableWidth(stream = $("#chat-log")) {
+  if (!stream) return 0;
+  const style = getComputedStyle(stream);
+  return Math.max(0, stream.getBoundingClientRect().width - parseFloat(style.paddingLeft || "0") - parseFloat(style.paddingRight || "0"));
+}
+
 function captureChatViewport(stream) {
   const streamTop = stream.getBoundingClientRect().top;
   const nodes = $$("[data-chat-block-index]", stream);
@@ -684,8 +690,8 @@ function loadEarlierActivity(activityKey) {
 function paintVirtualChat(stickToBottom = false) {
   if (state.chatSelectionActive) { state.chatRenderDeferred = true; state.chatDeferredStickToBottom ||= stickToBottom; return; }
   const stream = $("#chat-log"); const blocks = state.chatBlocks || []; const windowSize = 90;
-  const streamWidth = stream.getBoundingClientRect().width;
-  if (streamWidth > 0 && streamWidth < 240 && chatLayoutRetryCount < 5) {
+  const usableWidth = chatStreamUsableWidth(stream);
+  if (usableWidth > 0 && usableWidth < 240 && chatLayoutRetryCount < 5) {
     chatLayoutRetryCount += 1;
     if (!chatLayoutRetryTimer) chatLayoutRetryTimer = setTimeout(() => {
       chatLayoutRetryTimer = 0;
@@ -1270,8 +1276,17 @@ function renderCommandPalette() {
   if (!input || !input.value.startsWith("/") || input.value.includes("\n")) { palette.hidden = true; return; }
   const matches = commandMatches(input.value); if (!matches.length) { palette.hidden = true; return; }
   state.commandIndex = Math.max(0, Math.min(state.commandIndex, matches.length - 1));
-  palette.innerHTML = matches.slice(0, 18).map((command, index) => `<button type="button" class="command-option ${index === state.commandIndex ? "active" : ""}" data-command-index="${index}" role="option" aria-selected="${index === state.commandIndex}"><span class="command-name">/${esc(command.name)} <small>${esc(command.args || "")}</small></span><span class="command-description">${esc(command.description)}${command.destructive ? " · 需要确认" : ""}</span></button>`).join("");
+  palette.innerHTML = matches.map((command, index) => `<button type="button" class="command-option ${index === state.commandIndex ? "active" : ""}" data-command-index="${index}" role="option" aria-selected="${index === state.commandIndex}"><span class="command-name">/${esc(command.name)} <small>${esc(command.args || "")}</small></span><span class="command-description">${esc(command.description)}${command.destructive ? " · 需要确认" : ""}</span></button>`).join("");
   palette.hidden = false;
+  palette.style.maxHeight = "310px";
+  const anchoredBottom = palette.getBoundingClientRect().bottom;
+  palette.style.maxHeight = `${Math.max(120, Math.min(310, anchoredBottom - 8))}px`;
+  const active = palette.querySelector(".command-option.active");
+  if (active) {
+    const paletteRect = palette.getBoundingClientRect(); const activeRect = active.getBoundingClientRect();
+    if (activeRect.top < paletteRect.top + 8) palette.scrollTop += activeRect.top - paletteRect.top - 8;
+    else if (activeRect.bottom > paletteRect.bottom - 8) palette.scrollTop += activeRect.bottom - paletteRect.bottom + 8;
+  }
 }
 function selectedCommand() { const matches = commandMatches($("#message-input").value); return matches[state.commandIndex] || matches[0]; }
 function completeCommand(command = selectedCommand()) {
@@ -1297,7 +1312,6 @@ async function applyCommandAction(result) {
   if (action === "toggle_raw") { const value = result.value === "on" ? true : result.value === "off" ? false : !state.rawActivity; state.rawActivity = value; return renderChat(); }
   if (action === "theme") { const value = result.value === "toggle" ? (document.documentElement.dataset.theme === "wasteland" ? "dark" : "wasteland") : result.value; setTheme(value, true); return; }
   if (action === "title") { const value = result.value === "toggle" ? localStorage.getItem("codex-dashboard-title") !== "on" : result.value !== "off"; localStorage.setItem("codex-dashboard-title", value ? "on" : "off"); document.title = value && state.selectedTask ? `${state.selectedTask.name || "Codex"} · Codex Partner` : "Codex Partner"; return; }
-  if (action === "vim") { localStorage.setItem("codex-dashboard-vim", result.value === "off" ? "off" : "on"); return toast("Vim 模式标记已更新"); }
   if (action === "show_keymap") return toast("Enter 发送到当前 turn · Alt+Enter 排到下一轮 · Shift+Enter 换行 · Esc 停止 · 空输入框 ↑/↓ 历史");
   if (action === "disconnect") { socketPaused = true; clearTimeout(socketReconnectTimer); if (socket) { socket.onclose = null; socket.close(); socket = null; } setRealtimeChannel("task", "paused"); return toast("当前会话的实时连接已暂停"); }
 }
@@ -1443,7 +1457,12 @@ function connectSocket(id, reconnect = false) {
       if (!protocolNoise) scheduleRuntimeMetricsRefresh();
       const phase = protocolNoise ? "" : activityPhase(data.payload);
       if (phase) { livePhases.set(id, phase); renderTurnProgress(); }
-      if (!protocolNoise && (String(data.payload?.type || "").toLowerCase() !== "agent_delta" || !appendStreamingDelta(data.payload))) scheduleRenderChat();
+      if (!protocolNoise) {
+        if (String(data.payload?.type || "").toLowerCase() === "agent_delta") appendStreamingDelta(data.payload);
+        // Keep immediate token feedback, then periodically reparse the full
+        // Markdown so partial rich blocks do not remain raw until turn end.
+        scheduleRenderChat();
+      }
       if (!protocolNoise && !isAssistantEvent({ stream: data.stream, payload: data.payload }) && !isUserEvent({ stream: data.stream, payload: data.payload })) showActivity(data.payload);
     }
     if (data.type === "message" && state.selectedId === id) { upsertTaskMessage(data); renderQueuedMessages(); scheduleRenderChat(); }

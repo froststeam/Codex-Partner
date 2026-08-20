@@ -77,6 +77,7 @@ from codex_partner.platform_support import (
     prepare_subprocess_command,
     validate_bind_auth,
 )
+from codex_partner.persistent_appserver import ensure_service as ensure_persistent_appserver, stop_service as stop_persistent_appserver
 from codex_partner.schemas import (
     ApprovalResolveIn,
     AvatarIn,
@@ -630,6 +631,7 @@ activity_graph_backlog: dict[str, list[dict[str, Any]]] = {}
 app_servers: dict[str, "AppServerClient"] = {}
 app_thread_bindings: dict[str, tuple[str, str, str]] = {}
 turn_waiters: dict[str, asyncio.Future] = {}
+compaction_waiters: dict[str, asyncio.Future] = {}
 goal_sync_locks: dict[str, asyncio.Lock] = {}
 
 
@@ -681,6 +683,15 @@ async def close_task_appserver(provider: Optional[dict], task: Optional[dict], c
             if binding and binding[0] in keys:
                 app_thread_bindings.pop(task_id, None)
     await client.close()
+    if getattr(client, "daemon_pid", 0) and not app_shutting_down:
+        await asyncio.gather(*(stop_persistent_appserver(key) for key in keys), return_exceptions=True)
+
+
+async def stop_idle_task_appserver(task: dict) -> None:
+    if task.get("ssh_host") or dashboard_owns_task(task["id"]):
+        return
+    provider = db.one("SELECT * FROM providers WHERE id=?", (task.get("provider_id"),)) if task.get("provider_id") else None
+    await stop_persistent_appserver(appserver_key(provider, task))
 
 
 async def appserver_for(provider: Optional[dict], task: Optional[dict] = None) -> AppServerClient:
@@ -711,10 +722,11 @@ async def appserver_for(provider: Optional[dict], task: Optional[dict] = None) -
                     client_version=app.version,
                 )
             else:
+                persistent = await ensure_persistent_appserver(key, CODEX_BIN, env, DATA_DIR)
                 app_servers[key] = AppServerClient(
                     env,
                     key,
-                    command=[CODEX_BIN, "app-server", "--stdio"],
+                    command=[CODEX_BIN, "app-server", "--stdio"] if not persistent else None,
                     require_codex=require_codex,
                     notification_handler=handle_appserver_notification,
                     server_request_handler=handle_appserver_server_request,
@@ -722,7 +734,10 @@ async def appserver_for(provider: Optional[dict], task: Optional[dict] = None) -
                     turn_waiters=turn_waiters,
                     client_name=APP_NAME.lower().replace(" ", "-"),
                     client_version=app.version,
+                    websocket_url=persistent[0] if persistent else None,
                 )
+                if persistent:
+                    app_servers[key].daemon_pid = persistent[1]
         await app_servers[key].start()
         return app_servers[key]
 
@@ -1263,6 +1278,7 @@ def native_rollout_writer_pids(path: str, refresh: bool = False) -> set[int]:
         for client in app_servers.values()
         if client.process and client.process.returncode is None
     }
+    dashboard_roots.update(client.daemon_pid for client in app_servers.values() if getattr(client, "daemon_pid", 0))
     dashboard_pids = process_tree_pids(dashboard_roots)
     return rollout_writer_pids(path, refresh=refresh) - dashboard_pids - {os.getpid()}
 
@@ -1322,7 +1338,43 @@ def read_rollout_append(path: str, offset: int, remainder: bytes) -> tuple[int, 
 
 def dashboard_owns_task(task_id: str) -> bool:
     turn_task = appserver_turn_tasks.get(task_id)
-    return task_id in running or bool(turn_task and not turn_task.done())
+    if turn_task and not turn_task.done():
+        return True
+    process = running.get(task_id)
+    if not process:
+        return False
+    # Shared app-server processes outlive individual turns. A stale owner
+    # marker must not make an idle thread look permanently busy.
+    return not any(process is getattr(client, "owner", getattr(client, "process", None)) for client in app_servers.values())
+
+
+async def release_completed_dashboard_owner(task_id: str) -> bool:
+    """Release per-turn state left behind after an app-server task finished."""
+    turn_task = appserver_turn_tasks.get(task_id)
+    process = running.get(task_id)
+    shared_client = next(
+        (client for client in app_servers.values() if process is getattr(client, "owner", getattr(client, "process", None))),
+        None,
+    ) if process else None
+    if turn_task and not turn_task.done():
+        return False
+    if not turn_task and not shared_client:
+        return False
+
+    if turn_task and appserver_turn_tasks.get(task_id) is turn_task:
+        appserver_turn_tasks.pop(task_id, None)
+    appserver_turn_ids.pop(task_id, None)
+    binding = app_thread_bindings.pop(task_id, None)
+    if shared_client and running.get(task_id) is process:
+        running.pop(task_id, None)
+    if binding:
+        client = app_servers.get(binding[0])
+        if client:
+            try:
+                await asyncio.wait_for(client.request("thread/unsubscribe", {"threadId": binding[1]}), timeout=3)
+            except Exception:
+                pass
+    return True
 
 
 def has_persisted_dashboard_turn(task_id: str, turn_id: str) -> bool:
@@ -1529,6 +1581,7 @@ async def apply_external_turn_boundary(
             "UPDATE tasks SET status=?,active_session_id=NULL,execution_source='',execution_turn_id='',updated_at=? WHERE id=?",
             (status, stamp, task_id),
         )
+        await stop_idle_task_appserver(task)
     db.execute("INSERT INTO events (session_id,ts,stream,payload) VALUES (?,?,?,?)", (session_id, stamp, "rollout", json.dumps(live_payload, ensure_ascii=False)))
     await broadcast_task(task_id, {"type": "event", "session_id": session_id, "stream": "rollout", "payload": live_payload, "ts": stamp})
     await broadcast_task(task_id, {"type": "task_status", "task": task_or_404(task_id), "source": {"kind": "external_rollout", "boundary": boundary}})
@@ -2615,6 +2668,11 @@ async def handle_appserver_notification(server_key: str, message: dict) -> None:
     thread_id = params.get("threadId") or (params.get("thread") or {}).get("id")
     if not thread_id:
         return
+    item = params.get("item") or {}
+    if method == "thread/compacted" or (method == "item/completed" and "compact" in str(item.get("type") or "").lower()):
+        waiter = compaction_waiters.pop(thread_id, None)
+        if waiter and not waiter.done():
+            waiter.set_result(params)
     binding = next(((task_id, sid) for task_id, (key, tid, sid) in app_thread_bindings.items() if key == server_key and tid == thread_id), None)
     if not binding:
         return
@@ -2782,8 +2840,10 @@ async def handle_appserver_server_request(server_key: str, message: dict) -> Non
             await broadcast_task(binding[0], {"type": "server_request_resolved", "request_id": public_id})
             raise
     try:
-        async with client.write_lock:
-            if client.process and client.process.stdin:
+        if hasattr(client, "respond"):
+            await client.respond(request_id, result)
+        else:
+            async with client.write_lock:
                 client.process.stdin.write((json.dumps({"id": request_id, "result": result}, ensure_ascii=False) + "\n").encode())
                 await client.process.stdin.drain()
     finally:
@@ -2939,7 +2999,7 @@ async def supervise_appserver_turn(
         command = shlex.join([codex_label, "app-server", "thread/resume" if mode != "start" else "thread/start", thread_id, "turn/start"])
         db.execute("UPDATE sessions SET command=?, codex_session_id=? WHERE id=?", (command, thread_id, session_id))
         app_thread_bindings[task["id"]] = (key, thread_id, session_id)
-        running[task["id"]] = client.process  # owner marker; browsers never spawn a second resume
+        running[task["id"]] = client.owner  # owner marker; browsers never spawn a second resume
         waiter = asyncio.get_running_loop().create_future()
         turn_waiters[thread_id] = waiter
         # Do not allow a Goal edit between thread/goal/set and turn/start.
@@ -3081,7 +3141,7 @@ async def supervise_appserver_turn(
                 (fallback["id"], error, now(), task["id"]),
             )
             await broadcast_task(task["id"], {"type": "provider_failover", "from": (provider or {}).get("name"), "to": fallback.get("name"), "error": error})
-            if running.get(task["id"]) is getattr(client, "process", None):
+            if running.get(task["id"]) is client.owner:
                 running.pop(task["id"], None)
             asyncio.create_task(launch_after_turn_cleanup(task["id"], mode, message, message_id, tried_provider_ids))
             return
@@ -3163,7 +3223,7 @@ async def supervise_appserver_turn(
         binding = app_thread_bindings.get(task["id"])
         if binding and binding[2] == session_id:
             app_thread_bindings.pop(task["id"], None)
-        if running.get(task["id"]) is getattr(client, "process", None):
+        if running.get(task["id"]) is client.owner:
             running.pop(task["id"], None)
         # Cover early returns from retry/failover/stop paths as well as the
         # normal success path.  The worker will wait if another owner is still
@@ -4228,6 +4288,7 @@ async def drain_task_messages(task_id: str) -> None:
     never compete with that turn or be lost at the completion boundary. An
     adopted terminal Goal turn resumes only after queued user messages.
     """
+    await release_completed_dashboard_owner(task_id)
     lock = task_message_locks.setdefault(task_id, asyncio.Lock())
     async with lock:
         current = task_or_404(task_id)
@@ -4278,8 +4339,7 @@ def task_turn_active(task_id: str, task: Optional[dict] = None) -> bool:
     """Return whether another owner currently controls the Codex turn."""
     current = task or task_or_404(task_id)
     return bool(
-        task_id in running
-        or task_id in appserver_turn_tasks
+        dashboard_owns_task(task_id)
         or task_id in external_turns
         or current.get("status") in {"running", "retrying"}
     )
@@ -5073,6 +5133,7 @@ async def sync_current_goal(task: dict, status: str) -> str:
 
 @app.post("/api/tasks/{task_id}/goal/start")
 async def start_goal(task_id: str, _: Any = Depends(auth)):
+    await release_completed_dashboard_owner(task_id)
     async with goal_sync_lock(task_id):
         task = task_or_404(task_id)
         if not str(task.get("goal") or "").strip():
@@ -5089,7 +5150,7 @@ async def start_goal(task_id: str, _: Any = Depends(auth)):
         task = task_or_404(task_id)
     external_live = await refresh_live_external_turn(task_id)
     task = task_or_404(task_id)
-    if task_id in running or task_id in appserver_turn_tasks or task.get("status") == "running" or external_live:
+    if dashboard_owns_task(task_id) or task.get("status") == "running" or external_live:
         db.execute("UPDATE tasks SET run_mode='goal_resume',updated_at=? WHERE id=?", (now(), task_id))
         result = task_or_404(task_id)
     else:
@@ -5110,6 +5171,7 @@ async def start_goal(task_id: str, _: Any = Depends(auth)):
 
 @app.post("/api/tasks/{task_id}/goal/pause")
 async def pause_goal(task_id: str, _: Any = Depends(auth)):
+    await release_completed_dashboard_owner(task_id)
     async with goal_sync_lock(task_id):
         task = task_or_404(task_id)
         if not task.get("goal"):
@@ -5117,7 +5179,7 @@ async def pause_goal(task_id: str, _: Any = Depends(auth)):
         persist_goal_paused(task_id)
         sync_error = await sync_current_goal(task_or_404(task_id), "paused")
     task = task_or_404(task_id)
-    if task_id in running or task_id in appserver_turn_tasks or task.get("status") in {"running", "queued", "retrying"} or external_turns.get(task_id):
+    if dashboard_owns_task(task_id) or task.get("status") in {"running", "queued", "retrying"} or external_turns.get(task_id):
         result = await stop_task_run(task_id, pause_goal=False)
     else:
         result = task
@@ -5956,6 +6018,7 @@ async def launch(
     message_id: str = "",
     attempted_provider_ids: Optional[set[str]] = None,
 ) -> dict:
+    await release_completed_dashboard_owner(task_id)
     task = task_or_404(task_id)
     if task.get("ssh_host"):
         await require_ssh_connection(task["ssh_host"], codex=True)
@@ -5968,7 +6031,7 @@ async def launch(
     if external_turns.get(task_id):
         persist_external_task_status(task_id, dashboard_active=False)
         raise HTTPException(409, "Task is already running in a terminal Codex client")
-    if task_id in running or task["status"] == "running":
+    if dashboard_owns_task(task_id) or task["status"] == "running":
         raise HTTPException(409, "Task is already running")
     providers = provider_rows()
     attempted_provider_ids = attempted_provider_ids or set()
@@ -6127,11 +6190,12 @@ async def supervise(task: dict, session_id: str, providers: list[Optional[dict]]
 
 @app.post("/api/tasks/{task_id}/start")
 async def start_task(task_id: str, _: Any = Depends(auth)):
+    await release_completed_dashboard_owner(task_id)
     task = task_or_404(task_id)
     if external_turns.get(task_id):
         persist_external_task_status(task_id, dashboard_active=False)
         return task_or_404(task_id) | {"shared": True, "message": "Task is already running in a terminal Codex client"}
-    if task_id in running or task_id in appserver_turn_tasks or task["status"] == "running":
+    if dashboard_owns_task(task_id) or task["status"] == "running":
         raise HTTPException(409, "Task is already running")
     db.execute("UPDATE tasks SET retry_count=0, status='queued', updated_at=? WHERE id=?", (now(), task_id))
     return await launch(task_id, "resume" if task.get("native") else "start")
@@ -6139,6 +6203,7 @@ async def start_task(task_id: str, _: Any = Depends(auth)):
 
 @app.post("/api/tasks/{task_id}/resume")
 async def resume_task(task_id: str, _: Any = Depends(auth)):
+    await release_completed_dashboard_owner(task_id)
     task = task_or_404(task_id)
     if external_turns.get(task_id):
         persist_external_task_status(task_id, dashboard_active=False)
@@ -6146,7 +6211,7 @@ async def resume_task(task_id: str, _: Any = Depends(auth)):
         await broadcast_task(task_id, {"type": "task_status", "task": result, "source": {"kind": "resume", "surface": "terminal"}})
         await broadcast_overview(task_id, {"kind": "resume", "surface": "terminal"})
         return result | {"shared": True, "message": "Conversation resume adopted the active terminal Codex turn"}
-    if task_id in running or task_id in appserver_turn_tasks or task["status"] == "running":
+    if dashboard_owns_task(task_id) or task["status"] == "running":
         # Rejoin the server-owned turn instead of starting a competing CLI
         # process. All browser tabs can continue through /messages.
         return task | {"shared": True, "message": "Task is already owned by the dashboard session"}
@@ -6220,6 +6285,7 @@ async def delete_task_message(task_id: str, message_id: str, _: Any = Depends(au
 @app.post("/api/tasks/{task_id}/messages/{message_id}/dispatch")
 async def dispatch_task_message(task_id: str, message_id: str, _: Any = Depends(auth)):
     """Execute one queued message now, steering a live turn when possible."""
+    await release_completed_dashboard_owner(task_id)
     task_or_404(task_id)
     row = db.one("SELECT * FROM task_messages WHERE id=? AND task_id=?", (message_id, task_id))
     if not row:
@@ -6235,7 +6301,7 @@ async def dispatch_task_message(task_id: str, message_id: str, _: Any = Depends(
         if row["status"] != "queued":
             return row
         current = task_or_404(task_id)
-        task_busy = current["status"] in {"running", "retrying", "queued"} or task_id in running or task_id in appserver_turn_tasks or task_id in external_turns
+        task_busy = current["status"] in {"running", "retrying", "queued"} or dashboard_owns_task(task_id) or task_id in external_turns
         if task_busy:
             if dashboard_owns_task(task_id):
                 try:
@@ -6395,8 +6461,9 @@ async def task_socket(websocket: WebSocket, task_id: str):
 
 @app.post("/api/tasks/{task_id}/retry")
 async def retry_task(task_id: str, _: Any = Depends(auth)):
+    await release_completed_dashboard_owner(task_id)
     task = task_or_404(task_id)
-    if task_id in running or task_id in appserver_turn_tasks or task["status"] == "running":
+    if dashboard_owns_task(task_id) or task["status"] == "running":
         raise HTTPException(409, "Task is already running")
     db.execute("UPDATE tasks SET retry_count=0, status='queued', updated_at=? WHERE id=?", (now(), task_id))
     return await launch(task_id, "resume" if task.get("native") else "manual-retry")
@@ -6421,6 +6488,7 @@ async def stop_task(task_id: str, _: Any = Depends(auth)):
 
 
 async def stop_task_run(task_id: str, pause_goal: bool = True) -> dict:
+    await release_completed_dashboard_owner(task_id)
     task = task_or_404(task_id)
     goal_paused = persist_goal_paused(task_id) if pause_goal else False
     if goal_paused:
@@ -6573,7 +6641,16 @@ async def _run_thread_operation(task: dict, payload: OperationIn) -> dict:
         await broadcast_task(task["id"], {"type": "task_status", "task": renamed, "source": {"kind": "thread", "operation": operation}})
         return {"ok": True, "operation": operation, "thread_id": thread_id, "result": result, "task": renamed}
     if operation == "compact":
-        result = await client.request("thread/compact/start", {"threadId": thread_id})
+        waiter = asyncio.get_running_loop().create_future()
+        compaction_waiters[thread_id] = waiter
+        try:
+            result = await client.request("thread/compact/start", {"threadId": thread_id})
+            await asyncio.wait_for(waiter, timeout=180)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("Codex compaction did not complete within 180 seconds") from exc
+        finally:
+            if compaction_waiters.get(thread_id) is waiter:
+                compaction_waiters.pop(thread_id, None)
         return {"ok": True, "operation": operation, "thread_id": thread_id, "result": result}
     approval = "never" if task["yolo"] else "on-request"
     sandbox = "danger-full-access" if task["yolo"] else "workspace-write"
@@ -6707,11 +6784,24 @@ async def execute_slash_command(task: dict, command: str, arg_text: str, args: l
         return result_message(command, command_help(args[0] if args else ""))
 
     if command == "goal":
+        first = args[0].lower() if args else ""
+        requested_status = args[1].lower() if first == "status" and len(args) > 1 else first
+        if requested_status in {"active", "resume"}:
+            result = await start_goal(task["id"], None)
+            return result_message(command, "Goal 已启用，会话已开始。", task=result)
+        if requested_status in {"paused", "pause"}:
+            result = await pause_goal(task["id"], None)
+            return result_message(command, "Goal 已暂停，自动重试已关闭，会话已停止。", task=result)
         # Slash Goal updates share the same serialization boundary as the
         # REST editor. This prevents a running turn from restoring an older
         # objective after the command has returned.
         async with goal_sync_lock(task["id"]):
-            return await execute_goal_slash_command(task, command, arg_text, args, confirmed)
+            result = await execute_goal_slash_command(task, command, arg_text, args, confirmed)
+        if (result.get("goal") or {}).get("status") == "active" and not task_turn_active(task["id"]):
+            started = await start_goal(task["id"], None)
+            result["task"] = started
+            result["message"] += "\n\nGoal 已启用，会话已开始。"
+        return result
 
     return await execute_slash_command_unlocked(task, command, arg_text, args, confirmed)
 
@@ -6809,8 +6899,8 @@ async def _execute_slash_command_body(task: dict, command: str, arg_text: str, a
         return result_message(command, f"**会话状态**\n状态：`{task.get('status')}` · {'YOLO' if task.get('yolo') else '受控'}{account_text}\n模型：`{task.get('model') or '默认'}` · effort：`{task.get('reasoning_effort') or '默认'}`\n模式：`{task.get('collaboration_mode') or 'default'}` · fast：`{'on' if task.get('service_tier') else 'off'}`\nThread：`{thread_id or '尚未创建'}`\nGoal：`{goal.get('status', 'none')}` · tokens：{goal.get('tokensUsed', 0)}", task=task, goal=goal, account=account)
 
     if command == "model":
-        client, _ = await appserver_for_task(task)
         if not args:
+            client, _ = await appserver_for_task(task)
             response = await client.request("model/list", {"includeHidden": False, "limit": 100})
             models = response.get("data") or []
             rows = [f"- `{item.get('id') or item.get('model')}` {item.get('displayName', '')} · 默认 effort `{item.get('defaultReasoningEffort', '')}`" for item in models]
@@ -6839,6 +6929,8 @@ async def _execute_slash_command_body(task: dict, command: str, arg_text: str, a
         if model_value is not None:
             updates["model"] = normalize_model_command_value(model_value)
         if effort_value is not None:
+            if effort_value.lower() not in effort_values | default_values:
+                raise HTTPException(400, "effort 必须是 minimal、low、medium、high、xhigh、ultra 或 default")
             updates["reasoning_effort"] = "" if effort_value.lower() in default_values else effort_value.lower()
         if not updates:
             raise HTTPException(400, "用法：/model [model=<id>|default] [effort=<minimal|low|medium|high|xhigh|ultra>|default]")
@@ -6852,6 +6944,8 @@ async def _execute_slash_command_body(task: dict, command: str, arg_text: str, a
         return result_message(command, f"下一条 turn 使用模型 `{model_text}`，effort `{effort_text}`。", task=updated_task)
 
     if command == "fast":
+        if args and args[0].lower() not in {"on", "off", "true", "false", "1", "0", "fast", "priority"}:
+            raise HTTPException(400, "用法：/fast [on|off]")
         enabled = not bool(task.get("service_tier")) if not args else args[0].lower() in {"on", "true", "1", "fast", "priority"}
         tier = "fast" if enabled else ""
         if enabled and (USE_APP_SERVER or task.get("ssh_host")):
@@ -6889,6 +6983,8 @@ async def _execute_slash_command_body(task: dict, command: str, arg_text: str, a
         return result_message(command, f"权限 profile 已设置为 `{args[0]}`；下一条 turn 生效。")
 
     if command == "plan":
+        if args and args[0].lower() not in {"on", "off", "true", "false", "1", "0", "plan", "default"}:
+            raise HTTPException(400, "用法：/plan [on|off]")
         enabled = not (task.get("collaboration_mode") == "plan") if not args else args[0].lower() in {"on", "true", "1", "plan"}
         mode = "plan" if enabled else "default"
         db.execute("UPDATE tasks SET collaboration_mode=?,updated_at=? WHERE id=?", (mode, now(), task["id"]))
@@ -7011,7 +7107,7 @@ async def _execute_slash_command_body(task: dict, command: str, arg_text: str, a
         if task_is_running(task):
             raise HTTPException(409, "线程运行中不能手动压缩")
         result = await run_thread_operation(task, OperationIn(operation="compact"))
-        return result_message(command, "上下文压缩已启动。", **result)
+        return result_message(command, "上下文压缩已完成。", **result)
 
     if command in {"agent", "subagents"}:
         if not latest_codex_session(task):
@@ -7101,6 +7197,7 @@ async def _execute_slash_command_body(task: dict, command: str, arg_text: str, a
             return result_message(command, "正在停止当前 Codex turn。", stop=await stop_task_run(task["id"]))
         if latest_codex_session(task):
             client, _ = await appserver_for_task(task)
+            await ensure_thread_loaded(task, client)
             result = await client.request("thread/backgroundTerminals/clean", {"threadId": latest_codex_session(task)})
             return result_message(command, "后台终端已停止。", result=result)
         return result_message(command, "当前没有运行中的 turn 或后台终端。")
@@ -7118,13 +7215,28 @@ async def _execute_slash_command_body(task: dict, command: str, arg_text: str, a
         return result_message(command, f"实验功能 `{args[0]}` 已{'开启' if enabled else '关闭'}。", result=result)
 
     if command == "approve":
-        return result_message(command, "当前线程没有待处理的自动审查拒绝；如果 Codex 发出 Guardian 请求，请在该活动卡片中批准后重试。")
+        request = next(
+            (
+                item
+                for item in reversed(list(pending_appserver_requests.values()))
+                if item["task_id"] == task["id"]
+                and item["method"] != "item/tool/requestUserInput"
+                and not item["future"].done()
+            ),
+            None,
+        )
+        if not request:
+            return result_message(command, "当前线程没有可批准的待处理请求。")
+        request["future"].set_result(approval_result(request, ApprovalResolveIn(decision="accept")))
+        return result_message(command, "已批准最近一条待处理请求。", request_id=request["id"])
 
     if command in {"ide", "statusline"}:
         return result_message(command, "已打开浏览器工作区检查器。", ui_action="open_inspector")
     if command == "copy":
         return result_message(command, "已请求复制最近一条 Codex 回复。", ui_action="copy_last")
     if command == "raw":
+        if args and args[0].lower() not in {"on", "off", "toggle"}:
+            raise HTTPException(400, "raw 只能是 on、off 或 toggle")
         return result_message(command, "已切换原始活动显示。", ui_action="toggle_raw", value=(args[0].lower() if args else "toggle"))
     if command == "theme":
         theme = args[0].lower() if args else "toggle"
@@ -7133,11 +7245,11 @@ async def _execute_slash_command_body(task: dict, command: str, arg_text: str, a
         return result_message(command, f"浏览器主题：`{theme}`。", ui_action="theme", value=theme)
     if command == "title":
         value = args[0].lower() if args else "toggle"
+        if value not in {"on", "off", "toggle"}:
+            raise HTTPException(400, "title 只能是 on、off 或 toggle")
         return result_message(command, "已切换浏览器标题。", ui_action="title", value=value)
     if command == "keymap":
         return result_message(command, "**浏览器快捷键**\n- `Enter` 发送；Codex 运行时插入当前 turn\n- `Alt+Enter` 将消息排到下一轮\n- `Shift+Enter` 换行\n- 空输入框时 `↑/↓` 浏览历史输入\n- `Tab` 补全命令\n- `Esc` 取消队列编辑或停止当前运行\n- `Ctrl/Cmd+K` 聚焦 composer\n- `Ctrl/Cmd+N` 新建 YOLO 会话。", ui_action="show_keymap")
-    if command == "vim":
-        return result_message(command, "浏览器 composer 支持普通输入；Vim 标记已切换，但不会改变浏览器原生编辑行为。", ui_action="vim", value=(args[0].lower() if args else "toggle"))
     if command == "feedback":
         return result_message(command, "浏览器不会自动上传反馈或源码；请通过项目 issue/反馈渠道提交。")
     if command == "exit":
@@ -7187,19 +7299,26 @@ async def post_slash_command(task_id: str, payload: SlashCommandIn, _: Any = Dep
 
 @app.post("/api/tasks/{task_id}/operation")
 async def codex_operation(task_id: str, payload: OperationIn, _: Any = Depends(auth)):
+    await release_completed_dashboard_owner(task_id)
     task = task_or_404(task_id)
     if payload.operation not in CODEX_OPERATIONS:
         raise HTTPException(400, f"Unsupported Codex operation: {payload.operation}")
     # Moving a task to the recycle bin is a dashboard operation. It must work
     # even when Codex is unavailable or the task never created a native thread.
     if payload.operation == "delete":
-        if task_id in running or task_id in appserver_turn_tasks or task["status"] in {"running", "retrying", "queued"}:
+        if dashboard_owns_task(task_id) or task["status"] in {"running", "retrying", "queued"}:
             await stop_task_run(task_id)
             task = task_or_404(task_id)
         return await run_thread_operation(task, payload)
     if payload.operation in {"memory-enable", "memory-disable"}:
         return await run_thread_operation(task, payload)
-    if payload.operation not in {"rename", "fork"} and (task_id in running or task_id in appserver_turn_tasks or task["status"] == "running"):
+    active_turn = task_turn_active(task_id, task)
+    if payload.operation == "compact" and active_turn and "interrupt-active-turn" in payload.args:
+        await stop_task_run(task_id)
+        task = task_or_404(task_id)
+        payload = payload.model_copy(update={"args": [value for value in payload.args if value != "interrupt-active-turn"]})
+        active_turn = False
+    if payload.operation not in {"rename", "fork"} and active_turn:
         raise HTTPException(409, "Task is already running")
     if task.get("ssh_host"):
         await require_ssh_connection(task["ssh_host"], codex=True)

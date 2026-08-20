@@ -4,6 +4,8 @@ import asyncio
 import json
 from typing import Any, Awaitable, Callable, Optional
 
+import websockets
+
 from .platform_support import prepare_subprocess_command
 
 
@@ -27,6 +29,8 @@ class AppServerClient:
         turn_waiters: Optional[dict[str, asyncio.Future]] = None,
         client_name: str = "codex-partner",
         client_version: str = "0.0.0",
+        unix_socket: Optional[str] = None,
+        websocket_url: Optional[str] = None,
     ):
         self.env, self.key = env, key
         self.command = command or ["codex", "app-server", "--stdio"]
@@ -40,6 +44,10 @@ class AppServerClient:
         self.turn_waiters = turn_waiters if turn_waiters is not None else {}
         self.client_name = client_name
         self.client_version = client_version
+        self.unix_socket = unix_socket
+        self.websocket_url = websocket_url
+        self.websocket = None
+        self.daemon_pid = 0
         self.process: Optional[asyncio.subprocess.Process] = None
         self.reader_task: Optional[asyncio.Task] = None
         self.write_lock = asyncio.Lock()
@@ -49,6 +57,17 @@ class AppServerClient:
     async def start(self) -> None:
         if self.local and self.require_codex:
             self.require_codex()
+        if self.unix_socket or self.websocket_url:
+            if self.websocket:
+                return
+            self.websocket = (
+                await websockets.unix_connect(self.unix_socket, uri="ws://localhost", max_size=64 * 1024 * 1024)
+                if self.unix_socket
+                else await websockets.connect(self.websocket_url, max_size=64 * 1024 * 1024)
+            )
+            self.reader_task = asyncio.create_task(self._reader())
+            await self._initialize()
+            return
         if self.process and self.process.returncode is None and self.reader_task and not self.reader_task.done():
             return
         if self.process and self.process.returncode is None:
@@ -67,6 +86,9 @@ class AppServerClient:
             limit=64 * 1024 * 1024,
         )
         self.reader_task = asyncio.create_task(self._reader())
+        await self._initialize()
+
+    async def _initialize(self) -> None:
         await self.request(
             "initialize",
             {
@@ -77,11 +99,13 @@ class AppServerClient:
         await self.notify("initialized")
 
     async def _reader(self) -> None:
-        assert self.process and self.process.stdout
         try:
-            async for raw in self._message_lines():
+            source = self.websocket if self.websocket else self._message_lines()
+            async for raw in source:
                 try:
-                    message = json.loads(raw.decode(errors="replace"))
+                    if isinstance(raw, bytes):
+                        raw = raw.decode(errors="replace")
+                    message = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
                 request_id = message.get("id")
@@ -105,6 +129,7 @@ class AppServerClient:
         except asyncio.CancelledError:
             return
         finally:
+            self.websocket = None
             error = RuntimeError("Codex app-server exited")
             for future in self.pending.values():
                 if not future.done():
@@ -137,24 +162,39 @@ class AppServerClient:
         if params is not None:
             message["params"] = params
         async with self.write_lock:
-            if not self.process or not self.process.stdin:
-                raise RuntimeError("Codex app-server is not running")
-            self.process.stdin.write((json.dumps(message, ensure_ascii=False) + "\n").encode())
-            await self.process.stdin.drain()
+            await self._send(message)
 
     async def request(self, method: str, params: Any) -> Any:
         async with self.write_lock:
-            if not self.process or not self.process.stdin:
-                raise RuntimeError("Codex app-server is not running")
             request_id = self.next_id
             self.next_id += 1
             future = asyncio.get_running_loop().create_future()
             self.pending[request_id] = future
-            self.process.stdin.write((json.dumps({"id": request_id, "method": method, "params": params}, ensure_ascii=False) + "\n").encode())
-            await self.process.stdin.drain()
+            await self._send({"id": request_id, "method": method, "params": params})
         return await asyncio.wait_for(future, timeout=120)
 
+    async def respond(self, request_id: Any, result: Any) -> None:
+        async with self.write_lock:
+            await self._send({"id": request_id, "result": result})
+
+    async def _send(self, message: dict) -> None:
+        payload = json.dumps(message, ensure_ascii=False)
+        if self.websocket:
+            await self.websocket.send(payload)
+            return
+        if not self.process or not self.process.stdin:
+            raise RuntimeError("Codex app-server is not running")
+        self.process.stdin.write((payload + "\n").encode())
+        await self.process.stdin.drain()
+
+    @property
+    def owner(self):
+        return self.process or self
+
     async def close(self) -> None:
+        if self.websocket:
+            await self.websocket.close()
+            self.websocket = None
         if self.process and self.process.returncode is None:
             self.process.terminate()
             try:

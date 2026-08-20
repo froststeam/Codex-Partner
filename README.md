@@ -126,6 +126,8 @@ systemctl --user status codex-partner.service
 
 This service uses the current user's existing Codex login, configuration, memories, and Skills. The example assumes the repository is at `~/Codex-Partner`; edit the two paths in the unit if it is elsewhere.
 
+On Linux with a systemd user session, local Codex turns run in separate transient user services. Restarting `codex-partner.service` disconnects and reconnects the control panel without stopping an active Codex turn. The detached Codex service is removed after its turn completes. This restart isolation currently applies to local Linux sessions; macOS, Windows, Docker, and remote SSH sessions retain their platform transport behavior.
+
 View logs with `journalctl --user -u codex-partner.service -f`. To keep it running after logout, run `sudo loginctl enable-linger "$USER"` once.
 
 ## Use

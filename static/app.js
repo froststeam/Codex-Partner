@@ -193,15 +193,22 @@ async function runOperation(operation, trigger = null) {
   if (!state.selectedId || threadOperationInFlight) return;
   const taskId = state.selectedId;
   let forkCreated = false;
+  let triggerLabel = "";
   if (["archive", "delete"].includes(operation)) {
     const message = uiLabel(operation === "delete" ? "trashSessionConfirm" : "archiveSessionConfirm");
     if (!await appConfirm(message, { danger: operation === "delete" })) return;
   }
   threadOperationInFlight = true;
-  if (trigger) trigger.disabled = true;
+  if (trigger) { trigger.disabled = true; triggerLabel = trigger.textContent; }
   try {
   if (operation === "fork") toast(uiLabel("sessionDuplicating"));
-  const result = await api(`/tasks/${taskId}/operation`, { method: "POST", body: JSON.stringify({ operation, args: [] }) });
+  const args = [];
+  if (operation === "compact" && ["running", "retrying", "queued"].includes(state.selectedTask?.status)) {
+    if (!await appConfirm("当前会话仍在运行。要停止当前 turn 并压缩上下文吗？", { danger: true })) return;
+    args.push("interrupt-active-turn");
+  }
+  if (operation === "compact" && trigger) trigger.textContent = "压缩中…";
+  const result = await api(`/tasks/${taskId}/operation`, { method: "POST", body: JSON.stringify({ operation, args }) });
   if (result.memory_mode && state.selectedTask) {
     // Reflect the acknowledged mode immediately while the authoritative
     // refresh also updates the other browser clients.
@@ -231,14 +238,14 @@ async function runOperation(operation, trigger = null) {
     if (result.task?.id && result.task.id !== state.selectedId) await selectSession(result.task.id);
   }
   if (operation !== "fork") {
-    const message = result.trashed ? "会话已移到回收站" : operation === "unarchive" ? "会话已取消归档" : operation === "memory-enable" ? "记忆已打开" : operation === "memory-disable" ? "记忆已关闭" : uiLabel("operationComplete");
+    const message = result.trashed ? "会话已移到回收站" : operation === "compact" ? "上下文压缩已完成" : operation === "unarchive" ? "会话已取消归档" : operation === "memory-enable" ? "记忆已打开" : operation === "memory-disable" ? "记忆已关闭" : uiLabel("operationComplete");
     toast(message);
   }
   } catch (error) {
     toast(operation === "fork" ? `${forkCreated ? "会话已复制，但打开副本失败" : "复制会话失败"}：${error.message}` : error.message);
   } finally {
     threadOperationInFlight = false;
-    if (trigger) trigger.disabled = false;
+    if (trigger) { trigger.disabled = false; trigger.textContent = triggerLabel; }
   }
 }
 
@@ -451,8 +458,8 @@ $("#message-input").addEventListener("keydown", async event => {
   const palette = $("#command-palette");
   if (!palette.hidden) {
     const matches = commandMatches(event.target.value);
-    if (event.key === "ArrowDown") { event.preventDefault(); state.commandIndex = (state.commandIndex + 1) % matches.length; renderCommandPalette(); return; }
-    if (event.key === "ArrowUp") { event.preventDefault(); state.commandIndex = (state.commandIndex - 1 + matches.length) % matches.length; renderCommandPalette(); return; }
+    if (matches.length && event.key === "ArrowDown") { event.preventDefault(); event.stopPropagation(); state.commandIndex = (state.commandIndex + 1) % matches.length; renderCommandPalette(); return; }
+    if (matches.length && event.key === "ArrowUp") { event.preventDefault(); event.stopPropagation(); state.commandIndex = (state.commandIndex - 1 + matches.length) % matches.length; renderCommandPalette(); return; }
     if (event.key === "Tab") { event.preventDefault(); completeCommand(); return; }
     if (event.key === "Escape") { event.preventDefault(); palette.hidden = true; return; }
     if (event.key === "Enter" && !event.shiftKey && matches.length && !event.target.value.trim().includes(" ")) {
