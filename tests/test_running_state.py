@@ -3682,6 +3682,29 @@ process.stdout.write(JSON.stringify([
             self.app.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
+    def test_startup_drain_does_not_launch_saved_auto_retry_goal(self):
+        retry_task = "startup-auto-retry-do-not-launch"
+        queued_task = "startup-queued-message-launch"
+        message_id = "startup-queued-message"
+        stamp = self.app.now()
+        self.make_task(retry_task, "stopped")
+        self.make_task(queued_task, "stopped")
+        try:
+            self.app.db.execute(
+                "UPDATE tasks SET goal='continue later',goal_status='active',retry_forever=1 WHERE id=?",
+                (retry_task,),
+            )
+            self.app.db.execute(
+                "INSERT INTO task_messages (id,task_id,body,status,created_at) VALUES (?,?,?,?,?)",
+                (message_id, queued_task, "explicit queued input", "queued", stamp),
+            )
+            startup_ids = self.app.startup_drain_task_ids()
+            self.assertIn(queued_task, startup_ids)
+            self.assertNotIn(retry_task, startup_ids)
+        finally:
+            self.app.db.execute("DELETE FROM task_messages WHERE id=?", (message_id,))
+            self.app.db.execute("DELETE FROM tasks WHERE id IN (?,?)", (retry_task, queued_task))
+
     def test_port_configuration_rejects_invalid_values(self):
         with mock.patch.dict(os.environ, {"TEST_DASHBOARD_PORT": "9443"}):
             self.assertEqual(9443, self.app.configured_port("TEST_DASHBOARD_PORT", 8787))

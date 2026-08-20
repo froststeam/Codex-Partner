@@ -534,6 +534,15 @@ async def inactive_trash_loop() -> None:
             continue
 
 
+def startup_drain_task_ids() -> set[str]:
+    """Return only work that has a durable queued delivery on startup."""
+    return {
+        row["task_id"]
+        for row in db.all("SELECT DISTINCT task_id FROM task_messages WHERE status='queued'")
+        if row.get("task_id")
+    }
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global app_shutting_down
@@ -574,18 +583,12 @@ async def lifespan(_: FastAPI):
                 await launch(row["id"], "goal-resume" if goal_auto_resume_enabled(task) else ("resume" if latest_codex_session(task) else "start"))
             except Exception:
                 continue
-    drain_task_ids = {
-        row["task_id"]
-        for row in db.all("SELECT DISTINCT task_id FROM task_messages WHERE status='queued'")
-        if row.get("task_id")
-    }
-    drain_task_ids.update(
-        row["id"]
-        for row in db.all(
-            "SELECT id FROM tasks WHERE trashed=0 AND goal!='' AND retry_forever=1 "
-            "AND goal_status NOT IN ('complete','none')"
-        )
-    )
+    drain_task_ids = startup_drain_task_ids()
+    # A saved auto-resume setting is not itself a request to start a new turn.
+    # Only a durable queued message, an explicit Goal start, or a completion
+    # path observed while the service is running may schedule a drain. Scanning
+    # every unfinished retrying Goal here made a dashboard restart resurrect
+    # old tasks unexpectedly (and could race native rollout discovery).
     for task_id in drain_task_ids:
         schedule_task_drain(task_id)
     try:
