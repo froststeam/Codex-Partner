@@ -922,8 +922,16 @@ async function hydrateChatFiles() {
   }
 }
 
+function chatFileReference(path) {
+  const value = String(path || "");
+  const hash = value.match(/^(.*)#L(\d+)(?:C(\d+))?$/i);
+  if (hash) return { path: hash[1], line: Number(hash[2]), column: Number(hash[3] || 0) };
+  const location = value.match(/^(.*\.[a-z0-9][a-z0-9._+-]*):(\d+)(?::(\d+))?$/i);
+  if (location) return { path: location[1], line: Number(location[2]), column: Number(location[3] || 0) };
+  return { path: value, line: 0, column: 0 };
+}
 function chatFileExtension(path) {
-  const name = String(path || "").split("?")[0].split("#")[0].toLowerCase();
+  const name = chatFileReference(path).path.split("?")[0].split("#")[0].toLowerCase();
   const match = name.match(/\.([a-z0-9]+)$/i);
   return match ? match[1] : "";
 }
@@ -941,7 +949,7 @@ function chatViewerLabel(kind) {
   return ({ image: "IMAGE", audio: "AUDIO", video: "VIDEO", pdf: "PDF", text: "TEXT" })[kind] || "FILE";
 }
 function chatDownloadUrl(taskId, path) {
-  return `/api/tasks/${encodeURIComponent(taskId)}/workspace/download?path=${encodeURIComponent(path)}`;
+  return `/api/tasks/${encodeURIComponent(taskId)}/workspace/download?path=${encodeURIComponent(chatFileReference(path).path)}`;
 }
 async function chatFileObjectUrl(taskId, path, kind = "") {
   const cacheKey = `${taskId}:${path}`;
@@ -983,8 +991,9 @@ document.addEventListener("keydown", event => {
   }
 });
 async function renderTextFileViewer(taskId, path) {
+  const reference = chatFileReference(path);
   const loadChunk = async offset => {
-    const query = new URLSearchParams({ path, offset: String(offset), limit: String(1024 * 1024) });
+    const query = new URLSearchParams({ path: reference.path, offset: String(offset), limit: String(1024 * 1024) });
     const response = await workspaceFetch(`/tasks/${encodeURIComponent(taskId)}/workspace?${query}`);
     if (!response.ok) throw await workspaceResponseError(response);
     return response.json();
@@ -993,7 +1002,7 @@ async function renderTextFileViewer(taskId, path) {
   const content = response.content ?? "";
   const body = $("#media-viewer-body");
   const ext = chatFileExtension(path);
-  if (!response.truncated && ["md", "markdown"].includes(ext) && window.toastui?.Editor) {
+  if (!reference.line && !response.truncated && ["md", "markdown"].includes(ext) && window.toastui?.Editor) {
     body.innerHTML = `<div id="media-viewer-markdown" class="media-viewer-markdown"></div>`;
     mediaViewerMarkdown = toastui.Editor.factory({
       el: $("#media-viewer-markdown"),
@@ -1007,7 +1016,19 @@ async function renderTextFileViewer(taskId, path) {
   body.innerHTML = `<div class="media-viewer-text-shell"><pre class="media-viewer-text"></pre><button type="button" class="secondary media-viewer-load-more" ${response.next_offset == null ? "hidden" : ""}>加载后续内容</button></div>`;
   const output = $(".media-viewer-text", body);
   const more = $(".media-viewer-load-more", body);
-  output.textContent = content;
+  if (reference.line > 0) {
+    const lines = content.split("\n");
+    const index = Math.min(reference.line, lines.length) - 1;
+    output.append(document.createTextNode(lines.slice(0, index).join("\n") + (index ? "\n" : "")));
+    const target = document.createElement("mark");
+    target.className = "media-viewer-target-line";
+    target.textContent = lines[index] ?? "";
+    output.append(target);
+    output.append(document.createTextNode((index < lines.length - 1 ? "\n" : "") + lines.slice(index + 1).join("\n")));
+    requestAnimationFrame(() => target.scrollIntoView({ block: "center" }));
+  } else {
+    output.textContent = content;
+  }
   let nextOffset = response.next_offset;
   more.onclick = async () => {
     if (nextOffset == null || more.disabled) return;

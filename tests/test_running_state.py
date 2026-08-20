@@ -1193,7 +1193,7 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
         conversation = (worker.parent / "conversation.js").read_text(encoding="utf-8")
         html = (worker.parent / "index.html").read_text(encoding="utf-8")
         self.assertIn('/chat-worker.js?v=20260819-activity-retention', conversation)
-        self.assertIn('/conversation.js?v=20260820-large-file-viewer', html)
+        self.assertIn('/conversation.js?v=20260820-source-location-viewer', html)
 
     def test_worker_hides_native_media_tags(self):
         script = f"""
@@ -1664,7 +1664,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn('data-activity-output-key="${esc(outputKey)}"', conversation)
         self.assertIn("Object.prototype.hasOwnProperty.call(state.activityOutputOpen, outputKey)", conversation)
         self.assertIn("state.activityOutputOpen[output.dataset.activityOutputKey] = output.open", conversation)
-        self.assertIn('/conversation.js?v=20260820-large-file-viewer', html)
+        self.assertIn('/conversation.js?v=20260820-source-location-viewer', html)
 
     def test_message_history_skips_activity_only_pages(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -1720,7 +1720,7 @@ const cursors = [];
         self.assertIn("HistoryPagination.fetchEarlierTimelinePages", conversation)
         self.assertIn("messageTarget: 12, maxPages: 8", conversation)
         self.assertIn('/history-pagination.js?v=20260817-message-history', html)
-        self.assertIn('/conversation.js?v=20260820-large-file-viewer', html)
+        self.assertIn('/conversation.js?v=20260820-source-location-viewer', html)
 
     def test_sent_browser_messages_follow_the_loaded_timeline_boundary(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -2661,6 +2661,36 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertNotIn("response.blob()", downloader)
         self.assertIn("加载后续内容", source)
 
+    def test_source_locations_open_the_real_text_file_and_target_line(self):
+        source = (Path(__file__).resolve().parents[1] / "static" / "conversation.js").read_text(encoding="utf-8")
+        self.assertIn("function chatFileReference(path)", source)
+        self.assertIn("path: reference.path", source)
+        self.assertIn('target.className = "media-viewer-target-line"', source)
+        script = f"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync({json.dumps(str(Path(__file__).resolve().parents[1] / "static/conversation.js"))}, "utf8");
+const start = source.indexOf("function chatFileReference(path)");
+const end = source.indexOf("async function chatFileObjectUrl", start);
+const context = {{ URLSearchParams }};
+vm.createContext(context);
+vm.runInContext(source.slice(start, end), context);
+process.stdout.write(JSON.stringify([
+  context.chatFileReference("/repo/install.sh:79"),
+  context.chatFileReference("/repo/main.py:12:4"),
+  context.chatFileReference("/repo/main.cc#L25C3"),
+  context.chatViewerKind("/repo/install.sh:79"),
+  context.chatDownloadUrl("task", "/repo/install.sh:79")
+]));
+"""
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
+        parsed = json.loads(result.stdout)
+        self.assertEqual({"path": "/repo/install.sh", "line": 79, "column": 0}, parsed[0])
+        self.assertEqual({"path": "/repo/main.py", "line": 12, "column": 4}, parsed[1])
+        self.assertEqual({"path": "/repo/main.cc", "line": 25, "column": 3}, parsed[2])
+        self.assertEqual("text", parsed[3])
+        self.assertIn("path=%2Frepo%2Finstall.sh", parsed[4])
+
     def test_legacy_staging_attachment_is_restored_to_session_workspace(self):
         task_id = "legacy-attachment-thread"
         self.make_task(task_id, "available")
@@ -3104,7 +3134,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('disabled title="${esc(uiLabel("protectedSkillDelete"))}"', settings)
         self.assertIn(".panel-item button.danger-text:not(:disabled)", styles)
         self.assertNotIn(".panel-item button:last-child", styles)
-        self.assertIn('/styles.css?v=20260820-large-file-viewer', html)
+        self.assertIn('/styles.css?v=20260820-source-location-viewer', html)
         self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
         self.assertIn('/settings.js?v=20260817-skill-actions', html)
 
@@ -3712,11 +3742,11 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('forkCreated ? "会话已复制，但打开副本失败" : "复制会话失败"', app_js)
         self.assertIn('uiLabel("sessionRenamed")', app_js)
         self.assertIn('uiLabel("sessionDuplicated")', app_js)
-        self.assertIn('/app.js?v=20260820-large-file-viewer', html)
+        self.assertIn('/app.js?v=20260820-source-location-viewer', html)
         self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260820-large-file-viewer', html)
+        self.assertIn('/conversation.js?v=20260820-source-location-viewer', html)
         self.assertIn("/timeline?limit=120", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -3961,12 +3991,12 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260820-large-file-viewer', html)
+        self.assertIn('/conversation.js?v=20260820-source-location-viewer', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
-        self.assertIn('/app.js?v=20260820-large-file-viewer', html)
+        self.assertIn('/app.js?v=20260820-source-location-viewer', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
-        self.assertIn('/styles.css?v=20260820-large-file-viewer', html)
+        self.assertIn('/styles.css?v=20260820-source-location-viewer', html)
         self.assertIn('/vendor/katex/katex.min.css', html)
         self.assertIn('<span id="goal-run-label">暂停</span>', html)
         self.assertNotIn('id="goal-run-label" class="sr-only"', html)
@@ -4031,7 +4061,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn('const sessionList = $("#task-list")', conversation)
         self.assertIn("void selectSession(pointerSelectedSessionId)", conversation)
         self.assertIn('aria-current="${selected ? "true" : "false"}"', conversation)
-        self.assertIn('/conversation.js?v=20260820-large-file-viewer', html)
+        self.assertIn('/conversation.js?v=20260820-source-location-viewer', html)
 
     def test_live_chat_rendering_coalesces_expensive_work(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -4059,7 +4089,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         timeline_wait = conversation.index("timeline = await timelinePromise", select_start)
         self.assertLess(socket_start, timeline_wait)
         self.assertIn('/core.js?v=20260818-thread-ops-i18n', html)
-        self.assertIn('/conversation.js?v=20260820-large-file-viewer', html)
+        self.assertIn('/conversation.js?v=20260820-source-location-viewer', html)
         styles = (static / "styles.css").read_text(encoding="utf-8")
         app_js = (static / "app.js").read_text(encoding="utf-8")
         self.assertNotIn("content-visibility: auto", styles)
@@ -4076,8 +4106,8 @@ process.stdout.write(JSON.stringify(browserMessages));
         self.assertIn("if (chatIsNearBottom(stream))", conversation)
         self.assertNotIn("stream.scrollTop = target * state.chatAverageHeight", conversation)
         self.assertIn("function syncPageVisibility", app_js)
-        self.assertIn('/styles.css?v=20260820-large-file-viewer', html)
-        self.assertIn('/app.js?v=20260820-large-file-viewer', html)
+        self.assertIn('/styles.css?v=20260820-source-location-viewer', html)
+        self.assertIn('/app.js?v=20260820-source-location-viewer', html)
 
     def test_optimistic_queue_messages_survive_authoritative_refresh(self):
         static = Path(__file__).resolve().parents[1] / "static"
