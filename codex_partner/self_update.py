@@ -15,6 +15,7 @@ from typing import Any
 
 PACKAGE_NAME = "codex-partner"
 DEFAULT_INTERVAL_HOURS = 6
+AUTO_UPDATE_INTERVAL_MINUTES = 15
 PYPI_URL = "https://pypi.org/pypi/codex-partner/json"
 
 
@@ -80,6 +81,8 @@ async def pip_upgrade(
         "install",
         "--upgrade",
         "--disable-pip-version-check",
+        "--index-url",
+        "https://pypi.org/simple",
         package,
     ]
     process = await asyncio.create_subprocess_exec(

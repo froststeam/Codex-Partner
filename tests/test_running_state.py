@@ -247,6 +247,13 @@ class RunningStateTests(unittest.TestCase):
         if os.name != "nt":
             self.assertEqual(0o600, path.stat().st_mode & 0o777)
 
+    def test_partner_update_uses_official_pypi_and_exact_version(self):
+        updater = (Path(__file__).resolve().parents[1] / "codex_partner" / "self_update.py").read_text(encoding="utf-8")
+        app_source = Path(self.app.__file__).read_text(encoding="utf-8")
+        self.assertIn('"https://pypi.org/simple"', updater)
+        self.assertIn('package=f"codex-partner=={latest}"', app_source)
+        self.assertIn("AUTO_UPDATE_INTERVAL_MINUTES = 15", updater)
+
     def test_partner_update_without_new_version_does_not_restart(self):
         state_path = Path(self.temp.name) / "partner-update-no-change.json"
         async def run():
@@ -280,7 +287,7 @@ class RunningStateTests(unittest.TestCase):
                  mock.patch.object(self.app, "APP_VERSION", "0.0.10"), \
                  mock.patch.object(self.app, "installed_partner_version", return_value="0.0.10"), \
                  mock.patch.object(self.app, "latest_pypi_version", return_value="0.0.11"), \
-                 mock.patch.object(self.app, "pip_upgrade_partner", new=mock.AsyncMock(return_value=upgrade)), \
+                 mock.patch.object(self.app, "pip_upgrade_partner", new=mock.AsyncMock(return_value=upgrade)) as pip_upgrade, \
                  mock.patch.object(self.app.asyncio, "create_task") as create_task:
                 response = await self.app.perform_partner_update()
             self.assertTrue(response["changed"])
@@ -288,6 +295,7 @@ class RunningStateTests(unittest.TestCase):
             self.assertFalse(response["restart_scheduled"])
             create_task.assert_not_called()
             self.assertTrue(json.loads(state_path.read_text())["restart_required"])
+            pip_upgrade.assert_awaited_once_with(package="codex-partner==0.0.11")
 
         asyncio.run(run())
 

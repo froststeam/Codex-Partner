@@ -85,6 +85,7 @@ from codex_partner.persistent_appserver import (
 )
 from codex_partner.self_update import (
     installed_version as installed_partner_version,
+    AUTO_UPDATE_INTERVAL_MINUTES,
     latest_pypi_version,
     load_state as load_partner_update_state,
     pip_upgrade as pip_upgrade_partner,
@@ -622,7 +623,7 @@ async def perform_partner_update() -> dict[str, Any]:
                     "changed": False,
                     "restart_scheduled": False,
                 }
-            result = await pip_upgrade_partner()
+            result = await pip_upgrade_partner(package=f"codex-partner=={latest}")
         except Exception as exc:
             state["last_result"] = "failed"
             state["last_error"] = str(exc)[-4000:]
@@ -656,7 +657,7 @@ async def partner_auto_update_loop() -> None:
                 except ValueError:
                     last_check = datetime.fromtimestamp(0, timezone.utc)
                 due = datetime.now(timezone.utc) - last_check >= timedelta(
-                    hours=int(state.get("interval_hours") or 6)
+                    minutes=AUTO_UPDATE_INTERVAL_MINUTES
                 )
                 if due:
                     try:
