@@ -25,6 +25,7 @@ import sqlite3
 import socket
 import struct
 import subprocess
+import sys
 import time
 import uuid
 import urllib.error
@@ -77,7 +78,20 @@ from codex_partner.platform_support import (
     prepare_subprocess_command,
     validate_bind_auth,
 )
-from codex_partner.persistent_appserver import ensure_service as ensure_persistent_appserver, stop_service as stop_persistent_appserver
+from codex_partner.persistent_appserver import (
+    ensure_service as ensure_persistent_appserver,
+    stop_inactive_services as stop_inactive_appservers,
+    stop_service as stop_persistent_appserver,
+)
+from codex_partner.self_update import (
+    installed_version as installed_partner_version,
+    latest_pypi_version,
+    load_state as load_partner_update_state,
+    pip_upgrade as pip_upgrade_partner,
+    save_state as save_partner_update_state,
+    utc_now as update_utc_now,
+    version_key as partner_version_key,
+)
 from codex_partner.schemas import (
     ApprovalResolveIn,
     AvatarIn,
@@ -86,6 +100,8 @@ from codex_partner.schemas import (
     MemoryIn,
     MemoryResetIn,
     OperationIn,
+    PartnerRestartIn,
+    PartnerUpdateSettingsIn,
     ProviderIn,
     ProviderVerifyIn,
     QuickTaskCreate,
@@ -133,6 +149,10 @@ except ValueError:
     INACTIVE_TRASH_SCAN_SECONDS = 3600
 app_shutting_down = False
 CODEX_INSTALL_PACKAGE = "@openai/codex@latest"
+PARTNER_UPDATE_STATE_PATH = DATA_DIR / "partner-update.json"
+partner_update_lock = asyncio.Lock()
+partner_update_worker: Optional[asyncio.Task] = None
+task_restart_locks: dict[str, asyncio.Lock] = {}
 
 
 def configured_port(name: str, default: int) -> int:
@@ -543,9 +563,116 @@ def startup_drain_task_ids() -> set[str]:
     }
 
 
+def partner_update_snapshot() -> dict[str, Any]:
+    state = load_partner_update_state(PARTNER_UPDATE_STATE_PATH)
+    installed = installed_partner_version(APP_VERSION) or APP_VERSION
+    state["running_version"] = APP_VERSION
+    state["current_version"] = APP_VERSION
+    state["installed_version"] = installed
+    state["restart_required"] = (
+        state.get("restart_required", False)
+        or partner_version_key(installed) > partner_version_key(APP_VERSION)
+    )
+    state["updating"] = partner_update_lock.locked()
+    state["package"] = "codex-partner"
+    return state
+
+
+async def restart_partner_process(delay: float = 1.5) -> None:
+    """Apply an installed package update after the API response is flushed."""
+    await asyncio.sleep(delay)
+    if platform.system() == "Linux" and os.getenv("INVOCATION_ID") and shutil.which("systemctl"):
+        process = await asyncio.create_subprocess_exec(
+            "systemctl", "--user", "restart", "--no-block",
+            os.getenv("CODEX_PARTNER_SYSTEMD_UNIT", "codex-partner.service"),
+        )
+        if await process.wait() == 0:
+            return
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
+async def perform_partner_update() -> dict[str, Any]:
+    if partner_update_lock.locked():
+        raise HTTPException(409, "Codex Partner 正在更新，请稍候")
+    async with partner_update_lock:
+        state = load_partner_update_state(PARTNER_UPDATE_STATE_PATH)
+        state["last_checked_at"] = update_utc_now()
+        state["last_error"] = ""
+        try:
+            running = APP_VERSION
+            current = installed_partner_version(running) or running
+            if partner_version_key(current) > partner_version_key(running):
+                state["installed_version"] = current
+                state["restart_required"] = True
+                state["last_result"] = "updated"
+                save_partner_update_state(PARTNER_UPDATE_STATE_PATH, state)
+                return partner_update_snapshot() | {
+                    "ok": True,
+                    "changed": False,
+                    "restart_scheduled": False,
+                }
+            latest = await asyncio.to_thread(latest_pypi_version)
+            state["latest_version"] = latest
+            if not latest or partner_version_key(latest) <= partner_version_key(current):
+                state["last_result"] = "current"
+                state["installed_version"] = current
+                save_partner_update_state(PARTNER_UPDATE_STATE_PATH, state)
+                return partner_update_snapshot() | {
+                    "ok": True,
+                    "changed": False,
+                    "restart_scheduled": False,
+                }
+            result = await pip_upgrade_partner()
+        except Exception as exc:
+            state["last_result"] = "failed"
+            state["last_error"] = str(exc)[-4000:]
+            save_partner_update_state(PARTNER_UPDATE_STATE_PATH, state)
+            raise
+        state.update({
+            "last_result": "updated" if result["changed"] else "current",
+            "last_updated_at": update_utc_now() if result["changed"] else state.get("last_updated_at", ""),
+            "last_error": "",
+            "previous_version": result["previous_version"],
+            "installed_version": result["installed_version"],
+            "restart_required": bool(result["changed"]),
+        })
+        save_partner_update_state(PARTNER_UPDATE_STATE_PATH, state)
+    response = partner_update_snapshot() | {
+        "ok": True,
+        "changed": result["changed"],
+        "restart_scheduled": False,
+    }
+    return response
+
+
+async def partner_auto_update_loop() -> None:
+    while True:
+        try:
+            state = load_partner_update_state(PARTNER_UPDATE_STATE_PATH)
+            if state.get("auto_update"):
+                last_text = str(state.get("last_checked_at") or "")
+                try:
+                    last_check = datetime.fromisoformat(last_text)
+                except ValueError:
+                    last_check = datetime.fromtimestamp(0, timezone.utc)
+                due = datetime.now(timezone.utc) - last_check >= timedelta(
+                    hours=int(state.get("interval_hours") or 6)
+                )
+                if due:
+                    try:
+                        await perform_partner_update()
+                    except Exception:
+                        pass
+            await asyncio.sleep(300)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await asyncio.sleep(300)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global app_shutting_down
+    global app_shutting_down, partner_update_worker
     app_shutting_down = False
     observer_task: Optional[asyncio.Task] = None
     inactive_trash_task: Optional[asyncio.Task] = None
@@ -573,6 +700,7 @@ async def lifespan(_: FastAPI):
         pass
     seed_activity_graph_builds()
     activity_graph_task = asyncio.create_task(activity_graph_worker_loop())
+    partner_update_worker = asyncio.create_task(partner_auto_update_loop())
     if AUTO_RESUME:
         await asyncio.sleep(0)
         for row in db.all("SELECT id FROM tasks WHERE status='queued' ORDER BY updated_at"):
@@ -591,6 +719,11 @@ async def lifespan(_: FastAPI):
     # old tasks unexpectedly (and could race native rollout discovery).
     for task_id in drain_task_ids:
         schedule_task_drain(task_id)
+    active_appserver_keys = set()
+    for row in db.all("SELECT id,provider_id,ssh_host FROM tasks WHERE status IN ('running','queued')"):
+        provider = {"id": row.get("provider_id")} if row.get("provider_id") else None
+        active_appserver_keys.add(appserver_key(provider, row))
+    await stop_inactive_appservers(active_appserver_keys)
     try:
         yield
     finally:
@@ -604,6 +737,10 @@ async def lifespan(_: FastAPI):
         if activity_graph_task:
             activity_graph_task.cancel()
             await asyncio.gather(activity_graph_task, return_exceptions=True)
+        if partner_update_worker:
+            partner_update_worker.cancel()
+            await asyncio.gather(partner_update_worker, return_exceptions=True)
+            partner_update_worker = None
         workers = list(task_workers.values())
         for worker in workers:
             worker.cancel()
@@ -700,14 +837,14 @@ async def stop_idle_task_appserver(task: dict) -> None:
 
 async def appserver_for(provider: Optional[dict], task: Optional[dict] = None) -> AppServerClient:
     key = appserver_key(provider, task)
+    env = os.environ.copy()
+    host = (task or {}).get("ssh_host") or ""
+    if provider and provider.get("base_url") and not host:
+        env["OPENAI_BASE_URL"] = provider["base_url"]
+    if key_value := provider_api_key(provider) if not host else "":
+        env["OPENAI_API_KEY"] = key_value
     async with appserver_lock:
         if key not in app_servers:
-            env = os.environ.copy()
-            host = (task or {}).get("ssh_host") or ""
-            if provider and provider.get("base_url") and not host:
-                env["OPENAI_BASE_URL"] = provider["base_url"]
-            if key_value := provider_api_key(provider) if not host else "":
-                env["OPENAI_API_KEY"] = key_value
             if host:
                 connection = await require_ssh_connection(host, codex=True)
                 remote_command = shlex.join([connection["codex_bin"], "app-server", "--stdio"])
@@ -742,7 +879,32 @@ async def appserver_for(provider: Optional[dict], task: Optional[dict] = None) -
                 )
                 if persistent:
                     app_servers[key].daemon_pid = persistent[1]
-        await app_servers[key].start()
+        try:
+            await app_servers[key].start()
+        except Exception:
+            failed = app_servers.get(key)
+            if host or not failed or not getattr(failed, "daemon_pid", 0):
+                raise
+            app_servers.pop(key, None)
+            await failed.close()
+            await stop_persistent_appserver(key)
+            persistent = await ensure_persistent_appserver(key, CODEX_BIN, env, DATA_DIR)
+            app_servers[key] = AppServerClient(
+                env,
+                key,
+                command=[CODEX_BIN, "app-server", "--stdio"] if not persistent else None,
+                require_codex=require_codex,
+                notification_handler=handle_appserver_notification,
+                server_request_handler=handle_appserver_server_request,
+                thread_bindings=app_thread_bindings,
+                turn_waiters=turn_waiters,
+                client_name=APP_NAME.lower().replace(" ", "-"),
+                client_version=app.version,
+                websocket_url=persistent[0] if persistent else None,
+            )
+            if persistent:
+                app_servers[key].daemon_pid = persistent[1]
+            await app_servers[key].start()
         return app_servers[key]
 
 
@@ -3338,6 +3500,16 @@ async def supervise_appserver_turn(
             )
             while True:
                 await wait_for_appserver_turn(client, turn_events, turn_id)
+                # A running Goal can produce an unbounded sequence of turns.
+                # Give a queued user message a turn boundary before asking
+                # Codex to continue the Goal, otherwise manual input can
+                # starve forever while auto-resume is enabled.
+                queued_message = db.one(
+                    "SELECT id FROM task_messages WHERE task_id=? AND status='queued' ORDER BY created_at, id LIMIT 1",
+                    (task["id"],),
+                )
+                if queued_message:
+                    break
                 goal_task = task_or_404(task["id"])
                 revision_changed = int(goal_task.get("goal_revision") or 0) != int(goal_revision_at_start or 0)
                 if not (goal_task.get("goal") and run_mode == "goal_resume" and not revision_changed):
@@ -3447,14 +3619,35 @@ async def supervise_appserver_turn(
                 (fallback["id"], error, now(), task["id"]),
             )
             await broadcast_task(task["id"], {"type": "provider_failover", "from": (provider or {}).get("name"), "to": fallback.get("name"), "error": error})
-            if running.get(task["id"]) is client.owner:
+            if client and running.get(task["id"]) is client.owner:
                 running.pop(task["id"], None)
             asyncio.create_task(launch_after_turn_cleanup(task["id"], mode, message, message_id, tried_provider_ids))
             return
         current_task = task_or_404(task["id"])
-        retries = int(current_task["retry_count"])
         goal_continues = isinstance(exc, GoalIncompleteError)
-        should_retry = goal_auto_resume_enabled(current_task) if goal_continues else task_retry_allowed(current_task, retries)
+        context_recovered = False
+        if (
+            not stopped
+            and "context_window_exceeded" in error.lower()
+            and current_task.get("goal")
+            and (current_task.get("goal_status") or "none") == "active"
+            and client
+            and thread_id
+        ):
+            try:
+                await compact_codex_thread(client, thread_id)
+                context_recovered = True
+                goal_continues = True
+                await broadcast_task(task["id"], {
+                    "type": "system",
+                    "text": "Context window was full. Codex Partner compacted the thread and is continuing the active Goal.",
+                    "status": "retrying",
+                })
+            except Exception as compact_exc:
+                error = f"{error}; automatic context compaction failed: {compact_exc}"
+        should_retry = context_recovered or (
+            goal_auto_resume_enabled(current_task) if goal_continues else task_retry_allowed(current_task)
+        )
         pending_message = db.one(
             "SELECT id FROM task_messages WHERE task_id=? AND status='queued' ORDER BY created_at, id LIMIT 1",
             (task["id"],),
@@ -3492,7 +3685,7 @@ async def supervise_appserver_turn(
                 db.execute("UPDATE task_messages SET status='queued', error=?, session_id=NULL WHERE id=?", (error, message_id))
                 await broadcast_task(task["id"], {"type": "message", "message_id": message_id, "status": "queued", "error": error})
             await broadcast_task(task["id"], {"type": "session", "session_id": session_id, "status": "retrying", "error": error})
-            await asyncio.sleep(min(30, 2 ** min(retries, 4)))
+            await asyncio.sleep(2)
             if goal_continues and not task_or_404(task["id"]).get("goal"):
                 db.execute("UPDATE sessions SET status='succeeded',exit_code=0,summary='Goal cleared after completed turn' WHERE id=?", (session_id,))
                 db.execute("UPDATE tasks SET status='succeeded',active_session_id=NULL,execution_source='',execution_turn_id='',last_error='',updated_at=? WHERE id=?", (now(), task["id"]))
@@ -3515,7 +3708,7 @@ async def supervise_appserver_turn(
             await broadcast_task(task["id"], {"type": "message", "message_id": message_id, "status": "failed", "error": "Stopped by user" if stopped else error, "session_id": session_id})
         await broadcast_task(task["id"], {"type": "session", "session_id": session_id, "status": "stopped" if stopped else "failed", "error": error})
     finally:
-        if thread_id:
+        if client and thread_id:
             try:
                 await asyncio.wait_for(client.request("thread/unsubscribe", {"threadId": thread_id}), timeout=3)
             except Exception:
@@ -3531,7 +3724,7 @@ async def supervise_appserver_turn(
         binding = app_thread_bindings.get(task["id"])
         if binding and binding[2] == session_id:
             app_thread_bindings.pop(task["id"], None)
-        if running.get(task["id"]) is client.owner:
+        if client and running.get(task["id"]) is client.owner:
             running.pop(task["id"], None)
         # Cover early returns from retry/failover/stop paths as well as the
         # normal success path.  The worker will wait if another owner is still
@@ -4135,15 +4328,14 @@ def goal_auto_resume_enabled(task: dict) -> bool:
     return status not in GOAL_TERMINAL_STATUSES | {"paused"}
 
 
-def task_retry_allowed(task: dict, retries: int) -> bool:
+def task_retry_allowed(task: dict) -> bool:
+    """Retry only when the explicit auto-resume switch is enabled."""
     if task.get("goal"):
         status = task.get("goal_status") or "active"
         if status in GOAL_TERMINAL_STATUSES:
             return False
-        if status in GOAL_MANUAL_STOP_STATUSES and not task.get("retry_forever"):
-            return False
-    retry_forever = goal_auto_resume_enabled(task) if task.get("goal") else bool(task.get("retry_forever"))
-    return retry_forever or retries <= int(task["max_retries"])
+        return goal_auto_resume_enabled(task)
+    return bool(task.get("retry_forever"))
 
 
 async def launch_after_turn_cleanup(
@@ -4235,6 +4427,8 @@ def task_summary(task_id: str) -> Optional[dict]:
     row["archived"] = bool(row.get("archived", 0))
     row["trashed"] = bool(row.get("trashed", 0))
     row["goal_status"] = public_goal_status(row)
+    row.pop("max_retries", None)
+    row.pop("retry_count", None)
     return attach_external_task_state(row, task_id)
 
 
@@ -4315,7 +4509,7 @@ async def broadcast_task(task_id: str, payload: dict) -> None:
     if payload.get("type") == "task_status":
         task = payload.get("task") or {}
         mutable_fields = {
-            "name", "goal", "workspace", "status", "yolo", "retry_count", "retry_forever",
+            "name", "goal", "workspace", "status", "yolo", "retry_forever",
             "provider_id", "model", "reasoning_effort", "service_tier", "last_error",
             "active_session_id", "goal_status", "goal_tokens_used", "updated_at", "archived",
             "trashed", "execution_source", "execution_turn_id", "run_mode", "external_running",
@@ -4721,7 +4915,7 @@ def schedule_task_drain(task_id: str) -> None:
 
 
 async def enqueue_task_message(task_id: str, body: str, client_message_id: Optional[str] = None, delivery: str = "auto") -> dict:
-    task_or_404(task_id)
+    task = task_or_404(task_id)
     sample = body[:10000]
     if "\x00" in sample or "�PNG" in sample or ("IHDR" in sample and "IDAT" in sample and sample.count("�") > 8):
         raise HTTPException(400, "检测到被当作文本发送的二进制文件。请刷新页面后重新粘贴，文件会上传到工作区。")
@@ -4738,6 +4932,21 @@ async def enqueue_task_message(task_id: str, body: str, client_message_id: Optio
     db.execute("INSERT INTO task_messages (id,task_id,body,status,created_at) VALUES (?,?,?,?,?)", (message_id, task_id, body, "queued", stamp))
     db.execute("UPDATE tasks SET updated_at=? WHERE id=?", (stamp, task_id))
     await broadcast_task(task_id, {"type": "message", "message_id": message_id, "status": "queued", "body": body, "created_at": stamp})
+    # A normal Enter submission remains durable FIFO, but an active Goal turn
+    # should not starve it behind an unbounded sequence of Goal turns. Try to
+    # inject it into the current dashboard-owned turn after the row is saved;
+    # steer_task_message falls back to the queue if the turn boundary moved.
+    if (
+        delivery == "queue"
+        and task.get("goal")
+        and task.get("goal_status") == "active"
+        and task.get("execution_source") == "dashboard"
+        and dashboard_owns_task(task_id)
+    ):
+        return await steer_task_message(
+            task_id,
+            TaskMessageIn(message=body, client_message_id=message_id, delivery="auto"),
+        )
     schedule_task_drain(task_id)
     return db.one("SELECT * FROM task_messages WHERE id=?", (message_id,)) or {"id": message_id, "status": "queued"}
 
@@ -4999,6 +5208,31 @@ async def codex_manage(_: Any = Depends(auth)):
     return codex_management_snapshot()
 
 
+@app.get("/api/partner/update")
+async def get_partner_update(_: Any = Depends(auth)):
+    return partner_update_snapshot()
+
+
+@app.patch("/api/partner/update")
+async def patch_partner_update(payload: PartnerUpdateSettingsIn, _: Any = Depends(auth)):
+    state = load_partner_update_state(PARTNER_UPDATE_STATE_PATH)
+    state["auto_update"] = payload.auto_update
+    save_partner_update_state(PARTNER_UPDATE_STATE_PATH, state)
+    return partner_update_snapshot()
+
+
+@app.post("/api/partner/restart")
+async def restart_partner_after_update(payload: PartnerRestartIn, _: Any = Depends(auth)):
+    snapshot = partner_update_snapshot()
+    if not snapshot["restart_required"]:
+        raise HTTPException(409, "没有等待生效的 Codex Partner 更新")
+    state = load_partner_update_state(PARTNER_UPDATE_STATE_PATH)
+    state["restart_required"] = False
+    save_partner_update_state(PARTNER_UPDATE_STATE_PATH, state)
+    asyncio.create_task(restart_partner_process())
+    return {"ok": True, "restart_scheduled": True}
+
+
 @app.get("/api/ssh/hosts")
 async def list_ssh_hosts(probe: bool = True, _: Any = Depends(auth)):
     hosts = configured_ssh_hosts()
@@ -5147,6 +5381,8 @@ async def list_tasks(_: Any = Depends(auth)):
         r["archived"] = bool(r.get("archived", 0))
         r["trashed"] = bool(r.get("trashed", 0))
         r["goal_status"] = public_goal_status(r)
+        r.pop("max_retries", None)
+        r.pop("retry_count", None)
         attach_external_task_state(r, r["id"])
     return rows
 
@@ -5179,7 +5415,7 @@ async def create_task(payload: TaskCreate, _: Any = Depends(auth)):
     db.execute(
         "INSERT INTO tasks (id,name,prompt,goal,workspace,status,yolo,max_retries,retry_forever,retry_explicit,provider_id,model,context,codex_session_id,goal_status,created_at,updated_at,last_interaction_at,native,reasoning_effort,service_tier,personality,collaboration_mode,permission_profile,ssh_host) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (task_id, payload.name, payload.prompt, payload.goal, workspace, "queued", int(payload.yolo), payload.max_retries, int(payload.retry_forever), int(payload.retry_forever), payload.provider_id, payload.model, payload.context, requested_thread_id, goal_status, stamp, stamp, stamp, 0, payload.reasoning_effort, payload.service_tier, payload.personality, payload.collaboration_mode, payload.permission_profile, ssh_host),
+        (task_id, payload.name, payload.prompt, payload.goal, workspace, "queued", int(payload.yolo), 0, int(payload.retry_forever), int(payload.retry_forever), payload.provider_id, payload.model, payload.context, requested_thread_id, goal_status, stamp, stamp, stamp, 0, payload.reasoning_effort, payload.service_tier, payload.personality, payload.collaboration_mode, payload.permission_profile, ssh_host),
     )
     result = task_or_404(task_id)
     await broadcast_overview(task_id, {"type": "created"})
@@ -5202,7 +5438,9 @@ async def create_quick_task(payload: QuickTaskCreate = QuickTaskCreate(), _: Any
         (task_id, payload.name.strip() or "新 Codex 会话", "", "", workspace, "available", 1, 3, 0, None, "", "", "", "none", stamp, stamp, stamp, 0, "", "", "", "default", "", ssh_host),
     )
     result = task_or_404(task_id)
-    await broadcast_overview(task_id, {"type": "created", "quick": True})
+    # The creator already has the canonical row in this response. Do not let
+    # a slow overview WebSocket delay the one-click session transition.
+    asyncio.create_task(broadcast_overview(task_id, {"type": "created", "quick": True}))
     return result
 
 
@@ -5212,6 +5450,8 @@ async def get_task(task_id: str, _: Any = Depends(auth)):
     task_id = task["id"]
     task["sessions"] = db.all("SELECT * FROM sessions WHERE task_id=? ORDER BY attempt DESC LIMIT 40", (task_id,))
     task["session_count"] = db.one("SELECT COUNT(*) count FROM sessions WHERE task_id=?", (task_id,))["count"]
+    task.pop("max_retries", None)
+    task.pop("retry_count", None)
     return task
 
 
@@ -5316,7 +5556,7 @@ async def patch_task(task_id: str, payload: TaskPatch, _: Any = Depends(auth)):
     if "goal" in values and "goal_status" not in values:
         values["goal_status"] = "active" if (values["goal"] or "").strip() else "none"
     allowed = {
-        "name", "prompt", "goal", "workspace", "yolo", "max_retries", "retry_forever", "provider_id", "model",
+        "name", "prompt", "goal", "workspace", "yolo", "retry_forever", "provider_id", "model",
         "codex_session_id", "goal_status", "reasoning_effort", "service_tier", "personality", "collaboration_mode",
         "permission_profile", "ssh_host",
     }
@@ -5463,8 +5703,6 @@ async def start_goal(task_id: str, _: Any = Depends(auth)):
         task = task_or_404(task_id)
         if not str(task.get("goal") or "").strip():
             raise HTTPException(409, "Set a Goal before starting it")
-        if task.get("goal_status") == "complete":
-            raise HTTPException(409, "Completed Goal cannot be restarted; edit it first")
         previous_goal_status = (db.one("SELECT goal_status FROM tasks WHERE id=?", (task_id,)) or {}).get("goal_status") or "paused"
         stamp = now()
         db.execute(
@@ -6529,8 +6767,7 @@ async def supervise(task: dict, session_id: str, providers: list[Optional[dict]]
     async with running_lock:
         running.pop(task_id, None)
     latest = task_or_404(task_id)
-    retries = int(latest["retry_count"])
-    if task_retry_allowed(latest, retries):
+    if task_retry_allowed(latest):
         db.execute("UPDATE sessions SET status='retrying', finished_at=?, exit_code=?, summary=? WHERE id=?", (now(), 1, last_error, session_id))
         db.execute(
             "UPDATE tasks SET status='retrying',execution_source='dashboard',last_error=?,updated_at=? WHERE id=?",
@@ -6540,7 +6777,7 @@ async def supervise(task: dict, session_id: str, providers: list[Optional[dict]]
             db.execute("UPDATE task_messages SET status='failed', finished_at=?, error=?, session_id=? WHERE id=?", (now(), last_error, session_id, message_id))
             await broadcast_task(task_id, {"type": "message", "message_id": message_id, "status": "failed", "error": last_error, "session_id": session_id})
         await broadcast_task(task_id, {"type": "session", "session_id": session_id, "status": "retrying", "error": last_error})
-        await asyncio.sleep(min(30, 2 ** min(retries, 4)))
+        await asyncio.sleep(2)
         try:
             await launch(task_id, "goal-resume" if goal_auto_resume_enabled(latest) else "auto-retry")
         except Exception:
@@ -6588,6 +6825,71 @@ async def resume_task(task_id: str, _: Any = Depends(auth)):
     if task.get("active_session_id"):
         return await launch(task_id, "resume")
     return await launch(task_id, "resume")
+
+
+@app.post("/api/tasks/{task_id}/restart")
+async def restart_task_codex(task_id: str, _: Any = Depends(auth)):
+    """Replace one session's Codex process while preserving its thread identity."""
+    task = task_or_404(task_id)
+    task_id = str(task["id"])
+    lock = task_restart_locks.setdefault(task_id, asyncio.Lock())
+    if lock.locked():
+        raise HTTPException(409, "This session is already restarting Codex")
+    async with lock:
+        task = task_or_404(task_id)
+        previous_thread_id = latest_codex_session(task)
+        previous_run_mode = str(task.get("run_mode") or "")
+        external_live = await refresh_live_external_turn(task_id)
+        was_running = bool(
+            task.get("status") in {"running", "retrying", "queued"}
+            or
+            dashboard_owns_task(task_id)
+            or appserver_turn_tasks.get(task_id)
+            or external_live
+        )
+        if was_running:
+            await stop_task_run(task_id, pause_goal=False)
+        task = task_or_404(task_id)
+        provider = db.one(
+            "SELECT * FROM providers WHERE id=?", (task.get("provider_id"),)
+        ) if task.get("provider_id") else None
+        key = appserver_key(provider, task)
+        client = app_servers.get(key)
+        if client:
+            await close_task_appserver(provider, task, client)
+        else:
+            await stop_persistent_appserver(key)
+        app_thread_bindings.pop(task_id, None)
+        appserver_turn_ids.pop(task_id, None)
+        await appserver_for(provider, task)
+
+        resumed = False
+        if was_running:
+            latest = task_or_404(task_id)
+            goal_resume = (
+                previous_run_mode == "goal_resume"
+                and bool(latest.get("goal"))
+                and (latest.get("goal_status") or "none") == "active"
+            )
+            message = "" if goal_resume else (
+                "Continue from where the interrupted turn stopped. "
+                "Do not repeat work that was already completed."
+            )
+            await launch(task_id, "goal-resume" if goal_resume else "resume", message)
+            resumed = True
+        result = task_or_404(task_id)
+        await broadcast_task(task_id, {
+            "type": "task_status",
+            "task": result,
+            "source": {"kind": "codex_restart", "resumed": resumed},
+        })
+        await broadcast_overview(task_id, {"kind": "codex_restart", "resumed": resumed})
+        return result | {
+            "ok": True,
+            "restarted": True,
+            "resumed": resumed,
+            "thread_id": latest_codex_session(result) or previous_thread_id,
+        }
 
 
 @app.get("/api/tasks/{task_id}/messages")
@@ -6724,7 +7026,10 @@ async def steer_task_message(task_id: str, payload: TaskMessageIn, _: Any = Depe
     thread_id = binding[1] if binding else ""
     session_id = binding[2] if binding else ""
     if not (binding and client and thread_id and turn_id and turn_task and not turn_task.done()):
-        raise HTTPException(409, "当前没有可插入的 Codex turn")
+        # The turn can finish between the browser keydown and this request.
+        # Preserve the message in durable FIFO instead of reporting a false
+        # send failure or asking the user to type it again.
+        return await enqueue_task_message(task_id, payload.message, message_id, "queue")
 
     stamp = now()
     message_body = existing["body"] if existing else payload.message
@@ -6943,6 +7248,20 @@ CODEX_OPERATIONS = {
 THREAD_RPC_OPERATIONS = {"archive", "unarchive", "delete", "fork", "rename", "compact", "memory-enable", "memory-disable"}
 
 
+async def compact_codex_thread(client: AppServerClient, thread_id: str) -> dict[str, Any]:
+    waiter = asyncio.get_running_loop().create_future()
+    compaction_waiters[thread_id] = waiter
+    try:
+        result = await client.request("thread/compact/start", {"threadId": thread_id})
+        await asyncio.wait_for(waiter, timeout=180)
+        return result if isinstance(result, dict) else {"result": result}
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError("Codex compaction did not complete within 180 seconds") from exc
+    finally:
+        if compaction_waiters.get(thread_id) is waiter:
+            compaction_waiters.pop(thread_id, None)
+
+
 async def _run_thread_operation(task: dict, payload: OperationIn) -> dict:
     thread_id = latest_codex_session(task)
     operation = payload.operation
@@ -7011,16 +7330,7 @@ async def _run_thread_operation(task: dict, payload: OperationIn) -> dict:
         await broadcast_task(task["id"], {"type": "task_status", "task": renamed, "source": {"kind": "thread", "operation": operation}})
         return {"ok": True, "operation": operation, "thread_id": thread_id, "result": result, "task": renamed}
     if operation == "compact":
-        waiter = asyncio.get_running_loop().create_future()
-        compaction_waiters[thread_id] = waiter
-        try:
-            result = await client.request("thread/compact/start", {"threadId": thread_id})
-            await asyncio.wait_for(waiter, timeout=180)
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError("Codex compaction did not complete within 180 seconds") from exc
-        finally:
-            if compaction_waiters.get(thread_id) is waiter:
-                compaction_waiters.pop(thread_id, None)
+        result = await compact_codex_thread(client, thread_id)
         return {"ok": True, "operation": operation, "thread_id": thread_id, "result": result}
     approval = "never" if task["yolo"] else "on-request"
     sandbox = "danger-full-access" if task["yolo"] else "workspace-write"
@@ -7162,24 +7472,13 @@ async def execute_slash_command(task: dict, command: str, arg_text: str, args: l
         if requested_status in {"paused", "pause"}:
             result = await pause_goal(task["id"], None)
             return result_message(command, "Goal 已暂停，自动重试已关闭，会话已停止。", task=result)
-        # Slash Goal updates share the same serialization boundary as the
-        # REST editor. This prevents a running turn from restoring an older
-        # objective after the command has returned.
-        async with goal_sync_lock(task["id"]):
-            result = await execute_goal_slash_command(task, command, arg_text, args, confirmed)
-        if (result.get("goal") or {}).get("status") == "active" and not task_turn_active(task["id"]):
-            started = await start_goal(task["id"], None)
-            result["task"] = started
-            result["message"] += "\n\nGoal 已启用，会话已开始。"
-        return result
+        return await execute_goal_slash_command(task, command, arg_text, args, confirmed)
 
     return await execute_slash_command_unlocked(task, command, arg_text, args, confirmed)
 
 
 async def execute_goal_slash_command(task: dict, command: str, arg_text: str, args: list[str], confirmed: bool = False) -> dict:
-    """Execute Goal slash commands while holding the per-task Goal lock."""
-    # Keep the original command implementation below in one place. The
-    # function is split out so REST edits and slash edits use one lock.
+    """Execute Goal slash commands using the same lifecycle as Goal controls."""
     return await _execute_slash_command_body(task, command, arg_text, args, confirmed)
 
 
@@ -7190,35 +7489,25 @@ async def execute_slash_command_unlocked(task: dict, command: str, arg_text: str
 async def _execute_slash_command_body(task: dict, command: str, arg_text: str, args: list[str], confirmed: bool = False) -> dict:
     if command == "goal":
         thread_id = latest_codex_session(task)
-        client = None
-        if thread_id:
-            client, _ = await appserver_for_task(task)
-            await ensure_thread_loaded(task, client)
         first = args[0].lower() if args else ""
         statuses = {"active", "paused", "blocked", "usageLimited", "budgetLimited", "complete", "pause", "resume"}
         if not args or first in {"show", "get"} or (first == "status" and len(args) == 1):
             goal = {"objective": task.get("goal", ""), "status": task.get("goal_status", "none"), "tokensUsed": task.get("goal_tokens_used", 0)}
-            if client and thread_id:
-                try:
-                    goal = (await client.request("thread/goal/get", {"threadId": thread_id})).get("goal") or goal
-                except Exception:
-                    pass
             if not goal.get("objective"):
-                return result_message(command, "当前线程没有设置 Goal。\n\n用法：`/goal <objective>`")
-            return result_message(command, f"**Goal**\n{goal.get('objective')}\n\n状态：`{goal.get('status', 'active')}` · 已用 tokens：{goal.get('tokensUsed', 0)}", goal=goal)
+                return result_message(command, "当前线程没有设置 Goal。\n\n请在编辑框中输入目标，或使用 `/goal <objective>`。", goal=goal, ui_action="edit_goal")
+            return result_message(command, f"**Goal**\n{goal.get('objective')}\n\n状态：`{goal.get('status', 'active')}` · 已用 tokens：{goal.get('tokensUsed', 0)}", goal=goal, ui_action="edit_goal" if not args else "")
         if first == "clear":
-            stamp = now()
-            db.execute("UPDATE tasks SET goal='',goal_status='none',goal_tokens_used=0,goal_revision=goal_revision+1,goal_updated_at=?,retry_forever=0,retry_explicit=0,updated_at=? WHERE id=?", (stamp, stamp, task["id"]))
-            if client and thread_id:
-                await client.request("thread/goal/clear", {"threadId": thread_id})
-            return result_message(command, "Goal 已清除。")
+            updated = await patch_goal(task["id"], GoalPatch(objective=""), None)
+            return result_message(command, updated.get("goal_sync_error") or "Goal 已清除。", task=updated)
         if first == "budget":
             if len(args) != 2 or not args[1].isdigit():
                 raise HTTPException(400, "用法：/goal budget <tokens>")
             if not task.get("goal"):
                 raise HTTPException(400, "当前线程还没有 Goal")
             objective, status = task["goal"], task.get("goal_status") or "active"
-            if client and thread_id:
+            if thread_id:
+                client, _ = await appserver_for_task(task)
+                await ensure_thread_loaded(task, client)
                 await client.request("thread/goal/set", {"threadId": thread_id, "objective": objective, "status": status, "tokenBudget": int(args[1])})
             return result_message(command, f"Goal token budget 已设置为 `{args[1]}`。")
         if first == "status":
@@ -7228,27 +7517,17 @@ async def _execute_slash_command_body(task: dict, command: str, arg_text: str, a
         status_aliases = {"usagelimited": "usageLimited", "budgetlimited": "budgetLimited"}
         if first in statuses or first in status_aliases:
             status = {"pause": "paused", "resume": "active"}.get(first, status_aliases.get(first, first))
-            objective = task.get("goal", "")
-            if not objective:
+            if not task.get("goal"):
                 raise HTTPException(400, "当前线程还没有 Goal")
-            stamp = now()
-            db.execute("UPDATE tasks SET goal_status=?,goal_revision=goal_revision+1,goal_updated_at=?,updated_at=? WHERE id=?", (status, stamp, stamp, task["id"]))
-            if client and thread_id:
-                goal = (await client.request("thread/goal/set", {"threadId": thread_id, "objective": objective, "status": status})).get("goal") or {}
-                status = goal.get("status", status)
-                db.execute("UPDATE tasks SET goal_status=?,updated_at=? WHERE id=?", (status, now(), task["id"]))
-            return result_message(command, f"Goal 状态已切换为 `{status}`。")
+            updated = await patch_goal(task["id"], GoalPatch(status=status), None)
+            return result_message(command, updated.get("goal_sync_error") or f"Goal 状态已切换为 `{updated.get('goal_status', status)}`。", task=updated)
         objective = arg_text.strip()
         if not objective:
             raise HTTPException(400, "用法：/goal <objective>")
-        status = "active"
-        stamp = now()
-        db.execute("UPDATE tasks SET goal=?,goal_status=?,goal_tokens_used=0,goal_revision=goal_revision+1,goal_updated_at=?,updated_at=? WHERE id=?", (objective, status, stamp, stamp, task["id"]))
-        if client and thread_id:
-            goal = (await client.request("thread/goal/set", {"threadId": thread_id, "objective": objective, "status": status})).get("goal") or {}
-            status = goal.get("status", status)
-            db.execute("UPDATE tasks SET goal_status=?,updated_at=? WHERE id=?", (status, now(), task["id"]))
-        return result_message(command, f"Goal 已设置：\n\n{objective}\n\n状态：`{status}`。", goal={"objective": objective, "status": status})
+        updated = await patch_goal(task["id"], GoalPatch(objective=objective), None)
+        status = updated.get("goal_status", "paused")
+        message = updated.get("goal_sync_error") or f"Goal 已保存：\n\n{objective}\n\n状态：`{status}`。使用 `/goal resume` 启动。"
+        return result_message(command, message, task=updated, goal={"objective": objective, "status": status})
 
     if command == "status":
         goal = {"objective": task.get("goal", ""), "status": task.get("goal_status", "none"), "tokensUsed": task.get("goal_tokens_used", 0)}

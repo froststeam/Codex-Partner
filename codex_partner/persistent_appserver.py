@@ -35,6 +35,16 @@ async def _run(*command: str) -> tuple[int, str]:
     return process.returncode or 0, output.decode(errors="replace")
 
 
+async def _endpoint_ready(port: int) -> bool:
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.close()
+        await writer.wait_closed()
+        return True
+    except OSError:
+        return False
+
+
 async def ensure_service(
     key: str,
     codex_bin: str,
@@ -69,6 +79,22 @@ async def ensure_service(
     websocket_url = f"ws://127.0.0.1:{port}"
 
     active, _ = await _run("systemctl", "--user", "is-active", "--quiet", unit)
+    if active == 0 and not await _endpoint_ready(port):
+        # A transient unit can remain active while its old endpoint is no
+        # longer accepting connections. Never hand that stale address back to
+        # a restarted dashboard or session.
+        restart_code, _ = await _run("systemctl", "--user", "restart", unit)
+        if restart_code == 0:
+            for _ in range(100):
+                if await _endpoint_ready(port):
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                await _run("systemctl", "--user", "stop", unit)
+                active = 1
+        else:
+            await _run("systemctl", "--user", "stop", unit)
+            active = 1
     if active != 0:
         await _run("systemctl", "--user", "reset-failed", unit)
         code, output = await _run(
@@ -77,6 +103,7 @@ async def ensure_service(
             f"--unit={unit.removesuffix('.service')}",
             "--property=Restart=on-failure",
             "--property=RestartSec=1",
+            "--property=TimeoutStopSec=10",
             f"--property=EnvironmentFile={env_path}",
             codex_bin,
             "app-server",
@@ -86,13 +113,8 @@ async def ensure_service(
         if code:
             raise RuntimeError(f"Unable to start persistent Codex app-server: {output.strip()}")
         for _ in range(100):
-            try:
-                reader, writer = await asyncio.open_connection("127.0.0.1", port)
-                writer.close()
-                await writer.wait_closed()
+            if await _endpoint_ready(port):
                 break
-            except OSError:
-                pass
             await asyncio.sleep(0.05)
         else:
             raise RuntimeError("Persistent Codex app-server did not open its control endpoint")
@@ -108,3 +130,33 @@ async def ensure_service(
 async def stop_service(key: str) -> None:
     if supported():
         await _run("systemctl", "--user", "stop", unit_name(key))
+
+
+async def stop_inactive_services(active_keys: set[str]) -> int:
+    """Stop Partner-owned app servers that no active task can recover."""
+    if not supported():
+        return 0
+    active_units = {unit_name(key) for key in active_keys}
+    code, output = await _run(
+        "systemctl",
+        "--user",
+        "list-units",
+        "--type=service",
+        "--state=running",
+        "--plain",
+        "--no-legend",
+        "codex-partner-codex-*.service",
+    )
+    if code:
+        return 0
+    stale_units = {
+        line.split(None, 1)[0]
+        for line in output.splitlines()
+        if line.strip() and line.split(None, 1)[0] not in active_units
+    }
+    if not stale_units:
+        return 0
+    await asyncio.gather(
+        *(_run("systemctl", "--user", "stop", "--no-block", unit) for unit in stale_units)
+    )
+    return len(stale_units)

@@ -14,7 +14,6 @@ class TaskCreate(BaseModel):
     goal: str = ""
     workspace: str = ""
     yolo: bool = True
-    max_retries: int = Field(default=3, ge=0, le=100)
     retry_forever: bool = False
     provider_id: Optional[str] = None
     model: str = ""
@@ -40,7 +39,6 @@ class TaskPatch(BaseModel):
     goal: Optional[str] = None
     workspace: Optional[str] = None
     yolo: Optional[bool] = None
-    max_retries: Optional[int] = Field(default=None, ge=0, le=100)
     retry_forever: Optional[bool] = None
     provider_id: Optional[str] = None
     model: Optional[str] = None
@@ -145,4 +143,12 @@ class MemoryIn(BaseModel):
 
 
 class MemoryResetIn(BaseModel):
+    confirm: Literal[True]
+
+
+class PartnerUpdateSettingsIn(BaseModel):
+    auto_update: bool
+
+
+class PartnerRestartIn(BaseModel):
     confirm: Literal[True]

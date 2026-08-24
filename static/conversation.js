@@ -2,7 +2,7 @@
 const chatFileObjectUrls = new Map();
 const chatThumbnailObjectUrls = new Map();
 const chatThumbnailLoads = new Map();
-const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260820-distinct-agent-items") : null;
+const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260821-stream-markdown-preview") : null;
 const conversationSnapshots = new Map();
 let chatBuildRequestId = 0;
 let chatBuildInFlight = false;
@@ -11,6 +11,11 @@ let chatLayoutRetryTimer = 0;
 let chatLayoutRetryCount = 0;
 let chatHistoryLoadPromise = null;
 let mediaViewerMarkdown = null;
+let streamingPreviewTimer = 0;
+let streamingPreviewRequestId = 0;
+const streamingPreviewText = new Map();
+const streamingPreviewRevision = new Map();
+const streamingPreviewInFlight = new Map();
 function renderSidebarStats() {
   const running = sortTasks(state.tasks.filter(taskHasLiveExecution));
   const queued = sortTasks(state.tasks.filter(task => task.status === "queued" && !task.external_running));
@@ -95,6 +100,7 @@ function clearChatSelectionForSessionSwitch() {
 async function selectSession(id, openSocket = true) {
   if (state.selectedId !== id) clearChatSelectionForSessionSwitch();
   const previousId = state.selectedId;
+  if (previousId && previousId !== id) saveComposerDraft(previousId);
   if (previousId && previousId !== id && state.selectedTask) {
     conversationSnapshots.set(previousId, {
       task: state.selectedTask, events: state.selectedEvents, messages: state.selectedMessages,
@@ -118,6 +124,7 @@ async function selectSession(id, openSocket = true) {
     state.runtimeMetrics = { taskId: "", ttftMs: null, tpotMs: null, estimated: true, outputTokens: 0 };
   }
   state.selectedId = id; localStorage.setItem("codex-dashboard-session", id);
+  if (previousId !== id) restoreComposerDraft(id);
   const task = state.tasks.find(item => item.id === id);
   if (task) state.selectedTask = task;
   const cached = conversationSnapshots.get(id);
@@ -507,11 +514,37 @@ function renderChat() {
     },
   });
   chatWorker.onmessage = event => {
+    if (event.data.type === "markdownPreview") {
+      const preview = event.data;
+      const itemId = preview.itemId || [...streamingPreviewInFlight.entries()].find(([, requestId]) => requestId === preview.requestId)?.[0];
+      if (!itemId || streamingPreviewInFlight.get(itemId) !== preview.requestId) return;
+      streamingPreviewInFlight.delete(itemId);
+      if (!preview.error && state.selectedId === taskId && streamingPreviewText.has(itemId)) {
+        const article = $$("article.message.assistant", stream).find(node => node.dataset.itemId === itemId);
+        const content = article && $(".message-content", article);
+        const expectedRevision = streamingPreviewRevision.get(itemId) || 0;
+        if (article && content && expectedRevision >= (preview.revision || 0)) {
+          const stickToBottom = chatIsNearBottom(stream);
+          content.innerHTML = `${preview.html || ""}<span class="stream-cursor"></span>`;
+          article.classList.add("streaming");
+          if (stickToBottom) stream.scrollTop = stream.scrollHeight;
+        }
+      }
+      if (streamingPreviewText.has(itemId) && !streamingPreviewInFlight.has(itemId)) scheduleStreamingPreview(itemId);
+      return;
+    }
     if (event.data.requestId !== requestId) return;
     chatBuildInFlight = false;
     const stale = state.selectedId !== taskId;
     if (!event.data.error && !stale) {
       const blocks = event.data.blocks || [];
+      for (const block of blocks) {
+        if (block.role === "assistant" && block.itemId && !block.streaming) {
+          streamingPreviewText.delete(block.itemId);
+          streamingPreviewRevision.delete(block.itemId);
+          streamingPreviewInFlight.delete(block.itemId);
+        }
+      }
       if (!state.explorationPrecomputed) state.explorationNodes = event.data.explorationNodes || [];
       if (explorationSync && state.explorationRevision === explorationRevision) state.explorationNeedsSync = false;
       if (typeof renderExplorationMap === "function") renderExplorationMap({ liveUpdate: true });
@@ -846,20 +879,27 @@ function appendStreamingDelta(payload) {
   const delta = String(payload?.delta || "");
   const itemId = String(payload?.item_id || "");
   if (!delta || !itemId) return false;
+  streamingPreviewText.set(itemId, `${streamingPreviewText.get(itemId) || ""}${delta}`);
+  streamingPreviewRevision.set(itemId, (streamingPreviewRevision.get(itemId) || 0) + 1);
   const stream = $("#chat-log");
   const articles = $$("article.message.assistant", stream);
   const article = articles[articles.length - 1];
-  if (!article || article.dataset.itemId !== itemId) return false;
-  const content = $(".message-content", article);
-  if (!content) return false;
-  const stickToBottom = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 96;
-  const cursor = $(".stream-cursor", content);
-  const fragment = document.createDocumentFragment();
-  delta.split("\n").forEach((part, index) => { if (index) fragment.append(document.createElement("br")); if (part) fragment.append(document.createTextNode(part)); });
-  content.insertBefore(fragment, cursor || null);
-  article.classList.add("streaming");
-  if (stickToBottom) stream.scrollTop = stream.scrollHeight;
-  return true;
+  scheduleStreamingPreview(itemId);
+  return Boolean(article && article.dataset.itemId === itemId && $(".message-content", article));
+}
+
+function scheduleStreamingPreview(itemId) {
+  if (!chatWorker || !itemId || streamingPreviewInFlight.has(itemId)) return;
+  if (streamingPreviewTimer) return;
+  streamingPreviewTimer = setTimeout(() => {
+    streamingPreviewTimer = 0;
+    const text = streamingPreviewText.get(itemId);
+    if (!text || streamingPreviewInFlight.has(itemId)) return;
+    const revision = streamingPreviewRevision.get(itemId) || 0;
+    const requestId = `preview-${++streamingPreviewRequestId}`;
+    streamingPreviewInFlight.set(itemId, requestId);
+    chatWorker.postMessage({ type: "previewMarkdown", requestId, itemId, revision, text });
+  }, 50);
 }
 async function hydrateChatFiles() {
   for (const node of $$("[data-chat-file]")) {
@@ -992,17 +1032,27 @@ document.addEventListener("keydown", event => {
 });
 async function renderTextFileViewer(taskId, path) {
   const reference = chatFileReference(path);
+  const autoLoadLimit = 8 * 1024 * 1024;
   const loadChunk = async offset => {
     const query = new URLSearchParams({ path: reference.path, offset: String(offset), limit: String(1024 * 1024) });
     const response = await workspaceFetch(`/tasks/${encodeURIComponent(taskId)}/workspace?${query}`);
     if (!response.ok) throw await workspaceResponseError(response);
     return response.json();
   };
-  const response = await loadChunk(0);
-  const content = response.content ?? "";
+  let response = await loadChunk(0);
+  let content = response.content ?? "";
+  let nextOffset = response.next_offset;
+  const totalSize = Number(response.entry?.size || 0);
+  while (nextOffset != null && totalSize <= autoLoadLimit) {
+    const chunk = await loadChunk(nextOffset);
+    content += chunk.content ?? "";
+    nextOffset = chunk.next_offset;
+    response = chunk;
+  }
   const body = $("#media-viewer-body");
   const ext = chatFileExtension(path);
-  if (!reference.line && !response.truncated && ["md", "markdown"].includes(ext) && window.toastui?.Editor) {
+  const markdown = !reference.line && ["md", "markdown"].includes(ext) && window.toastui?.Editor;
+  const renderMarkdown = () => {
     body.innerHTML = `<div id="media-viewer-markdown" class="media-viewer-markdown"></div>`;
     mediaViewerMarkdown = toastui.Editor.factory({
       el: $("#media-viewer-markdown"),
@@ -1011,11 +1061,16 @@ async function renderTextFileViewer(taskId, path) {
       usageStatistics: false,
       ...(typeof markdownOptions === "function" ? markdownOptions() : {}),
     });
+  };
+  if (markdown && nextOffset == null) {
+    renderMarkdown();
     return;
   }
-  body.innerHTML = `<div class="media-viewer-text-shell"><pre class="media-viewer-text"></pre><button type="button" class="secondary media-viewer-load-more" ${response.next_offset == null ? "hidden" : ""}>加载后续内容</button></div>`;
+  body.innerHTML = `<div class="media-viewer-text-shell"><pre class="media-viewer-text"></pre><div class="media-viewer-text-footer"><span class="media-viewer-progress"></span><div><button type="button" class="secondary media-viewer-load-more" ${nextOffset == null ? "hidden" : ""}>继续加载</button><button type="button" class="secondary media-viewer-load-all" ${nextOffset == null ? "hidden" : ""}>加载全部</button></div></div></div>`;
   const output = $(".media-viewer-text", body);
   const more = $(".media-viewer-load-more", body);
+  const all = $(".media-viewer-load-all", body);
+  const progress = $(".media-viewer-progress", body);
   if (reference.line > 0) {
     const lines = content.split("\n");
     const index = Math.min(reference.line, lines.length) - 1;
@@ -1029,23 +1084,49 @@ async function renderTextFileViewer(taskId, path) {
   } else {
     output.textContent = content;
   }
-  let nextOffset = response.next_offset;
+  const updateProgress = () => {
+    const loaded = nextOffset == null ? totalSize : nextOffset;
+    progress.textContent = nextOffset == null ? `完整文件 · ${formatBytes(totalSize)}` : `已加载 ${formatBytes(loaded)} / ${formatBytes(totalSize)}`;
+    more.hidden = nextOffset == null;
+    all.hidden = nextOffset == null;
+  };
+  const appendNext = async () => {
+    if (nextOffset == null) return false;
+    const chunk = await loadChunk(nextOffset);
+    content += chunk.content ?? "";
+    output.append(document.createTextNode(chunk.content ?? ""));
+    nextOffset = chunk.next_offset;
+    updateProgress();
+    if (nextOffset == null && markdown) renderMarkdown();
+    return nextOffset != null;
+  };
   more.onclick = async () => {
-    if (nextOffset == null || more.disabled) return;
-    more.disabled = true;
+    if (nextOffset == null || more.disabled || all.disabled) return;
+    more.disabled = all.disabled = true;
     more.textContent = "正在加载…";
     try {
-      const chunk = await loadChunk(nextOffset);
-      output.append(document.createTextNode(chunk.content ?? ""));
-      nextOffset = chunk.next_offset;
-      more.hidden = nextOffset == null;
+      await appendNext();
       more.textContent = "加载后续内容";
     } catch (error) {
       more.textContent = error.message || "加载失败，重试";
     } finally {
-      more.disabled = false;
+      more.disabled = all.disabled = false;
     }
   };
+  all.onclick = async () => {
+    if (nextOffset == null || all.disabled || more.disabled) return;
+    more.disabled = all.disabled = true;
+    all.textContent = "正在加载全部…";
+    try {
+      while (await appendNext()) await new Promise(resolve => requestAnimationFrame(resolve));
+    } catch (error) {
+      all.textContent = error.message || "加载失败，重试";
+    } finally {
+      more.disabled = all.disabled = false;
+      if (nextOffset != null) all.textContent = "加载全部";
+    }
+  };
+  updateProgress();
 }
 async function openChatFileViewer({ taskId, path, kind }) {
   const viewer = $("#media-viewer");
@@ -1125,7 +1206,7 @@ function renderInspector() {
   const archiveLabel = task.archived ? uiLabel("unarchive") : uiLabel("archive");
   const memoryAction = memoryEnabled ? "memory-disable" : "memory-enable";
   const memoryLabel = memoryEnabled ? uiLabel("disableMemory") : uiLabel("enableMemory");
-  content.innerHTML = `<section class="inspector-section"><span class="inspector-label">SESSION</span><div class="inspector-row"><span>状态</span>${status(task.status)}</div><div class="inspector-row"><span>Thread</span><button class="path-button thread-copy" data-copy-thread="${esc(threadId)}" title="${threadId ? "点击复制 Thread ID" : "Thread 尚未创建"}" ${threadId ? "" : "disabled"}>${esc(threadId || "未创建")}</button></div>${task.ssh_host ? `<div class="inspector-row"><span>SSH 主机</span><button class="path-button" data-panel="ssh">${esc(task.ssh_host)}</button></div>` : ""}<div class="inspector-row"><span>工作目录</span><button class="path-button" data-workspace-change title="重新设置工作目录">${esc(task.workspace)}</button></div></section><section class="inspector-section"><span class="inspector-label">GOAL</span><p class="inspector-goal">${esc(task.goal || "没有设置 Goal")}</p><div class="inspector-row"><span>进度</span><span>${esc(task.goal_status || "none")}</span></div></section><details class="inspector-section run-history"><summary><span>运行记录</span><small>${sessions.length}</small></summary><div class="run-history-list">${sessions.length ? sessions.map(session => `<div class="run-row"><span class="run-dot ${esc(session.status)}"></span><span><strong>尝试 ${session.attempt || 0}</strong><small>${esc(session.provider_id || "自动 Provider")} · ${esc(shortDate(session.started_at))}</small></span>${status(session.status)}</div>`).join("") : `<p class="muted">暂无运行记录</p>`}</div></details><section class="inspector-section"><span class="inspector-label">THREAD CONTROLS</span><div class="inspector-actions"><button data-thread-action="fork">复制会话</button><button data-thread-action="compact">压缩上下文</button><button data-thread-action="${archiveAction}">${archiveLabel}</button><button data-thread-action="delete" class="danger">移到回收站</button><button data-thread-action="${memoryAction}" title="当前状态：记忆${memoryEnabled ? "已开启" : "已关闭"}">${memoryLabel}</button></div></section>`;
+  content.innerHTML = `<section class="inspector-section"><span class="inspector-label">SESSION</span><div class="inspector-row"><span>状态</span>${status(task.status)}</div><div class="inspector-row"><span>Thread</span><button class="path-button thread-copy" data-copy-thread="${esc(threadId)}" title="${threadId ? "点击复制 Thread ID" : "Thread 尚未创建"}" ${threadId ? "" : "disabled"}>${esc(threadId || "未创建")}</button></div>${task.ssh_host ? `<div class="inspector-row"><span>SSH 主机</span><button class="path-button" data-panel="ssh">${esc(task.ssh_host)}</button></div>` : ""}<div class="inspector-row"><span>工作目录</span><button class="path-button" data-workspace-change title="重新设置工作目录">${esc(task.workspace)}</button></div></section><section class="inspector-section"><span class="inspector-label">GOAL</span><p class="inspector-goal">${esc(task.goal || "没有设置 Goal")}</p><div class="inspector-row"><span>进度</span><span>${esc(task.goal_status || "none")}</span></div></section><details class="inspector-section run-history"><summary><span>运行记录</span><small>${sessions.length}</small></summary><div class="run-history-list">${sessions.length ? sessions.map(session => `<div class="run-row"><span class="run-dot ${esc(session.status)}"></span><span><strong>尝试 ${session.attempt || 0}</strong><small>${esc(session.provider_id || "自动 Provider")} · ${esc(shortDate(session.started_at))}</small></span>${status(session.status)}</div>`).join("") : `<p class="muted">暂无运行记录</p>`}</div></details><section class="inspector-section"><span class="inspector-label">THREAD CONTROLS</span><div class="inspector-actions"><button data-session-restart>${uiLabel("restartSessionCodex")}</button><button data-thread-action="fork">复制会话</button><button data-thread-action="compact">压缩上下文</button><button data-thread-action="${archiveAction}">${archiveLabel}</button><button data-thread-action="delete" class="danger">移到回收站</button><button data-thread-action="${memoryAction}" title="当前状态：记忆${memoryEnabled ? "已开启" : "已关闭"}">${memoryLabel}</button></div></section>`;
   if (workspaceSection?.dataset.taskId === task.id) content.append(workspaceSection);
   else if (workspaceError?.dataset.taskId === task.id) content.append(workspaceError);
   localizeInspectorText(content);
@@ -1166,7 +1247,7 @@ function renderWorkspace(data, taskId = state.selectedTask?.id || "") {
   const parent = parts.slice(0, -1).join("/");
   const toolbar = `<div class="workspace-toolbar"><button type="button" class="workspace-tool" data-workspace-change title="${workspaceLocked ? "停止当前 Codex turn 后更改工作目录" : "选择工作目录"}" ${workspaceLocked ? "disabled" : ""}><span aria-hidden="true">▰</span> 更改目录</button>${isDirectory ? `<button type="button" class="workspace-tool" data-workspace-upload title="上传文件到当前目录"><span aria-hidden="true">↑</span> 上传</button>` : `<button type="button" class="workspace-tool" data-workspace-preview="${esc(path)}" data-preview-kind="${esc(data.preview_kind || chatViewerKind(path))}" title="预览当前文件"><span aria-hidden="true">⌕</span> 预览</button>${data.editable === true ? `<button type="button" class="workspace-tool" data-workspace-edit="${esc(path)}" title="编辑当前文件"><span aria-hidden="true">✎</span> 编辑</button>` : ""}<button type="button" class="workspace-tool" data-workspace-download="${esc(path)}" title="下载当前文件"><span aria-hidden="true">↓</span> 下载</button>`}</div>`;
   const entries = data.entry.kind === "file"
-    ? `<div class="file-preview"><div class="file-preview-head"><span>▣ ${esc(data.entry.name)}</span><small>${formatBytes(data.entry.size)}${data.truncated ? " · 已显示前 1 MB" : ""}</small></div>${data.preview_kind === "text" ? `<pre>${esc(data.content || "")}</pre>` : `<button type="button" class="file-preview-open" data-workspace-preview="${esc(path)}" data-preview-kind="${esc(data.preview_kind || chatViewerKind(path))}">打开${chatViewerLabel(data.preview_kind || chatViewerKind(path))}预览</button>`}</div>`
+    ? `<div class="file-preview"><div class="file-preview-head"><span>▣ ${esc(data.entry.name)}</span><small>${formatBytes(data.entry.size)}</small></div><button type="button" class="file-preview-open" data-workspace-preview="${esc(path)}" data-preview-kind="${esc(data.preview_kind || chatViewerKind(path))}">打开${chatViewerLabel(data.preview_kind || chatViewerKind(path))}预览</button>${data.truncated ? `<small class="file-preview-note">文件较大，将在预览器中分段加载；不会把首段内容当成完整文件。</small>` : ""}</div>`
     : `<div class="workspace-browser" id="workspace-browser">${(data.entries || []).map(entry => `<div class="file-row ${entry.kind}"><button type="button" class="file-open" data-browse="${esc(entry.path)}"><span>${entry.kind === "directory" ? "▰" : "▤"}</span><span>${esc(entry.name)}</span><small>${entry.kind === "directory" ? "目录" : formatBytes(entry.size)}</small></button>${entry.kind === "file" ? `<button type="button" class="file-download" data-workspace-download="${esc(entry.path)}" title="下载 ${esc(entry.name)}" aria-label="下载 ${esc(entry.name)}">↓</button>` : ""}</div>`).join("") || `<p class="muted">目录为空，可将文件拖到这里上传。</p>`}</div>`;
   $("#inspector-content").insertAdjacentHTML("beforeend", `<section class="inspector-section workspace-section" id="workspace-section" data-task-id="${esc(taskId)}" data-entry-kind="${esc(data.entry.kind)}" data-path="${esc(path)}"><span class="inspector-label">WORKSPACE FILES</span>${toolbar}<nav class="workspace-breadcrumbs" aria-label="工作区路径">${breadcrumbs.join("")}</nav>${path ? `<button class="file-up" data-browse="${esc(parent)}">‹ 返回上级</button>` : ""}${entries}</section>`);
   const workspace = $("#workspace-section");
@@ -1324,6 +1405,7 @@ async function applyCommandAction(result) {
   if (action === "open_panel") return openPanel(result.panel || "skills");
   if (action === "open_inspector") { state.inspectorClosed = false; setInspectorOpen(true); return; }
   if (action === "open_workspace") { state.inspectorClosed = false; setInspectorOpen(true); return loadWorkspace(state.workspacePath || ""); }
+  if (action === "edit_goal") { openGoalEditor(); return toast(result.message || "Goal 已打开"); }
   if (action === "focus_composer") { $("#message-input").focus(); return; }
   if (action === "attach_text") { pendingAttachments = [result.attachment]; renderComposerAttachments(); $("#message-input").focus(); return; }
   if (action === "copy_last") {
@@ -1335,7 +1417,7 @@ async function applyCommandAction(result) {
   if (action === "toggle_raw") { const value = result.value === "on" ? true : result.value === "off" ? false : !state.rawActivity; state.rawActivity = value; return renderChat(); }
   if (action === "theme") { const value = result.value === "toggle" ? (document.documentElement.dataset.theme === "wasteland" ? "dark" : "wasteland") : result.value; setTheme(value, true); return; }
   if (action === "title") { const value = result.value === "toggle" ? localStorage.getItem("codex-dashboard-title") !== "on" : result.value !== "off"; localStorage.setItem("codex-dashboard-title", value ? "on" : "off"); document.title = value && state.selectedTask ? `${state.selectedTask.name || "Codex"} · Codex Partner` : "Codex Partner"; return; }
-  if (action === "show_keymap") return toast("Enter 发送到当前 turn · Alt+Enter 排到下一轮 · Shift+Enter 换行 · Esc 停止 · 空输入框 ↑/↓ 历史");
+  if (action === "show_keymap") return toast("Enter 运行中排到下一轮 · Alt+Enter 插入当前 turn · Shift+Enter 换行 · Esc 停止 · 空输入框 ↑/↓ 历史");
   if (action === "disconnect") { socketPaused = true; clearTimeout(socketReconnectTimer); if (socket) { socket.onclose = null; socket.close(); socket = null; } setRealtimeChannel("task", "paused"); return toast("当前会话的实时连接已暂停"); }
 }
 async function submitSlashCommand(raw) {
@@ -1481,10 +1563,11 @@ function connectSocket(id, reconnect = false) {
       const phase = protocolNoise ? "" : activityPhase(data.payload);
       if (phase) { livePhases.set(id, phase); renderTurnProgress(); }
       if (!protocolNoise) {
-        if (String(data.payload?.type || "").toLowerCase() === "agent_delta") appendStreamingDelta(data.payload);
-        // Keep immediate token feedback, then periodically reparse the full
-        // Markdown so partial rich blocks do not remain raw until turn end.
-        scheduleRenderChat();
+        const isDelta = String(data.payload?.type || "").toLowerCase() === "agent_delta";
+        const painted = isDelta ? appendStreamingDelta(data.payload) : false;
+        // Delta previews only touch the active assistant item. Rebuild the full
+        // timeline for structural events and the final agentMessage snapshot.
+        if (!isDelta || !painted) scheduleRenderChat();
       }
       if (!protocolNoise && !isAssistantEvent({ stream: data.stream, payload: data.payload }) && !isUserEvent({ stream: data.stream, payload: data.payload })) showActivity(data.payload);
     }

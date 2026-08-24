@@ -104,6 +104,7 @@ document.addEventListener("click", async event => {
     if (button.id === "workspace-picker-select") return selectWorkspaceDirectory();
     if (button.dataset.browse !== undefined) return loadWorkspace(button.dataset.browse);
     if (button.id === "conversation-rename") return openRename(button);
+    if (button.id === "conversation-restart" || button.dataset.sessionRestart !== undefined) return restartSessionCodex(button);
     if (button.id === "conversation-fork") return runOperation("fork", button);
     if (button.id === "conversation-more") {
       const inspector = $("#inspector");
@@ -250,6 +251,22 @@ async function runOperation(operation, trigger = null) {
   }
 }
 
+async function restartSessionCodex(trigger = null) {
+  if (!state.selectedId || !state.selectedTask) return toast(uiLabel("selectSessionFirst"));
+  const running = ["running", "retrying", "queued"].includes(state.selectedTask.status) || state.selectedTask.external_running;
+  if (!await appConfirm(running ? uiLabel("restartRunningSessionConfirm") : uiLabel("restartSessionConfirm"), { danger: running })) return;
+  const taskId = state.selectedId;
+  const previous = trigger?.textContent || "";
+  if (trigger) { trigger.disabled = true; if (trigger.id !== "conversation-restart") trigger.textContent = uiLabel("restartingSessionCodex"); }
+  try {
+    const result = await api(`/tasks/${encodeURIComponent(taskId)}/restart`, { method: "POST" });
+    if (result.id === state.selectedId) { state.selectedTask = { ...state.selectedTask, ...result }; mergeTask(state.selectedTask); renderConversation(); }
+    toast(result.resumed ? uiLabel("sessionCodexRestartedResumed") : uiLabel("sessionCodexRestarted"));
+  } finally {
+    if (trigger) { trigger.disabled = false; if (trigger.id !== "conversation-restart") trigger.textContent = previous; }
+  }
+}
+
 async function submitMessage(mode = "codex") {
   if (!state.selectedId) return;
   const taskId = state.selectedId;
@@ -289,23 +306,25 @@ async function submitMessage(mode = "codex") {
   }
   let takeoverTerminal = false;
   const terminalActive = Boolean(state.selectedTask?.external_running) && state.selectedTask?.execution_source === "terminal";
-  if (mode === "codex" && terminalActive) {
+  const steerCurrentTurn = mode === "steer" && activeTurn && !terminalActive;
+  if (mode === "steer" && terminalActive) {
     takeoverTerminal = await appConfirm(uiLabel("terminalTakeoverConfirm"), { danger: true, confirmLabel: uiLabel("terminalTakeoverAction") });
     if (!takeoverTerminal) return;
   }
-  // Dashboard-owned turns stay FIFO. A terminal-owned turn requires an
-  // explicit takeover confirmation; Alt+Enter always remains queue-only.
+  // Enter is durable FIFO while a turn is active. Alt+Enter explicitly steers
+  // a dashboard-owned turn; terminal ownership still requires confirmation.
   const clientMessageId = crypto.randomUUID ? crypto.randomUUID() : String(Date.now());
-  const delivery = mode === "queue" || (activeTurn && !takeoverTerminal) ? "queue" : "auto";
-  const optimisticStatus = delivery === "queue" ? "queued" : "sending";
+  const delivery = activeTurn && !takeoverTerminal ? "queue" : "auto";
+  const optimisticStatus = steerCurrentTurn ? "steering" : delivery === "queue" ? "queued" : "sending";
   const optimistic = { id: clientMessageId, body: message, status: optimisticStatus, created_at: new Date().toISOString(), _optimistic: true };
-  upsertTaskMessage(optimistic); state.historyIndex = -1; input.value = ""; resizeComposerInput(input); pendingAttachments = []; $("#composer-context").textContent = ""; $("#attach-file").value = ""; $("#command-palette").hidden = true; renderGoalBar(); scheduleRenderChat(); input.focus();
+  upsertTaskMessage(optimistic); state.historyIndex = -1; input.value = ""; resizeComposerInput(input); clearComposerDraft(taskId); $("#composer-context").textContent = ""; $("#attach-file").value = ""; $("#command-palette").hidden = true; renderGoalBar(); scheduleRenderChat(); input.focus();
   try {
     let delivered;
     try {
-      delivered = await api(`/tasks/${taskId}/messages`, { method: "POST", body: JSON.stringify({ message, client_message_id: clientMessageId, delivery, takeover_terminal: takeoverTerminal }) });
+      const endpoint = steerCurrentTurn ? `/tasks/${taskId}/steer` : `/tasks/${taskId}/messages`;
+      delivered = await api(endpoint, { method: "POST", body: JSON.stringify({ message, client_message_id: clientMessageId, delivery, takeover_terminal: takeoverTerminal }) });
     } catch (error) {
-      if (mode !== "codex" || error.code !== "terminal_turn_active" || takeoverTerminal) throw error;
+      if (mode !== "steer" || error.code !== "terminal_turn_active" || takeoverTerminal) throw error;
       const confirmed = await appConfirm(uiLabel("terminalTakeoverConfirm"), { danger: true, confirmLabel: uiLabel("terminalTakeoverAction") });
       if (!confirmed) {
         if (state.selectedId === taskId) {
@@ -319,20 +338,30 @@ async function submitMessage(mode = "codex") {
     }
     if (state.selectedId === taskId) { upsertTaskMessage(delivered); renderQueuedMessages(); refreshComposerHistory(); renderGoalBar(); scheduleRenderChat(); }
     if (activeTurn && delivered.status === "queued") toast(uiLabel("queuedAfterTurn"));
+    else if (delivered.status === "steered") toast("已插入当前 Codex turn");
   } catch (error) {
     if (state.selectedId === taskId) { upsertTaskMessage({ id: clientMessageId, status: "failed", error: error.message }); renderGoalBar(); scheduleRenderChat(); }
     toast(error.message);
   }
 }
 $("#message-form").onsubmit = async event => { event.preventDefault(); await submitMessage("codex"); };
+$("#composer-context").addEventListener("click", event => {
+  const button = event.target.closest("[data-composer-attachment-remove]");
+  if (!button) return;
+  pendingAttachments.splice(Number(button.dataset.composerAttachmentRemove), 1);
+  renderComposerAttachments();
+  saveComposerDraft();
+});
 
-$("#goal-edit").onclick = () => {
+function openGoalEditor() {
   const task = state.selectedTask; if (!task) return;
   $("#goal-input").value = task.goal || "";
   $("#goal-clear").hidden = !task.goal;
   $("#goal-text").hidden = true; $("#goal-edit-form").hidden = false;
+  $("#goal-bar").scrollIntoView({ behavior: "smooth", block: "nearest" });
   $("#goal-input").focus();
-};
+}
+$("#goal-edit").onclick = openGoalEditor;
 $("#goal-edit-cancel").onclick = () => { $("#goal-edit-form").hidden = true; $("#goal-text").hidden = false; };
 $("#goal-clear").onclick = async () => {
   if (!state.selectedId || !state.selectedTask?.goal || !await appConfirm(uiLabel("clearGoalConfirm"), { danger: true })) return;
@@ -388,6 +417,38 @@ function resizeComposerInput(input = $("#message-input")) {
   input.style.height = `${height}px`;
   input.style.overflowY = input.scrollHeight > 120 ? "auto" : "hidden";
 }
+function loadStoredComposerDrafts() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(COMPOSER_DRAFT_STORAGE_KEY) || "{}");
+    for (const [taskId, text] of Object.entries(stored || {})) composerDrafts.set(taskId, { text: String(text || ""), attachments: [] });
+  } catch (_) { /* Browser storage may be unavailable or corrupt. */ }
+}
+function persistComposerDraftTexts() {
+  const stored = {};
+  for (const [taskId, draft] of composerDrafts) if (draft.text) stored[taskId] = draft.text;
+  try { localStorage.setItem(COMPOSER_DRAFT_STORAGE_KEY, JSON.stringify(stored)); } catch (_) { /* Ignore storage quota errors. */ }
+}
+function saveComposerDraft(taskId = state.selectedId) {
+  if (!taskId) return;
+  const text = $("#message-input")?.value || "";
+  if (!text && !pendingAttachments.length) composerDrafts.delete(taskId);
+  else composerDrafts.set(taskId, { text, attachments: [...pendingAttachments] });
+  persistComposerDraftTexts();
+}
+function restoreComposerDraft(taskId) {
+  const draft = composerDrafts.get(taskId) || { text: "", attachments: [] };
+  const input = $("#message-input");
+  if (input) input.value = draft.text || "";
+  pendingAttachments = [...(draft.attachments || [])];
+  renderComposerAttachments();
+  resizeComposerInput(input);
+}
+function clearComposerDraft(taskId = state.selectedId) {
+  if (taskId) composerDrafts.delete(taskId);
+  pendingAttachments = [];
+  persistComposerDraftTexts();
+}
+loadStoredComposerDrafts();
 function renderComposerAttachments() {
   const context = $("#composer-context");
   if (!context) return;
@@ -449,11 +510,12 @@ async function attachComposerFiles(fileList) {
   if (!added.length) return;
   pendingAttachments.push(...added);
   renderComposerAttachments();
+  saveComposerDraft();
   renderGoalBar();
   toast(uiLabel("filesReady", { count: added.length }));
   $("#message-input").focus();
 }
-$("#message-input").addEventListener("input", event => { resizeComposerInput(event.target); state.commandIndex = 0; state.historyIndex = -1; renderCommandPalette(); renderGoalBar(); });
+$("#message-input").addEventListener("input", event => { resizeComposerInput(event.target); saveComposerDraft(); state.commandIndex = 0; state.historyIndex = -1; renderCommandPalette(); renderGoalBar(); });
 $("#message-input").addEventListener("keydown", async event => {
   if (event.isComposing || event.keyCode === 229) return;
   const palette = $("#command-palette");
@@ -472,7 +534,7 @@ $("#message-input").addEventListener("keydown", async event => {
   if (event.key === "Escape" && state.editingQueuedId) {
     event.preventDefault(); event.stopPropagation(); state.editingQueuedId = null; event.target.value = ""; resizeComposerInput(event.target); $("#composer-context").textContent = ""; renderQueuedMessages(); renderGoalBar(); return;
   }
-  if (event.key === "Enter" && event.shiftKey) { event.preventDefault(); return; }
+  if (event.key === "Enter" && event.shiftKey) return;
   if (event.key === "Escape" && ["running", "retrying", "queued"].includes(state.selectedTask?.status)) {
     event.preventDefault(); event.stopPropagation(); await changeSelectedRun("stop"); return;
   }
@@ -483,7 +545,7 @@ $("#message-input").addEventListener("keydown", async event => {
   if (event.key === "ArrowDown" && !event.shiftKey && !event.altKey && !event.metaKey && !event.ctrlKey && state.historyIndex >= 0) {
     event.preventDefault(); state.historyIndex += 1; if (state.historyIndex >= state.composerHistory.length) { state.historyIndex = -1; event.target.value = ""; } else event.target.value = state.composerHistory[state.historyIndex]; resizeComposerInput(event.target); return;
   }
-  if (event.key === "Enter" && event.altKey && !event.ctrlKey) { event.preventDefault(); await submitMessage("queue"); return; }
+  if (event.key === "Enter" && event.altKey && !event.ctrlKey) { event.preventDefault(); await submitMessage("steer"); return; }
   if (event.key === "Enter" && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) { event.preventDefault(); $("#message-form").requestSubmit(); }
 });
 $("#session-search").addEventListener("input", event => { state.query = event.target.value.trim(); renderSessionList(); });

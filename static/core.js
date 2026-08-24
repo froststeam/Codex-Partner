@@ -79,6 +79,7 @@ const UI_LABELS = {
   pause: { zh: "暂停", en: "Pause", fr: "Pause", ja: "一時停止", ko: "일시정지" },
   goalStart: { zh: "开始目标续跑", en: "Start goal resume", fr: "Reprendre l’objectif", ja: "目標の再開", ko: "목표 재개" },
   goalPause: { zh: "暂停目标续跑", en: "Pause goal resume", fr: "Suspendre l’objectif", ja: "目標を一時停止", ko: "목표 일시정지" },
+  goalComplete: { zh: "目标已完成，请编辑后重新开始", en: "Goal complete; edit it before restarting", fr: "Objectif terminé ; modifiez-le avant de redémarrer", ja: "目標は完了しました。編集してから再開してください", ko: "목표가 완료되었습니다. 편집 후 다시 시작하세요" },
   goalPauseRetryEnabled: { zh: "请先关闭自动续跑，才能暂停 Goal", en: "Disable auto-resume before pausing the Goal", fr: "Désactivez la reprise automatique avant de mettre l’objectif en pause", ja: "Goalを一時停止するには自動再開を先に無効にしてください", ko: "Goal을 일시정지하려면 자동 재개를 먼저 끄세요" },
   setGoal: { zh: "先设置目标", en: "Set a goal first", fr: "Définissez un objectif", ja: "目標を設定してください", ko: "목표를 먼저 설정하세요" },
   retryOn: { zh: "开启目标自动续跑", en: "Enable goal auto-resume", fr: "Activer la reprise automatique", ja: "目標の自動再開を有効化", ko: "목표 자동 재개 켜기" },
@@ -263,6 +264,30 @@ const UI_LABELS = {
   codexSource: { zh: "来源", en: "Source", fr: "Source", ja: "ソース", ko: "소스" },
   updateCodex: { zh: "更新 Codex", en: "Update Codex", fr: "Mettre Codex à jour", ja: "Codex を更新", ko: "Codex 업데이트" },
   updatingCodex: { zh: "更新中…", en: "Updating…", fr: "Mise à jour…", ja: "更新中…", ko: "업데이트 중…" },
+  restartSessionCodex: { zh: "重启 Codex", en: "Restart Codex", fr: "Redémarrer Codex", ja: "Codex を再起動", ko: "Codex 다시 시작" },
+  restartingSessionCodex: { zh: "重启中…", en: "Restarting…", fr: "Redémarrage…", ja: "再起動中…", ko: "다시 시작 중…" },
+  restartSessionConfirm: { zh: "关闭并重新启动此会话的 Codex 进程？Thread、工作目录和队列都会保留。", en: "Close and restart this session's Codex process? Its thread, workspace, and queue will be preserved.", fr: "Fermer et redémarrer le processus Codex de cette session ? Le fil, le dossier et la file seront conservés.", ja: "このセッションの Codex プロセスを再起動しますか？スレッド、作業領域、キューは保持されます。", ko: "이 세션의 Codex 프로세스를 다시 시작할까요? 스레드, 작업 공간 및 대기열은 유지됩니다." },
+  restartRunningSessionConfirm: { zh: "此会话正在运行。中断当前 turn、关闭 Codex，然后在同一 Thread 上重启并继续？", en: "This session is running. Interrupt the current turn, restart Codex, and continue on the same thread?", fr: "Cette session est active. Interrompre le tour, redémarrer Codex et continuer sur le même fil ?", ja: "実行中です。現在の turn を中断し、Codex を再起動して同じスレッドで続行しますか？", ko: "이 세션이 실행 중입니다. 현재 turn을 중단하고 Codex를 다시 시작한 뒤 같은 스레드에서 계속할까요?" },
+  sessionCodexRestarted: { zh: "Codex 已重启，Thread 保持不变", en: "Codex restarted; the thread was preserved", fr: "Codex redémarré ; le fil est conservé", ja: "Codex を再起動しました。スレッドは保持されています", ko: "Codex가 다시 시작되었으며 스레드는 유지되었습니다" },
+  sessionCodexRestartedResumed: { zh: "Codex 已重启并继续当前会话", en: "Codex restarted and resumed this session", fr: "Codex redémarré et session reprise", ja: "Codex を再起動し、セッションを再開しました", ko: "Codex를 다시 시작하고 세션을 재개했습니다" },
+  partnerUpdates: { zh: "Partner 更新", en: "Partner updates", fr: "Mises à jour Partner", ja: "Partner 更新", ko: "Partner 업데이트" },
+  partnerUpdateDescription: { zh: "使用当前服务 Python 的 pip 安装最新版。自动更新每 6 小时检查一次。", en: "Uses this service's Python and pip to install the latest release. Auto-update checks every 6 hours.", fr: "Utilise Python et pip du service pour installer la dernière version. Vérification toutes les 6 heures.", ja: "サービスの Python と pip で最新版を導入します。自動更新は 6 時間ごとに確認します。", ko: "서비스의 Python과 pip로 최신 버전을 설치합니다. 자동 업데이트는 6시간마다 확인합니다." },
+  updatePartnerNow: { zh: "立即更新", en: "Update now", fr: "Mettre à jour", ja: "今すぐ更新", ko: "지금 업데이트" },
+  updatingPartner: { zh: "正在 pip 更新…", en: "Updating with pip…", fr: "Mise à jour via pip…", ja: "pip で更新中…", ko: "pip 업데이트 중…" },
+  autoUpdatePartner: { zh: "自动更新 Codex Partner", en: "Automatically update Codex Partner", fr: "Mettre Codex Partner à jour automatiquement", ja: "Codex Partner を自動更新", ko: "Codex Partner 자동 업데이트" },
+  autoUpdateOnNewVersion: { zh: "有新版本时通过 pip 更新", en: "Update with pip when a new version is available", fr: "Mettre à jour via pip lorsqu'une nouvelle version existe", ja: "新しいバージョンがある場合に pip で更新", ko: "새 버전이 있으면 pip로 업데이트" },
+  partnerAutoUpdateDescription: { zh: "发现新版本后通过 pip 自动安装", en: "Automatically install new releases with pip", fr: "Installer automatiquement les nouvelles versions via pip", ja: "新しいバージョンを pip で自動インストール", ko: "새 버전을 pip로 자동 설치" },
+  partnerVersionInstalled: { zh: "{version} 已安装", en: "{version} installed", fr: "{version} installée", ja: "{version} をインストール済み", ko: "{version} 설치됨" },
+  partnerRestartRequired: { zh: "当前任务不会中断，重启 Partner 后生效", en: "Current tasks stay running; restart Partner to apply", fr: "Les tâches continuent ; redémarrez Partner pour appliquer", ja: "現在のタスクは継続します。Partner 再起動後に反映されます", ko: "현재 작업은 계속됩니다. Partner를 다시 시작하면 적용됩니다" },
+  restartAndApply: { zh: "重启并应用", en: "Restart and apply", fr: "Redémarrer et appliquer", ja: "再起動して適用", ko: "다시 시작하여 적용" },
+  restartPartnerConfirm: { zh: "重启 Codex Partner 以应用已安装的新版本？Codex 会话进程会继续运行。", en: "Restart Codex Partner to apply the installed update? Codex session processes will keep running.", fr: "Redémarrer Codex Partner pour appliquer la mise à jour ? Les sessions Codex continueront.", ja: "更新を適用するため Codex Partner を再起動しますか？Codex セッションは実行を続けます。", ko: "설치된 업데이트를 적용하기 위해 Codex Partner를 다시 시작할까요? Codex 세션은 계속 실행됩니다." },
+  restartingPartner: { zh: "正在重启…", en: "Restarting…", fr: "Redémarrage…", ja: "再起動中…", ko: "다시 시작 중…" },
+  autoUpdateEnabled: { zh: "已开启 Partner 自动更新", en: "Partner auto-update enabled", fr: "Mise à jour automatique activée", ja: "Partner 自動更新を有効にしました", ko: "Partner 자동 업데이트를 켰습니다" },
+  autoUpdateDisabled: { zh: "已关闭 Partner 自动更新", en: "Partner auto-update disabled", fr: "Mise à jour automatique désactivée", ja: "Partner 自動更新を無効にしました", ko: "Partner 자동 업데이트를 껐습니다" },
+  partnerCurrent: { zh: "已是最新版本", en: "Already up to date", fr: "Déjà à jour", ja: "最新バージョンです", ko: "이미 최신 버전입니다" },
+  partnerUpdated: { zh: "更新已安装", en: "Update installed", fr: "Mise à jour installée", ja: "更新をインストールしました", ko: "업데이트를 설치했습니다" },
+  partnerNeverChecked: { zh: "尚未检查更新", en: "Updates have not been checked", fr: "Aucune vérification effectuée", ja: "更新はまだ確認されていません", ko: "업데이트를 아직 확인하지 않았습니다" },
+  partnerRestarting: { zh: "更新完成，Partner 正在重启", en: "Update installed; Partner is restarting", fr: "Mise à jour installée ; redémarrage", ja: "更新完了。Partner を再起動しています", ko: "업데이트 완료, Partner를 다시 시작하는 중입니다" },
   codexVersionUnknown: { zh: "版本未知", en: "Version unavailable", fr: "Version indisponible", ja: "バージョン不明", ko: "버전 확인 불가" },
   runningTasks: { zh: "{{count}} 个任务运行中", en: "{{count}} tasks running", fr: "{{count}} tâches en cours", ja: "{{count}} 件のタスクを実行中", ko: "{{count}}개 작업 실행 중" },
   workspaceUnset: { zh: "未设置工作目录", en: "Workspace not set", fr: "Espace de travail non défini", ja: "ワークスペース未設定", ko: "작업 공간이 설정되지 않음" },
@@ -563,6 +588,8 @@ let chatRenderFrame = null;
 let chatLastRenderAt = 0;
 let runtimeMetricsTimer = null;
 let pendingAttachments = [];
+const composerDrafts = new Map();
+const COMPOSER_DRAFT_STORAGE_KEY = "codex-partner-composer-drafts-v1";
 let terminalSocket = null;
 let terminalTaskId = null;
 let terminalEmulator = null;

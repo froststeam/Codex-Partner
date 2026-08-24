@@ -514,6 +514,14 @@ function buildExplorationTree(blocks, taskRunning = false, taskStatus = "") {
 }
 
 self.onmessage = event => {
+  if (event.data?.type === "previewMarkdown") {
+    try {
+      self.postMessage({ requestId: event.data.requestId, type: "markdownPreview", itemId: event.data.itemId || "", revision: event.data.revision || 0, html: markdown(event.data.text || "") });
+    } catch (error) {
+      self.postMessage({ requestId: event.data.requestId, type: "markdownPreview", itemId: event.data.itemId || "", revision: event.data.revision || 0, error: String(error?.message || error) });
+    }
+    return;
+  }
   const { requestId, taskId, events, explorationEvents, explorationRevision, messages, rawActivity, labels, taskRunning, taskStatus } = event.data;
   try {
     const merged = mergeEvents(events, messages);

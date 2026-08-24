@@ -39,10 +39,32 @@ async function renderCodexManagement() {
   const section = $("#codex-management");
   if (!section) return;
   try {
-    const info = await api("/codex/manage");
+    const [info, partner] = await Promise.all([api("/codex/manage"), api("/partner/update")]);
     state.codexInfo = info;
     const plan = info.update_plan || {};
-    section.innerHTML = `<div class="connection-section-head"><div><span class="panel-section-label">CODEX</span><h3>${uiLabel("codexManagement")}</h3></div><button id="update-codex" class="secondary" ${plan.supported ? "" : "disabled"}>${uiLabel("updateCodex")}</button></div><div class="codex-management-grid"><div><small>${uiLabel("codexVersion")}</small><strong>${esc(info.version || uiLabel("codexVersionUnknown"))}</strong></div><div><small>${uiLabel("codexSource")}</small><strong>${esc(info.source || "missing")}</strong></div><div class="codex-management-wide"><small>${uiLabel("codexPath")}</small><code title="${esc(info.path || "")}">${esc(info.path || uiLabel("codexMissing"))}</code></div><div class="codex-management-wide"><small>${uiLabel("codexWorkingDirectory")}</small><code title="${esc(info.working_directory || "")}">${esc(info.working_directory || "")}</code></div></div>${info.error ? `<p class="connection-inline-error">${esc(info.error)}</p>` : ""}`;
+    const pendingUpdate = partner.restart_required ? `<div class="partner-update-ready"><div><strong>${uiLabel("partnerVersionInstalled").replace("{version}", `v${esc(partner.installed_version || "")}`)}</strong><small>${uiLabel("partnerRestartRequired")}</small></div><button id="restart-partner-after-update" class="primary">${uiLabel("restartAndApply")}</button></div>` : "";
+    section.innerHTML = `<div class="connection-section-head"><div><span class="panel-section-label">CODEX</span><h3>${uiLabel("codexManagement")}</h3></div><button id="update-codex" class="secondary" ${plan.supported ? "" : "disabled"}>${uiLabel("updateCodex")}</button></div><div class="codex-management-grid"><div><small>${uiLabel("codexVersion")}</small><strong>${esc(info.version || uiLabel("codexVersionUnknown"))}</strong></div><div><small>${uiLabel("codexSource")}</small><strong>${esc(info.source || "missing")}</strong></div><div class="codex-management-wide"><small>${uiLabel("codexPath")}</small><code title="${esc(info.path || "")}">${esc(info.path || uiLabel("codexMissing"))}</code></div><div class="codex-management-wide"><small>${uiLabel("codexWorkingDirectory")}</small><code title="${esc(info.working_directory || "")}">${esc(info.working_directory || "")}</code></div></div>${info.error ? `<p class="connection-inline-error">${esc(info.error)}</p>` : ""}<div class="partner-update-block"><div class="partner-update-main"><div class="partner-update-copy"><div class="partner-update-title"><strong>Codex Partner</strong><span>v${esc(partner.running_version || partner.current_version || "")}</span></div><small>${uiLabel("partnerAutoUpdateDescription")}</small></div><label class="setting-switch" title="${uiLabel("autoUpdatePartner")}"><input id="partner-auto-update" type="checkbox" ${partner.auto_update ? "checked" : ""}/><span aria-hidden="true"></span></label></div>${pendingUpdate}</div>`;
+    $("#partner-auto-update").onchange = async event => {
+      const checked = event.target.checked;
+      event.target.disabled = true;
+      try { await api("/partner/update", { method: "PATCH", body: JSON.stringify({ auto_update: checked }) }); toast(checked ? uiLabel("autoUpdateEnabled") : uiLabel("autoUpdateDisabled")); }
+      catch (error) { event.target.checked = !checked; toast(error.message); }
+      finally { event.target.disabled = false; }
+    };
+    const restartPartner = $("#restart-partner-after-update");
+    if (restartPartner) restartPartner.onclick = async () => {
+      if (!await appConfirm(uiLabel("restartPartnerConfirm"), { danger: false })) return;
+      restartPartner.disabled = true;
+      restartPartner.textContent = uiLabel("restartingPartner");
+      try {
+        await api("/partner/restart", { method: "POST", body: JSON.stringify({ confirm: true }) });
+        toast(uiLabel("partnerRestarting"));
+      } catch (error) {
+        restartPartner.disabled = false;
+        restartPartner.textContent = uiLabel("restartAndApply");
+        toast(error.message);
+      }
+    };
   } catch (error) {
     section.innerHTML = `<div class="connection-section-head"><div><span class="panel-section-label">CODEX</span><h3>${uiLabel("codexManagement")}</h3></div></div><p class="connection-inline-error">${esc(error.message)}</p>`;
   }
@@ -170,7 +192,9 @@ async function createQuickSession() {
     // New sessions run on the Codex Partner service host. SSH is opt-in for
     // legacy remote sessions and must never change the webpage connection.
     const created = await api("/tasks/quick", { method: "POST", body: JSON.stringify({ workspace: "", ssh_host: "" }) });
-    await refresh(false);
+    mergeTask(created);
+    renderSessionList();
+    renderSidebarStats();
     await selectSession(created.id);
     $("#message-input").focus();
     toast("新会话已创建 · YOLO 已开启");
