@@ -21,14 +21,15 @@ class Database:
             pass
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, check_same_thread=False)
+        connection = sqlite3.connect(self.path, check_same_thread=False, timeout=5)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=5000")
         connection.execute("PRAGMA foreign_keys=ON")
         return connection
 
     def initialize(self) -> None:
         with self.lock, closing(self.connect()) as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS tasks (
@@ -122,6 +123,7 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_sessions_task_id ON sessions(task_id, id);
                 CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id, id);
                 CREATE INDEX IF NOT EXISTS idx_events_session_ts_id ON events(session_id, ts DESC, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_events_task_id ON events(task_id, id DESC);
                 CREATE INDEX IF NOT EXISTS idx_events_stream_id_session ON events(stream, id DESC, session_id);
                 CREATE INDEX IF NOT EXISTS idx_task_messages_task_status ON task_messages(task_id, status, created_at);
                 CREATE INDEX IF NOT EXISTS idx_activity_nodes_task_sequence ON activity_nodes(task_id, sequence);
@@ -270,12 +272,14 @@ class Database:
         )
 
     def one(self, sql: str, args: tuple = ()) -> Optional[dict]:
-        with self.lock, closing(self.connect()) as connection:
+        # WAL permits readers while a graph/event writer is committing. A
+        # global Python lock here made every chat switch wait for graph builds.
+        with closing(self.connect()) as connection:
             row = connection.execute(sql, args).fetchone()
             return dict(row) if row else None
 
     def all(self, sql: str, args: tuple = ()) -> list[dict]:
-        with self.lock, closing(self.connect()) as connection:
+        with closing(self.connect()) as connection:
             return [dict(row) for row in connection.execute(sql, args).fetchall()]
 
     def execute(self, sql: str, args: tuple = ()) -> None:

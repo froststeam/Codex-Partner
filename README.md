@@ -99,7 +99,7 @@ py -m codex_partner
 ## Docker
 
 ```bash
-docker build -t codex-partner:0.0.12 .
+docker build -t codex-partner:0.0.13 .
 docker run -d --name codex-partner \
   -p 8787:8787 \
   --add-host=host.docker.internal:host-gateway \

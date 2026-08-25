@@ -77,11 +77,15 @@ const UI_LABELS = {
   you: { zh: "用户", en: "User", fr: "Utilisateur", ja: "ユーザー", ko: "사용자" },
   start: { zh: "开始", en: "Start", fr: "Démarrer", ja: "開始", ko: "시작" },
   pause: { zh: "暂停", en: "Pause", fr: "Pause", ja: "一時停止", ko: "일시정지" },
+  continueGoal: { zh: "继续", en: "Continue", fr: "Continuer", ja: "続行", ko: "계속" },
+  restartGoal: { zh: "重新开始", en: "Restart", fr: "Recommencer", ja: "再開", ko: "다시 시작" },
+  startingGoal: { zh: "启动中…", en: "Starting…", fr: "Démarrage…", ja: "開始中…", ko: "시작 중…" },
+  recoveringGoal: { zh: "恢复中…", en: "Recovering…", fr: "Reprise…", ja: "復旧中…", ko: "복구 중…" },
   goalStart: { zh: "开始目标续跑", en: "Start goal resume", fr: "Reprendre l’objectif", ja: "目標の再開", ko: "목표 재개" },
   goalPause: { zh: "暂停目标续跑", en: "Pause goal resume", fr: "Suspendre l’objectif", ja: "目標を一時停止", ko: "목표 일시정지" },
   goalComplete: { zh: "目标已完成，请编辑后重新开始", en: "Goal complete; edit it before restarting", fr: "Objectif terminé ; modifiez-le avant de redémarrer", ja: "目標は完了しました。編集してから再開してください", ko: "목표가 완료되었습니다. 편집 후 다시 시작하세요" },
   goalPauseRetryEnabled: { zh: "请先关闭自动续跑，才能暂停 Goal", en: "Disable auto-resume before pausing the Goal", fr: "Désactivez la reprise automatique avant de mettre l’objectif en pause", ja: "Goalを一時停止するには自動再開を先に無効にしてください", ko: "Goal을 일시정지하려면 자동 재개를 먼저 끄세요" },
-  setGoal: { zh: "先设置目标", en: "Set a goal first", fr: "Définissez un objectif", ja: "目標を設定してください", ko: "목표를 먼저 설정하세요" },
+  setGoal: { zh: "设置目标", en: "Set goal", fr: "Définir l’objectif", ja: "目標を設定", ko: "목표 설정" },
   retryOn: { zh: "开启目标自动续跑", en: "Enable goal auto-resume", fr: "Activer la reprise automatique", ja: "目標の自動再開を有効化", ko: "목표 자동 재개 켜기" },
   retryOff: { zh: "关闭目标自动续跑", en: "Disable goal auto-resume", fr: "Désactiver la reprise automatique", ja: "目標の自動再開を無効化", ko: "목표 자동 재개 끄기" },
   on: { zh: "开", en: "On", fr: "Oui", ja: "オン", ko: "켬" },
@@ -198,6 +202,7 @@ const UI_LABELS = {
   shortcutComposer: { zh: "输入框", en: "Composer", fr: "Saisie", ja: "入力欄", ko: "입력창" },
   shortcutComposerToggle: { zh: "聚焦/取消聚焦输入框", en: "Focus or unfocus the composer", fr: "Activer ou quitter la zone de saisie", ja: "入力欄のフォーカスを切り替え", ko: "입력창 포커스 전환" },
   stopAction: { zh: "停止", en: "Stop", fr: "Arrêter", ja: "停止", ko: "중지" },
+  stopActiveGoalConfirm: { zh: "停止会话会同时关闭自动重试并暂停当前 Goal，是否继续？", en: "Stopping the session will also disable auto-resume and pause the active Goal. Continue?", fr: "Arrêter la session désactivera aussi la reprise automatique et mettra l’objectif en pause. Continuer ?", ja: "セッションを停止すると自動再開が無効になり、Goal も一時停止します。続行しますか？", ko: "세션을 중지하면 자동 재개가 꺼지고 현재 Goal도 일시 중지됩니다. 계속할까요?" },
   editQueued: { zh: "修改排队中的消息…", en: "Edit queued message…", fr: "Modifier le message en attente…", ja: "待機メッセージを編集…", ko: "대기 메시지 편집…" },
   readingDirectory: { zh: "正在读取目录…", en: "Reading directory…", fr: "Lecture du dossier…", ja: "ディレクトリを読み込み中…", ko: "디렉터리 읽는 중…" },
   open: { zh: "打开", en: "Open", fr: "Ouvrir", ja: "開く", ko: "열기" },
@@ -673,10 +678,6 @@ async function requestSSHLogin() {
     const error = $("#ssh-login-error");
     const submit = $("#ssh-login-submit");
     updateSSHLoginDialog();
-    $("#ssh-login-server").textContent = `SSH · ${location.hostname}:22`;
-    fetch("/api/auth/status").then(response => response.json()).then(status => {
-      if (status?.ssh_host) $("#ssh-login-server").textContent = `SSH · ${status.ssh_host}:${status.ssh_port || 22}`;
-    }).catch(() => {});
     error.textContent = "";
     password.value = "";
     dialog.oncancel = event => event.preventDefault();
@@ -1149,7 +1150,7 @@ function scheduleRuntimeMetricsRefresh() {
 
 async function refresh(keepSelection = true) {
   try {
-    const [tasks, sessions, providers, skills, memories, health, commandData] = await Promise.all([api("/tasks"), api("/sessions"), api("/providers"), api("/skills"), api("/memories"), api("/health"), api("/commands"), loadUserProfile()]);
+    const [tasks, sessions, providers, skills, memories, health, commandData] = await Promise.all([api("/tasks"), Promise.resolve([]), api("/providers"), api("/skills"), api("/memories"), api("/health"), api("/commands"), loadUserProfile()]);
     state.tasks = tasks; state.sessions = sessions; state.providers = providers; state.skills = skills; state.memories = memories.files || []; state.generatedMemories = memories.generated || []; state.commands = commandData.commands || []; state.defaultWorkspace = health.default_workspace || state.defaultWorkspace; renderCodexAvailability(health); renderConnectionStatus();
     renderSessionList(); renderSidebarStats(); refreshOpenPanel();
     if (state.selectedId && !state.tasks.some(task => task.id === state.selectedId)) state.selectedId = null;

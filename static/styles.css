@@ -796,9 +796,6 @@ body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56p
 }
 .ssh-login-dialog { width: min(420px, calc(100vw - 28px)); }
 .ssh-login-dialog form { gap: 14px; }
-.ssh-login-server { display: flex; align-items: center; gap: 9px; min-width: 0; border: 1px solid #334248; border-radius: 5px; padding: 9px 10px; background: #0d1417; color: #9facb1; font-size: 11px; }
-.ssh-login-server span { color: #91ad69; font-family: var(--mono); font-weight: 800; }
-.ssh-login-server strong { overflow: hidden; color: #dbe4e6; font-family: var(--mono); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .ssh-login-error { min-height: 18px; margin: 0; color: #ff8e86; font-size: 11px; line-height: 1.45; }
 .ssh-login-dialog .app-dialog-actions { padding-top: 0; }
 .ssh-login-dialog .app-dialog-actions button { width: 100%; }
@@ -910,8 +907,6 @@ body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56p
 [data-theme="light"] .app-dialog { border-color: #ccd6d2; background: #ffffff; color: #172126; box-shadow: 0 24px 70px #24323942; }
 [data-theme="light"] .app-dialog-heading h2 { color: #182429; }
 [data-theme="light"] .app-dialog input { border-color: #ccd6d9; background: #f7f9f9; color: #172126; }
-[data-theme="light"] .ssh-login-server { border-color: #d2dcda; background: #f3f7f6; color: #526166; }
-[data-theme="light"] .ssh-login-server strong { color: #253338; }
 [data-theme="light"] .chat-stream { background: #f7f9f9; }
 [data-theme="light"] .message-content { border-color: #d7dfe1; background: #ffffff; color: #26373d; box-shadow: 0 3px 13px #465b6420; }
 [data-theme="light"] .message.user .message-content { border-color: #c9d9bf; background: #f1f7ed; }

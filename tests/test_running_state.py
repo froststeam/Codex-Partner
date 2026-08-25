@@ -11,6 +11,7 @@ import sqlite3
 import sys
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timezone
@@ -18,8 +19,235 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from codex_partner.interaction_state import derive_interaction_state, goal_should_run, goal_status_after_failure
+
 
 class RunningStateTests(unittest.TestCase):
+    def test_interaction_state_matrix(self):
+        cases = [
+            # goal, status, retry, session, action, enabled, retry-enabled, clear, should-run
+            ("", "none", False, "available", "set", True, False, False, False),
+            ("goal", "paused", False, "available", "start", True, True, True, False),
+            ("goal", "active", False, "running", "pause", True, True, False, True),
+            ("goal", "active", True, "running", "pause", False, True, False, True),
+            ("goal", "blocked", False, "failed", "continue", True, True, True, False),
+            ("goal", "blocked", True, "retrying", "recovering", False, False, False, True),
+            ("goal", "paused", True, "retrying", "recovering", False, False, False, True),
+            ("goal", "complete", False, "available", "restart", True, False, True, False),
+            ("goal", "active", False, "queued", "starting", False, False, False, True),
+            ("goal", "active", False, "stopped", "start", True, True, True, False),
+            ("goal", "active", False, "available", "starting", False, False, False, True),
+            ("goal", "blocked", True, "available", "recovering", False, False, False, True),
+        ]
+        for goal, goal_status, retry, session, action, enabled, retry_enabled, clear, should_run in cases:
+            with self.subTest(goal_status=goal_status, retry=retry, session=session):
+                task = {
+                    "goal": goal, "goal_status": goal_status,
+                    "retry_forever": retry, "status": session,
+                    "run_mode": "goal_resume" if session == "queued" else "",
+                }
+                state = derive_interaction_state(task)
+                self.assertEqual(action, state["goalAction"])
+                self.assertEqual(enabled, state["goalActionEnabled"])
+                self.assertEqual(retry_enabled, state["retryEnabled"])
+                self.assertEqual(clear, state["goalClearEnabled"])
+                self.assertEqual(should_run, goal_should_run(task))
+
+    def test_interaction_state_exhaustive_invariants(self):
+        goal_statuses = ("none", "planned", "active", "paused", "blocked", "complete")
+        session_statuses = ("available", "running", "queued", "retrying", "stopped", "failed", "succeeded")
+        for goal_status in goal_statuses:
+            for session_status in session_statuses:
+                for retry in (False, True):
+                    goal = "" if goal_status == "none" else "goal"
+                    task = {"goal": goal, "goal_status": goal_status, "status": session_status, "retry_forever": retry}
+                    with self.subTest(goal_status=goal_status, session_status=session_status, retry=retry):
+                        state = derive_interaction_state(task)
+                        self.assertEqual(session_status in {"running", "queued", "retrying"}, state["sessionBusy"])
+                        self.assertEqual("pause" if state["sessionBusy"] else "send", state["composerAction"])
+                        if not goal:
+                            self.assertEqual("set", state["goalAction"])
+                            self.assertFalse(state["retryEnabled"])
+                            self.assertFalse(state["goalClearEnabled"])
+                        if state["goalStatus"] == "complete":
+                            self.assertEqual("restart", state["goalAction"])
+                            self.assertFalse(state["retryEnabled"])
+                            self.assertFalse(state["goalShouldRun"])
+                        if state["goalStatus"] == "active" and state["sessionBusy"]:
+                            self.assertIn(state["goalAction"], {"pause", "starting"})
+                            self.assertFalse(state["goalClearEnabled"])
+                        if state["goalAction"] in {"starting", "recovering", "pausing"}:
+                            self.assertFalse(state["goalActionEnabled"])
+                            self.assertFalse(state["retryEnabled"])
+
+    def test_composer_action_matrix_is_independent_of_goal_status(self):
+        for goal_status in ("none", "paused", "active", "blocked", "complete"):
+            goal = "" if goal_status == "none" else "goal"
+            for session_status in ("available", "stopped", "failed", "succeeded"):
+                state = derive_interaction_state({"goal": goal, "goal_status": goal_status, "status": session_status})
+                self.assertEqual("send", state["composerAction"])
+            for session_status in ("running", "queued", "retrying"):
+                state = derive_interaction_state({"goal": goal, "goal_status": goal_status, "status": session_status})
+                self.assertEqual("pause", state["composerAction"])
+
+    def test_startup_drain_includes_active_and_retry_recoverable_goals(self):
+        ids = []
+        cases = (
+            ("startup-active-goal", "active", False, True),
+            ("startup-paused-retry", "paused", True, True),
+            ("startup-blocked-retry", "blocked", True, True),
+            ("startup-paused-off", "paused", False, False),
+            ("startup-complete", "complete", True, False),
+            ("startup-legacy-stopped-active", "active", False, False),
+        )
+        try:
+            for task_id, status, retry, _expected in cases:
+                ids.append(task_id)
+                self.make_task(task_id, "stopped" if task_id == "startup-legacy-stopped-active" else "available")
+                self.app.db.execute(
+                    "UPDATE tasks SET goal='goal',goal_status=?,retry_forever=? WHERE id=?",
+                    (status, int(retry), task_id),
+                )
+            startup = self.app.startup_drain_task_ids()
+            for task_id, _status, _retry, expected in cases:
+                self.assertEqual(expected, task_id in startup)
+        finally:
+            for task_id in ids:
+                self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_legacy_stopped_active_states_are_reconciled(self):
+        user_stop = "legacy-user-stopped-active"
+        failed_stop = "legacy-failed-stopped-active"
+        complete_retry = "legacy-complete-retry"
+        terminal_binding = "legacy-terminal-binding"
+        for task_id in (user_stop, failed_stop, complete_retry, terminal_binding):
+            self.make_task(task_id, "stopped")
+        self.app.db.execute("UPDATE tasks SET goal='goal',goal_status='active',retry_forever=1 WHERE id=?", (user_stop,))
+        self.app.db.execute(
+            "UPDATE tasks SET goal='goal',goal_status='active',retry_forever=0,last_error='Codex process ended without a completion event' WHERE id=?",
+            (failed_stop,),
+        )
+        self.app.db.execute("UPDATE tasks SET goal='goal',goal_status='complete',retry_forever=1 WHERE id=?", (complete_retry,))
+        self.app.db.execute(
+            "UPDATE tasks SET status='available',active_session_id='old-session',execution_turn_id='old-turn',run_mode='goal_resume',last_error='Stopped by user' WHERE id=?",
+            (terminal_binding,),
+        )
+        try:
+            self.app.reconcile_legacy_interaction_states()
+            user = self.app.task_or_404(user_stop)
+            failed = self.app.task_or_404(failed_stop)
+            complete = self.app.task_or_404(complete_retry)
+            normalized = self.app.task_or_404(terminal_binding)
+            self.assertEqual(("stopped", "paused", False), (user["status"], user["goal_status"], user["retry_forever"]))
+            self.assertEqual(("failed", "blocked"), (failed["status"], failed["goal_status"]))
+            self.assertFalse(complete["retry_forever"])
+            self.assertIsNone(normalized["active_session_id"])
+            self.assertEqual("", normalized["execution_turn_id"])
+            self.assertEqual("", normalized["run_mode"])
+            self.assertEqual("", normalized["last_error"])
+        finally:
+            for task_id in (user_stop, failed_stop, complete_retry, terminal_binding):
+                self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_active_goal_continues_normally_but_errors_require_auto_retry(self):
+        task = {"goal": "goal", "goal_status": "active", "retry_forever": False}
+        self.assertTrue(self.app.goal_auto_resume_enabled(task))
+        self.assertFalse(self.app.task_retry_allowed(task))
+        task["retry_forever"] = True
+        self.assertTrue(self.app.task_retry_allowed(task))
+        self.assertEqual("blocked", goal_status_after_failure(task))
+        task["retry_forever"] = False
+        self.assertEqual("blocked", goal_status_after_failure(task))
+        self.assertEqual("paused", goal_status_after_failure(task, user_stopped=True))
+
+    def test_complete_and_missing_goal_cannot_enable_auto_retry(self):
+        for task_id, goal, goal_status in (
+            ("retry-without-goal", "", "none"),
+            ("retry-complete-goal", "done", "complete"),
+        ):
+            self.make_task(task_id, "available")
+            self.app.db.execute(
+                "UPDATE tasks SET goal=?,goal_status=? WHERE id=?",
+                (goal, goal_status, task_id),
+            )
+            try:
+                with self.assertRaises(self.app.HTTPException) as raised:
+                    asyncio.run(self.app.patch_task(task_id, self.app.TaskPatch(retry_forever=True), None))
+                self.assertEqual(409, raised.exception.status_code)
+                self.assertFalse(self.app.task_or_404(task_id)["retry_forever"])
+            finally:
+                self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_stopped_session_accepts_an_ordinary_message_without_reactivating_goal(self):
+        task_id = "stopped-paused-goal-message"
+        self.make_task(task_id, "stopped")
+        self.app.db.execute(
+            "UPDATE tasks SET goal='paused goal',goal_status='paused',retry_forever=0 WHERE id=?",
+            (task_id,),
+        )
+        try:
+            with mock.patch.object(self.app, "schedule_task_drain") as schedule:
+                message = asyncio.run(self.app.enqueue_task_message(task_id, "ordinary message"))
+            task = self.app.task_or_404(task_id)
+            self.assertEqual("queued", message["status"])
+            self.assertEqual("available", task["status"])
+            self.assertEqual("paused", task["goal_status"])
+            schedule.assert_called_once_with(task_id)
+        finally:
+            self.app.db.execute("DELETE FROM task_messages WHERE task_id=?", (task_id,))
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_message_queue_normalizes_a_pre_thread_task_alias(self):
+        task_id = "canonical-message-task"
+        alias = "temporary-message-alias"
+        self.make_task(task_id, "available")
+        self.app.task_id_aliases[alias] = task_id
+        try:
+            with mock.patch.object(self.app, "schedule_task_drain") as schedule:
+                message = asyncio.run(self.app.enqueue_task_message(alias, "second message"))
+            row = self.app.db.one("SELECT task_id,status FROM task_messages WHERE id=?", (message["id"],))
+            self.assertEqual(task_id, row["task_id"])
+            self.assertEqual("queued", row["status"])
+            schedule.assert_called_once_with(task_id)
+        finally:
+            self.app.task_id_aliases.pop(alias, None)
+            self.app.db.execute("DELETE FROM task_messages WHERE task_id=?", (task_id,))
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_task_payload_exposes_canonical_interaction_controls(self):
+        task_id = "interaction-payload"
+        self.make_task(task_id, "available")
+        self.app.db.execute(
+            "UPDATE tasks SET goal='paused goal',goal_status='paused',retry_forever=0 WHERE id=?",
+            (task_id,),
+        )
+        try:
+            task = self.app.task_or_404(task_id)
+            self.assertEqual("start", task["interaction"]["goalAction"])
+            self.assertEqual("send", task["interaction"]["composerAction"])
+            self.assertTrue(task["interaction"]["goalClearEnabled"])
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_native_history_timeout_returns_overlay_fallback_instead_of_500(self):
+        task_id = "native-history-timeout"
+        self.make_task(task_id, "available")
+        self.app.db.execute(
+            "UPDATE tasks SET native=1,codex_session_id=? WHERE id=?",
+            (task_id, task_id),
+        )
+
+        class SlowClient:
+            async def request(self, _method, _params):
+                raise asyncio.TimeoutError()
+
+        try:
+            with mock.patch.object(self.app, "appserver_for", new=mock.AsyncMock(return_value=SlowClient())):
+                rows = asyncio.run(self.app.native_history_events(self.app.task_or_404(task_id)))
+            self.assertEqual([], rows)
+        finally:
+            self.app.native_history_cache.pop(task_id, None)
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
     @classmethod
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory()
@@ -104,6 +332,59 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn(("systemctl", "--user", "restart", unit), calls)
         self.assertFalse(any("systemd-run" in command for command in calls))
 
+    def test_database_reads_do_not_wait_for_global_writer_lock(self):
+        completed = threading.Event()
+        result = []
+
+        def read():
+            result.append(self.app.db.one("SELECT 1 AS value"))
+            completed.set()
+
+        with self.app.db.lock:
+            thread = threading.Thread(target=read)
+            thread.start()
+            self.assertTrue(completed.wait(0.5), "WAL read was blocked by the Python writer lock")
+        thread.join(timeout=1)
+        self.assertEqual({"value": 1}, result[0])
+
+    def test_timeline_has_task_id_ordering_index(self):
+        indexes = self.app.db.all("PRAGMA index_list(events)")
+        self.assertIn("idx_events_task_id", {index["name"] for index in indexes})
+        plan = self.app.db.all(
+            "EXPLAIN QUERY PLAN SELECT * FROM events WHERE task_id=? ORDER BY id DESC LIMIT ?",
+            ("thread", 120),
+        )
+        self.assertTrue(any("idx_events_task_id" in row["detail"] for row in plan), plan)
+
+    def test_first_page_does_not_wait_for_global_session_history(self):
+        core = (Path(__file__).resolve().parents[1] / "static" / "core.js").read_text(encoding="utf-8")
+        refresh = core[core.index("async function refresh(") : core.index("async function refreshSelectedConversation")]
+        self.assertNotIn('api("/sessions")', refresh)
+        self.assertIn("Promise.resolve([])", refresh)
+
+    def test_global_session_history_query_does_not_block_event_loop(self):
+        def slow_query(*_args):
+            time.sleep(0.2)
+            return []
+
+        async def exercise():
+            started = time.perf_counter()
+            with mock.patch.object(self.app.db, "all", side_effect=slow_query):
+                query = asyncio.create_task(self.app.list_sessions(100, None))
+                await asyncio.sleep(0.02)
+                self.assertLess(time.perf_counter() - started, 0.1)
+                self.assertFalse(query.done())
+                self.assertEqual([], await query)
+
+        asyncio.run(exercise())
+
+    def test_global_sessions_do_not_scan_event_history_for_deduplication(self):
+        source = Path(self.app.__file__).read_text(encoding="utf-8")
+        start = source.index('@app.get("/api/sessions")')
+        block = source[start : start + 5000]
+        self.assertNotIn("FROM events", block)
+        self.assertIn("appserver_turn_tasks.items()", block)
+
     def test_appserver_start_failure_cleans_up_without_client(self):
         task_id = "appserver-start-failure"
         session_id = "appserver-start-failure-session"
@@ -112,6 +393,10 @@ class RunningStateTests(unittest.TestCase):
         self.app.db.execute(
             "INSERT INTO sessions (id,task_id,status,attempt,command,started_at) VALUES (?,?,?,?,?,?)",
             (session_id, task_id, "running", 1, "codex app-server", self.app.now()),
+        )
+        self.app.db.execute(
+            "UPDATE tasks SET active_session_id=?,run_mode='message',execution_source='dashboard' WHERE id=?",
+            (session_id, task_id),
         )
 
         async def run():
@@ -122,8 +407,18 @@ class RunningStateTests(unittest.TestCase):
                 schedule.assert_called_once_with(task_id)
 
         asyncio.run(run())
-        self.assertEqual("failed", self.app.task_or_404(task_id)["status"])
-        self.assertEqual("start failed", self.app.task_or_404(task_id)["last_error"])
+        failed = self.app.task_or_404(task_id)
+        self.assertEqual("failed", failed["status"])
+        self.assertEqual("start failed", failed["last_error"])
+        self.assertFalse(failed["active_session_id"])
+        self.assertEqual("", failed["run_mode"])
+
+    def test_success_path_releases_all_execution_bindings(self):
+        source = Path(self.app.__file__).read_text(encoding="utf-8")
+        self.assertIn(
+            "status=?,active_session_id=NULL,execution_source='',execution_turn_id='',run_mode='',last_error=''",
+            source,
+        )
 
     def test_idle_session_restart_replaces_codex_service_and_preserves_thread(self):
         task_id = "manual-restart-idle"
@@ -583,7 +878,7 @@ class RunningStateTests(unittest.TestCase):
             self.assertEqual((282, 320), image.size)
         self.assertIn('const DEFAULT_USER_AVATAR = "/default-user-avatar.webp?v=20260818"', core)
         self.assertIn('profile?.avatar_url || DEFAULT_USER_AVATAR', core)
-        self.assertIn('/core.js?v=20260824-partner-update-confirm', html)
+        self.assertIn('/core.js?v=20260825-fast-conversation-load', html)
 
     def test_app_server_reads_large_json_messages_in_chunks(self):
         async def collect():
@@ -743,7 +1038,10 @@ class RunningStateTests(unittest.TestCase):
             "ssh_host": "",
         }
         inputs = self.app.appserver_turn_inputs(task, "", include_goal_memory=True)
-        self.assertEqual("Continue working toward the active thread goal.", inputs[0]["text"])
+        self.assertIn("Continue working toward the active thread goal.", inputs[0]["text"])
+        self.assertIn("call update_goal with status \"complete\"", inputs[0]["text"])
+        self.assertIn("do not create another variant", inputs[0]["text"])
+        self.assertNotIn(task["prompt"], inputs[0]["text"])
         self.assertNotIn("stale original prompt", inputs[0]["text"])
 
     def test_attachment_frontend_uses_structured_appserver_inputs(self):
@@ -983,7 +1281,7 @@ class RunningStateTests(unittest.TestCase):
             self.app.db.execute("DELETE FROM sessions WHERE task_id=?", (task_id,))
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
-    def test_stale_started_turn_becomes_stopped(self):
+    def test_stale_started_turn_becomes_failed(self):
         task_id = "stale-thread"
         self.make_task(task_id)
         path = Path(self.temp.name) / "stale.jsonl"
@@ -991,7 +1289,7 @@ class RunningStateTests(unittest.TestCase):
         path.write_text(json.dumps(record) + "\n", encoding="utf-8")
         os.utime(path, (time.time() - 10, time.time() - 10))
         asyncio.run(self.app.reconcile_initial_rollout(task_id, task_id, str(path), record, ""))
-        self.assertEqual("stopped", self.app.task_or_404(task_id)["status"])
+        self.assertEqual("failed", self.app.task_or_404(task_id)["status"])
         self.assertNotIn(task_id, self.app.external_turns)
 
     def test_live_started_turn_remains_running(self):
@@ -1055,11 +1353,11 @@ class RunningStateTests(unittest.TestCase):
                 with mock.patch.object(self.app, "launch", new=mock.AsyncMock(return_value={"session_id": "next"})) as launch:
                     asyncio.run(self.app.drain_task_messages(task_id))
                 task = self.app.task_or_404(task_id)
-                self.assertEqual("active", task["goal_status"])
+                self.assertEqual(status, task["goal_status"])
                 launch.assert_awaited_once_with(task_id, "goal-resume")
                 self.assertEqual("queued", task["status"])
                 self.assertTrue(self.app.goal_auto_resume_enabled(task))
-                self.assertEqual("active", self.app.goal_status_for_resume(task))
+                self.assertEqual(status, self.app.goal_status_for_resume(task))
             finally:
                 self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
@@ -1095,7 +1393,7 @@ class RunningStateTests(unittest.TestCase):
         finally:
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
-    def test_external_turn_disappearance_does_not_pause_active_goal(self):
+    def test_external_turn_disappearance_blocks_active_goal_without_auto_retry(self):
         task_id = f"external-goal-stopped-{time.time_ns()}"
         self.make_task(task_id, "running")
         self.app.db.execute(
@@ -1116,9 +1414,69 @@ class RunningStateTests(unittest.TestCase):
                 {**external, "session_id": ""},
             ))
             result = self.app.task_or_404(task_id)
-            self.assertEqual("stopped", result["status"])
-            self.assertEqual("active", result["goal_status"])
+            self.assertEqual("failed", result["status"])
+            self.assertEqual("blocked", result["goal_status"])
             self.assertFalse(result["retry_forever"])
+        finally:
+            self.app.clear_external_turns(task_id)
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_external_turn_disappearance_blocks_and_schedules_recovery_with_auto_retry(self):
+        task_id = f"external-goal-retry-{time.time_ns()}"
+        self.make_task(task_id, "running")
+        self.app.db.execute(
+            "UPDATE tasks SET goal='finish it',goal_status='active',retry_forever=1 WHERE id=?",
+            (task_id,),
+        )
+        external = self.app.register_external_turn(task_id, {
+            "thread_id": task_id, "turn_id": "terminal-turn", "started_at": self.app.now(),
+            "session_id": f"external:{task_id}:terminal-turn", "path": "/tmp/missing-terminal-rollout",
+        })
+        try:
+            with mock.patch.object(self.app, "schedule_task_drain") as schedule:
+                asyncio.run(self.app.settle_inactive_external_turn(
+                    task_id, "Codex process ended without a completion event", {**external, "session_id": ""},
+                ))
+            result = self.app.task_or_404(task_id)
+            self.assertEqual("failed", result["status"])
+            self.assertEqual("blocked", result["goal_status"])
+            self.assertTrue(result["retry_forever"])
+            self.assertEqual("recovering", result["interaction"]["goalAction"])
+            schedule.assert_called_once_with(task_id)
+        finally:
+            self.app.clear_external_turns(task_id)
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_explicit_external_turn_abort_pauses_goal_and_disables_retry(self):
+        task_id = f"external-goal-abort-{time.time_ns()}"
+        turn_id = "terminal-abort-turn"
+        self.make_task(task_id, "running")
+        self.app.db.execute(
+            "UPDATE tasks SET goal='finish it',goal_status='active',retry_forever=1 WHERE id=?",
+            (task_id,),
+        )
+        session_id = f"external:{task_id}:{turn_id}"
+        self.app.register_external_turn(task_id, {
+            "thread_id": task_id, "turn_id": turn_id, "started_at": self.app.now(),
+            "session_id": session_id, "path": "/tmp/aborted-terminal-rollout",
+        })
+        self.app.db.execute(
+            "INSERT INTO sessions (id,task_id,status,attempt,provider_id,command,started_at,codex_session_id) VALUES (?,?,?,?,?,?,?,?)",
+            (session_id, task_id, "running", 1, None, "terminal", self.app.now(), task_id),
+        )
+        record = {
+            "timestamp": self.app.now(), "type": "event_msg",
+            "payload": {"type": "turn_aborted", "turn_id": turn_id, "reason": "interrupted"},
+        }
+        try:
+            with mock.patch.object(self.app, "schedule_task_drain") as schedule:
+                asyncio.run(self.app.apply_external_turn_boundary(task_id, task_id, record))
+            result = self.app.task_or_404(task_id)
+            self.assertEqual("stopped", result["status"])
+            self.assertEqual("paused", result["goal_status"])
+            self.assertFalse(result["retry_forever"])
+            self.assertEqual("start", result["interaction"]["goalAction"])
+            schedule.assert_called_once_with(task_id)
         finally:
             self.app.clear_external_turns(task_id)
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
@@ -1160,8 +1518,12 @@ class RunningStateTests(unittest.TestCase):
         marker = 'queued_message = db.one(\n                    "SELECT id FROM task_messages WHERE task_id=? AND status=\'queued\''
         self.assertIn(marker, source)
         self.assertIn("if queued_message:\n                    break\n                goal_task", source)
+        self.assertIn('remote_goal_status = "paused" if run_mode == "goal_resume"', source)
+        self.assertIn("goal_staging_tasks.add(task[\"id\"])", source)
+        self.assertIn("stale_objective or staging_pause", source)
+        self.assertIn('{"threadId": thread_id, "objective": goal_task["goal"], "status": "active"}', source)
 
-    def test_normal_queue_submission_steers_active_dashboard_goal(self):
+    def test_normal_queue_submission_stays_fifo_during_active_dashboard_goal(self):
         task_id = f"goal-queue-steer-{time.time_ns()}"
         self.make_task(task_id, "running")
         self.app.db.execute(
@@ -1176,9 +1538,9 @@ class RunningStateTests(unittest.TestCase):
                 mock.patch.object(self.app, "schedule_task_drain") as schedule,
             ):
                 result = asyncio.run(self.app.enqueue_task_message(task_id, "guide the current work", "goal-queue-message", "queue"))
-            self.assertEqual("steered", result["status"])
-            steer.assert_awaited_once()
-            schedule.assert_not_called()
+            self.assertEqual("queued", result["status"])
+            steer.assert_not_awaited()
+            schedule.assert_called_once_with(task_id)
         finally:
             self.app.db.execute("DELETE FROM task_messages WHERE id='goal-queue-message'")
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
@@ -1201,14 +1563,14 @@ class RunningStateTests(unittest.TestCase):
 
     def test_goal_pause_control_is_disabled_when_auto_resume_is_enabled(self):
         source = Path(self.app.__file__).with_name("static").joinpath("conversation.js").read_text(encoding="utf-8")
-        self.assertIn("const goalPauseBlocked = goalActive && Boolean(task.retry_forever);", source)
-        self.assertIn('$("#goal-run-toggle").disabled = !goal || goalPauseBlocked;', source)
+        self.assertIn('goalActionDisabledReason: goalAction === "pause" && retryOn ? "disable_retry" : ""', source)
+        self.assertIn('$("#goal-run-toggle").disabled = !controls.goalActionEnabled;', source)
         self.assertIn('uiLabel("goalPauseRetryEnabled")', source)
 
     def test_completed_goal_can_render_as_a_start_button(self):
         source = Path(self.app.__file__).with_name("static").joinpath("conversation.js").read_text(encoding="utf-8")
-        self.assertNotIn("goalComplete", source)
-        self.assertIn('$("#goal-run-label").textContent = goalActive ? uiLabel("pause") : uiLabel("start");', source)
+        self.assertIn('goalStatus === "complete" ? "restart"', source)
+        self.assertIn('restart: "restartGoal"', source)
 
     def test_completed_goal_can_be_started_again(self):
         task_id = f"restart-completed-goal-{time.time_ns()}"
@@ -1272,10 +1634,41 @@ class RunningStateTests(unittest.TestCase):
     def test_stop_clears_unowned_running_state(self):
         task_id = "orphan-thread"
         self.make_task(task_id)
-        self.app.db.execute("UPDATE tasks SET run_mode='goal_resume' WHERE id=?", (task_id,))
+        self.app.db.execute("UPDATE tasks SET run_mode='goal_resume',last_error='old error' WHERE id=?", (task_id,))
         result = asyncio.run(self.app.stop_task_run(task_id))
         self.assertEqual("stopped", result["status"])
         self.assertEqual("", result["run_mode"])
+        self.assertIsNone(result["active_session_id"])
+        self.assertEqual("", result["last_error"])
+
+    def test_user_stop_of_external_turn_is_not_recorded_as_failure(self):
+        task_id = "external-user-stop"
+        self.make_task(task_id, "running")
+        external = {
+            "thread_id": task_id,
+            "turn_id": "external-turn",
+            "session_id": "external-session",
+            "path": str(Path(self.temp.name) / "external.jsonl"),
+        }
+        self.app.db.execute(
+            "INSERT INTO sessions (id,task_id,status,attempt,command,started_at) VALUES (?,?,?,?,?,?)",
+            (external["session_id"], task_id, "running", 1, "external", self.app.now()),
+        )
+        self.app.register_external_turn(task_id, external)
+        try:
+            with mock.patch.object(self.app, "interrupt_rollout_writers"), \
+                 mock.patch.object(self.app, "broadcast_task", new=mock.AsyncMock()), \
+                 mock.patch.object(self.app, "broadcast_overview", new=mock.AsyncMock()):
+                result = asyncio.run(self.app.stop_task_run(task_id))
+            self.assertEqual("stopped", result["status"])
+            self.assertIsNone(result["active_session_id"])
+            self.assertEqual("", result["last_error"])
+            session = self.app.db.one("SELECT status FROM sessions WHERE id=?", (external["session_id"],))
+            self.assertEqual("stopped", session["status"])
+        finally:
+            self.app.clear_external_turns(task_id)
+            self.app.db.execute("DELETE FROM sessions WHERE task_id=?", (task_id,))
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
     def test_one_task_stays_running_until_all_terminal_turns_finish(self):
         task_id = "shared-thread"
@@ -1546,6 +1939,20 @@ process.stdout.write(JSON.stringify(merged.map(item => JSON.parse(item.payload).
             self.assertEqual("active", guarded["goal_status"])
             self.assertEqual(7, guarded["goal_tokens_used"])
 
+            notification["params"]["goal"] = {
+                "objective": "dashboard objective",
+                "status": "paused",
+                "tokensUsed": 8,
+            }
+            self.app.goal_staging_tasks.add(task_id)
+            with mock.patch.object(self.app, "duplicate_live_event", return_value=False), \
+                 mock.patch.object(self.app, "broadcast_task", new=mock.AsyncMock()):
+                asyncio.run(self.app.handle_appserver_notification(server_key, notification))
+            staged = self.app.task_or_404(task_id)
+            self.assertEqual("active", staged["goal_status"])
+            self.assertEqual(8, staged["goal_tokens_used"])
+            self.app.goal_staging_tasks.discard(task_id)
+
             script = f"""
 const fs = require("fs");
 const vm = require("vm");
@@ -1565,6 +1972,7 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
             result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
             self.assertEqual(["visible user message"], json.loads(result.stdout))
         finally:
+            self.app.goal_staging_tasks.discard(task_id)
             self.app.app_thread_bindings.pop(task_id, None)
             self.app.db.execute("DELETE FROM events WHERE session_id=?", (session_id,))
             self.app.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
@@ -1646,7 +2054,7 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
         conversation = (worker.parent / "conversation.js").read_text(encoding="utf-8")
         html = (worker.parent / "index.html").read_text(encoding="utf-8")
         self.assertIn('/chat-worker.js?v=20260821-stream-markdown-preview', conversation)
-        self.assertIn('/conversation.js?v=20260824-session-drafts-file-preview', html)
+        self.assertIn('/conversation.js?v=20260825-fast-conversation-load', html)
 
     def test_worker_keeps_distinct_agent_items_in_separate_markdown_blocks(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -2154,7 +2562,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn('data-activity-output-key="${esc(outputKey)}"', conversation)
         self.assertIn("Object.prototype.hasOwnProperty.call(state.activityOutputOpen, outputKey)", conversation)
         self.assertIn("state.activityOutputOpen[output.dataset.activityOutputKey] = output.open", conversation)
-        self.assertIn('/conversation.js?v=20260824-session-drafts-file-preview', html)
+        self.assertIn('/conversation.js?v=20260825-fast-conversation-load', html)
 
     def test_message_history_skips_activity_only_pages(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -2210,7 +2618,7 @@ const cursors = [];
         self.assertIn("HistoryPagination.fetchEarlierTimelinePages", conversation)
         self.assertIn("messageTarget: 12, maxPages: 8", conversation)
         self.assertIn('/history-pagination.js?v=20260817-message-history', html)
-        self.assertIn('/conversation.js?v=20260824-session-drafts-file-preview', html)
+        self.assertIn('/conversation.js?v=20260825-fast-conversation-load', html)
 
     def test_sent_browser_messages_follow_the_loaded_timeline_boundary(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -2737,7 +3145,7 @@ process.stdout.write(JSON.stringify(browserMessages));
         task_id = "clear-native-goal-thread"
         self.make_task(task_id, "available")
         self.app.db.execute(
-            "UPDATE tasks SET goal='old goal',goal_status='active',retry_forever=1,codex_session_id=? WHERE id=?",
+            "UPDATE tasks SET goal='old goal',goal_status='paused',retry_forever=0,codex_session_id=? WHERE id=?",
             (task_id, task_id),
         )
 
@@ -2759,6 +3167,30 @@ process.stdout.write(JSON.stringify(browserMessages));
             self.assertFalse(result["retry_forever"])
             self.assertEqual(0, result["goal_tokens_used"])
             self.assertEqual(1, result["goal_revision"])
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_editing_a_completed_goal_moves_it_to_paused_with_retry_off(self):
+        task_id = "edit-completed-goal-thread"
+        self.make_task(task_id, "available")
+        self.app.db.execute(
+            "UPDATE tasks SET goal='old completed goal',goal_status='complete',retry_forever=0,codex_session_id=? WHERE id=?",
+            (task_id, task_id),
+        )
+
+        class FakeClient:
+            async def request(self, method, params):
+                if method == "thread/goal/update":
+                    return {"goal": {"objective": params["objective"], "status": params["status"], "tokensUsed": 0}}
+                return {}
+
+        try:
+            with mock.patch.object(self.app, "appserver_for_task", new=mock.AsyncMock(return_value=(FakeClient(), None))):
+                result = asyncio.run(self.app.patch_goal(task_id, self.app.GoalPatch(objective="revised goal"), None))
+            self.assertEqual("revised goal", result["goal"])
+            self.assertEqual("paused", result["goal_status"])
+            self.assertFalse(result["retry_forever"])
+            self.assertEqual("start", result["interaction"]["goalAction"])
         finally:
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
@@ -2799,9 +3231,49 @@ process.stdout.write(JSON.stringify(browserMessages));
                 result = asyncio.run(self.app.start_goal(task_id, None))
             self.assertEqual("active", self.app.task_or_404(task_id)["goal_status"])
             self.assertEqual(5, self.app.task_or_404(task_id)["goal_revision"])
-            self.assertEqual("latest objective", sync.await_args.args[0]["goal"])
+            sync.assert_not_awaited()
             launch.assert_awaited_once_with(task_id, "goal-resume")
             self.assertEqual("goal_resume", result["run_mode"])
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_goal_actions_are_serialized_per_task(self):
+        task_id = "serialized-goal-actions"
+        self.make_task(task_id, "available")
+        active = 0
+        max_active = 0
+
+        async def fake_start(_task_id):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.02)
+            active -= 1
+            return {"id": task_id}
+
+        async def exercise():
+            with mock.patch.object(self.app, "_start_goal", new=mock.AsyncMock(side_effect=fake_start)) as start:
+                await asyncio.gather(
+                    self.app.start_goal(task_id, None),
+                    self.app.start_goal(task_id, None),
+                )
+            self.assertEqual(2, start.await_count)
+            self.assertEqual(1, max_active)
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_provider_cannot_change_while_task_has_a_writer(self):
+        task_id = "provider-change-active-writer"
+        self.make_task(task_id, "running")
+        try:
+            with mock.patch.object(self.app, "dashboard_owns_task", return_value=True):
+                with self.assertRaises(self.app.HTTPException) as raised:
+                    asyncio.run(self.app.patch_task(task_id, self.app.TaskPatch(provider_id="other-provider"), None))
+            self.assertEqual(409, raised.exception.status_code)
+            self.assertIn("before changing its provider", raised.exception.detail)
         finally:
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
@@ -2876,13 +3348,13 @@ process.stdout.write(JSON.stringify(browserMessages));
 
     def test_manual_turn_completion_honors_goal_start_takeover(self):
         source = Path(self.app.__file__).read_text(encoding="utf-8")
-        self.assertIn('and goal_task.get("run_mode") == "goal_resume"', source)
+        self.assertIn('and goal_should_run(goal_task)', source)
         self.assertIn('launch_after_turn_cleanup(task["id"], "goal-resume"', source)
 
     def test_goal_pause_pauses_goal_and_stops_conversation(self):
         task_id = "atomic-goal-pause"
         self.make_task(task_id, "running")
-        self.app.db.execute("UPDATE tasks SET goal='ship it',goal_status='active',retry_forever=1,goal_revision=2 WHERE id=?", (task_id,))
+        self.app.db.execute("UPDATE tasks SET goal='ship it',goal_status='active',retry_forever=0,goal_revision=2 WHERE id=?", (task_id,))
         try:
             with (
                 mock.patch.object(self.app, "sync_current_goal", new=mock.AsyncMock(return_value="")),
@@ -2897,10 +3369,58 @@ process.stdout.write(JSON.stringify(browserMessages));
         finally:
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
+    def test_goal_pause_api_rejects_active_auto_resume_until_retry_is_disabled(self):
+        task_id = "goal-pause-retry-on"
+        self.make_task(task_id, "running")
+        self.app.db.execute(
+            "UPDATE tasks SET goal='active goal',goal_status='active',retry_forever=1 WHERE id=?",
+            (task_id,),
+        )
+        try:
+            with mock.patch.object(self.app, "release_completed_dashboard_owner", new=mock.AsyncMock()):
+                with self.assertRaises(self.app.HTTPException) as raised:
+                    asyncio.run(self.app.pause_goal(task_id, None))
+            self.assertEqual(409, raised.exception.status_code)
+            task = self.app.task_or_404(task_id)
+            self.assertEqual("active", task["goal_status"])
+            self.assertTrue(task["retry_forever"])
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_goal_pause_clears_stale_session_binding_when_task_is_available(self):
+        task_id = "goal-pause-stale-binding"
+        self.make_task(task_id, "available", active_session_id="stale-session")
+        self.app.db.execute(
+            "UPDATE tasks SET goal='continue normally',goal_status='active',execution_source='dashboard',execution_turn_id='stale-turn' WHERE id=?",
+            (task_id,),
+        )
+        try:
+            async def fake_stop(actual_task_id, pause_goal=False):
+                self.assertEqual(task_id, actual_task_id)
+                self.assertFalse(pause_goal)
+                self.app.db.execute(
+                    "UPDATE tasks SET active_session_id=NULL,execution_source='',execution_turn_id='',run_mode='' WHERE id=?",
+                    (task_id,),
+                )
+                return self.app.task_or_404(task_id)
+
+            with (
+                mock.patch.object(self.app, "sync_current_goal", new=mock.AsyncMock(return_value="")),
+                mock.patch.object(self.app, "stop_task_run", new=mock.AsyncMock(side_effect=fake_stop)) as stop,
+                mock.patch.object(self.app, "broadcast_task", new=mock.AsyncMock()),
+                mock.patch.object(self.app, "broadcast_overview", new=mock.AsyncMock()),
+            ):
+                result = asyncio.run(self.app.pause_goal(task_id, None))
+            self.assertEqual("paused", result["goal_status"])
+            self.assertIsNone(result["active_session_id"])
+            stop.assert_not_awaited()
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
     def test_conversation_stop_pauses_goal_even_when_turn_is_already_stopped(self):
         task_id = "conversation-stop-pauses-goal"
         self.make_task(task_id, "available")
-        self.app.db.execute("UPDATE tasks SET goal='ship it',goal_status='active',retry_forever=1 WHERE id=?", (task_id,))
+        self.app.db.execute("UPDATE tasks SET goal='ship it',goal_status='active',retry_forever=1,last_error='old failure' WHERE id=?", (task_id,))
         try:
             with (
                 mock.patch.object(self.app, "broadcast_task", new=mock.AsyncMock()),
@@ -2909,6 +3429,7 @@ process.stdout.write(JSON.stringify(browserMessages));
                 result = asyncio.run(self.app.stop_task_run(task_id))
             self.assertEqual("paused", result["goal_status"])
             self.assertFalse(result["retry_forever"])
+            self.assertEqual("", result["last_error"])
         finally:
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
@@ -3315,6 +3836,84 @@ process.stdout.write(JSON.stringify([
 
         asyncio.run(exercise())
 
+    def test_unset_task_provider_resolves_to_the_same_effective_provider_everywhere(self):
+        task = {"id": "providerless-thread", "provider_id": None, "ssh_host": ""}
+        provider = {"id": "effective-default"}
+        with mock.patch.object(self.app, "provider_rows", return_value=[provider]):
+            self.assertIs(provider, self.app.provider_for_task(task))
+            self.assertEqual(
+                self.app.appserver_key(provider, task),
+                self.app.appserver_key(self.app.provider_for_task(task), task),
+            )
+
+    def test_appserver_removes_alternate_provider_keys_for_the_same_task(self):
+        task = {"id": "one-writer-thread", "provider_id": None, "ssh_host": ""}
+        desired = {"id": "effective-provider"}
+        stale_key = self.app.appserver_key(None, task)
+        desired_key = self.app.appserver_key(desired, task)
+
+        class Client:
+            closed = False
+
+            async def close(inner_self):
+                inner_self.closed = True
+
+        stale_client = Client()
+
+        async def exercise():
+            self.app.app_servers[stale_key] = stale_client
+            self.app.app_thread_bindings[task["id"]] = (stale_key, task["id"], "old-session")
+            with mock.patch.object(self.app, "provider_rows", return_value=[desired]), \
+                 mock.patch.object(self.app, "stop_persistent_appserver", new=mock.AsyncMock()) as stop:
+                await self.app.remove_stale_task_appservers(task, desired_key)
+            self.assertTrue(stale_client.closed)
+            self.assertNotIn(stale_key, self.app.app_servers)
+            self.assertNotIn(task["id"], self.app.app_thread_bindings)
+            stopped = {call.args[0] for call in stop.await_args_list}
+            self.assertIn(stale_key, stopped)
+            self.assertNotIn(desired_key, stopped)
+
+        asyncio.run(exercise())
+
+    def test_permanent_delete_releases_task_appserver(self):
+        task_id = "deleted-task-appserver"
+        self.make_task(task_id, "trashed")
+        self.app.db.execute(
+            "UPDATE tasks SET trashed=1,codex_session_id='' WHERE id=?",
+            (task_id,),
+        )
+        with mock.patch.object(self.app, "provider_rows", return_value=[]), \
+             mock.patch.object(self.app, "close_task_appserver", new=mock.AsyncMock()) as close, \
+             mock.patch.object(self.app, "stop_persistent_appserver", new=mock.AsyncMock()) as stop, \
+             mock.patch.object(self.app, "broadcast_overview_removed", new=mock.AsyncMock()):
+            result = asyncio.run(self.app.permanently_delete_trash(task_id, None))
+        self.assertTrue(result["deleted"])
+        close.assert_awaited_once()
+        stop.assert_awaited_once()
+        self.assertIsNone(self.app.db.one("SELECT id FROM tasks WHERE id=?", (task_id,)))
+
+    def test_launch_persists_effective_provider_before_opening_appserver(self):
+        task_id = "persist-effective-provider"
+        self.make_task(task_id, "available")
+        provider = {"id": "effective-provider", "name": "Effective"}
+
+        async def fake_launch_appserver(task, selected, *_args):
+            self.assertEqual(provider["id"], selected["id"])
+            self.assertEqual(provider["id"], task["provider_id"])
+            return task | {"status": "running"}
+
+        try:
+            with mock.patch.object(self.app, "provider_rows", return_value=[provider]), \
+                 mock.patch.object(self.app, "refresh_live_external_turn", new=mock.AsyncMock(return_value=False)), \
+                 mock.patch.object(self.app, "dashboard_owns_task", return_value=False), \
+                 mock.patch.object(self.app, "require_codex"), \
+                 mock.patch.object(self.app, "launch_appserver", new=mock.AsyncMock(side_effect=fake_launch_appserver)), \
+                 mock.patch.object(self.app, "broadcast_overview", new=mock.AsyncMock()):
+                asyncio.run(self.app.launch(task_id, "resume"))
+            self.assertEqual(provider["id"], self.app.task_or_404(task_id)["provider_id"])
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
     def test_remote_thread_fork_keeps_ssh_host_and_workspace(self):
         task_id = "remote-fork-source"
         self.make_task(task_id, "available")
@@ -3448,7 +4047,7 @@ process.stdout.write(JSON.stringify([
         finally:
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
-    def test_auto_retry_exposes_unfinished_goal_as_active(self):
+    def test_auto_retry_preserves_real_unfinished_goal_status(self):
         task_id = "auto-retry-public-goal-status"
         self.make_task(task_id, "stopped")
         self.app.db.execute(
@@ -3456,10 +4055,10 @@ process.stdout.write(JSON.stringify([
             ("Keep working", task_id),
         )
         try:
-            self.assertEqual("active", self.app.task_or_404(task_id)["goal_status"])
-            self.assertEqual("active", self.app.task_summary(task_id)["goal_status"])
+            self.assertEqual("blocked", self.app.task_or_404(task_id)["goal_status"])
+            self.assertEqual("blocked", self.app.task_summary(task_id)["goal_status"])
             listed = asyncio.run(self.app.list_tasks(None))
-            self.assertEqual("active", next(row for row in listed if row["id"] == task_id)["goal_status"])
+            self.assertEqual("blocked", next(row for row in listed if row["id"] == task_id)["goal_status"])
             raw = self.app.db.one("SELECT goal_status FROM tasks WHERE id=?", (task_id,))
             self.assertEqual("blocked", raw["goal_status"])
             self.app.db.execute("UPDATE tasks SET goal_status='complete' WHERE id=?", (task_id,))
@@ -3701,9 +4300,9 @@ process.stdout.write(JSON.stringify([
         self.assertIn('disabled title="${esc(uiLabel("protectedSkillDelete"))}"', settings)
         self.assertIn(".panel-item button.danger-text:not(:disabled)", styles)
         self.assertNotIn(".panel-item button:last-child", styles)
-        self.assertIn('/styles.css?v=20260824-partner-update-confirm', html)
-        self.assertIn('/core.js?v=20260824-partner-update-confirm', html)
-        self.assertIn('/settings.js?v=20260824-partner-update-confirm', html)
+        self.assertIn('/styles.css?v=20260825-directed-ssh-login', html)
+        self.assertIn('/core.js?v=20260825-fast-conversation-load', html)
+        self.assertIn('/settings.js?v=20260825-directed-ssh-login', html)
 
     def test_provider_probe_status_and_endpoint_refresh(self):
         provider_id = f"provider-status-{os.getpid()}"
@@ -4151,13 +4750,16 @@ process.stdout.write(JSON.stringify([
             self.app.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
-    def test_startup_drain_does_not_launch_saved_auto_retry_goal(self):
-        retry_task = "startup-auto-retry-do-not-launch"
+    def test_startup_drain_launches_saved_active_goal_and_queued_message(self):
+        retry_task = "startup-active-goal-launch"
         queued_task = "startup-queued-message-launch"
+        stopped_queue_task = "startup-stopped-queue-waits"
         message_id = "startup-queued-message"
+        stopped_message_id = "startup-stopped-queued-message"
         stamp = self.app.now()
-        self.make_task(retry_task, "stopped")
-        self.make_task(queued_task, "stopped")
+        self.make_task(retry_task, "available")
+        self.make_task(queued_task, "available")
+        self.make_task(stopped_queue_task, "stopped")
         try:
             self.app.db.execute(
                 "UPDATE tasks SET goal='continue later',goal_status='active',retry_forever=1 WHERE id=?",
@@ -4167,12 +4769,17 @@ process.stdout.write(JSON.stringify([
                 "INSERT INTO task_messages (id,task_id,body,status,created_at) VALUES (?,?,?,?,?)",
                 (message_id, queued_task, "explicit queued input", "queued", stamp),
             )
+            self.app.db.execute(
+                "INSERT INTO task_messages (id,task_id,body,status,created_at) VALUES (?,?,?,?,?)",
+                (stopped_message_id, stopped_queue_task, "wait for resume", "queued", stamp),
+            )
             startup_ids = self.app.startup_drain_task_ids()
             self.assertIn(queued_task, startup_ids)
-            self.assertNotIn(retry_task, startup_ids)
+            self.assertIn(retry_task, startup_ids)
+            self.assertNotIn(stopped_queue_task, startup_ids)
         finally:
-            self.app.db.execute("DELETE FROM task_messages WHERE id=?", (message_id,))
-            self.app.db.execute("DELETE FROM tasks WHERE id IN (?,?)", (retry_task, queued_task))
+            self.app.db.execute("DELETE FROM task_messages WHERE id IN (?,?)", (message_id, stopped_message_id))
+            self.app.db.execute("DELETE FROM tasks WHERE id IN (?,?,?)", (retry_task, queued_task, stopped_queue_task))
 
     def test_port_configuration_rejects_invalid_values(self):
         with mock.patch.dict(os.environ, {"TEST_DASHBOARD_PORT": "9443"}):
@@ -4332,11 +4939,11 @@ process.stdout.write(JSON.stringify([
         self.assertIn('forkCreated ? "会话已复制，但打开副本失败" : "复制会话失败"', app_js)
         self.assertIn('uiLabel("sessionRenamed")', app_js)
         self.assertIn('uiLabel("sessionDuplicated")', app_js)
-        self.assertIn('/app.js?v=20260824-session-drafts-file-preview', html)
-        self.assertIn('/core.js?v=20260824-partner-update-confirm', html)
+        self.assertIn('/app.js?v=20260825-interaction-state-machine', html)
+        self.assertIn('/core.js?v=20260825-fast-conversation-load', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260824-session-drafts-file-preview', html)
+        self.assertIn('/conversation.js?v=20260825-fast-conversation-load', html)
         self.assertIn("/timeline?limit=120", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -4391,13 +4998,13 @@ process.stdout.write(JSON.stringify([
         database_py = (root / "codex_partner" / "database.py").read_text(encoding="utf-8")
         self.assertIn("function goalIsActive", conversation_js)
         self.assertIn('(task.goal_status || "none") === "active"', conversation_js)
-        self.assertIn("goalIsActive(task)", app_js)
-        self.assertIn('/goal/${goalActive ? "pause" : "start"}', app_js)
+        self.assertIn("interactionState(task)", app_js)
+        self.assertIn('controls.goalAction === "pause"', app_js)
         self.assertIn('active: "enabled"', conversation_js)
         self.assertIn('goalProgress.textContent = goalStatusLabel', conversation_js)
         self.assertIn('function goalStatusSummary', conversation_js)
         self.assertIn('function goalCanAutoResume', conversation_js)
-        self.assertIn('return retryForever || !["paused", "blocked"].includes(value)', conversation_js)
+        self.assertIn("function interactionState", conversation_js)
         self.assertIn('Goal 和会话已暂停', app_js)
         self.assertIn('${uiLabel("goalStatusPrefix")}：${goalStatusLabel', conversation_js)
         self.assertNotIn('statusLabel(task.status)}', conversation_js)
@@ -4424,8 +5031,15 @@ process.stdout.write(JSON.stringify([
         conversation_js = (static / "conversation.js").read_text(encoding="utf-8")
         html = (static / "index.html").read_text(encoding="utf-8")
         self.assertIn('id="ssh-login-dialog"', html)
+        self.assertNotIn('id="ssh-login-server"', html)
         self.assertIn("requestSSHLogin", core_js)
         self.assertIn('fetch("/api/auth/login"', core_js)
+        login_block = core_js[core_js.index("async function requestSSHLogin") : core_js.index("async function api")]
+        self.assertNotIn("location.hostname", login_block)
+        self.assertNotIn("/api/auth/status", login_block)
+        settings_js = (static / "settings.js").read_text(encoding="utf-8")
+        password_form = settings_js[settings_js.index("function openSSHPasswordForm") : settings_js.index("async function checkAllProviders")]
+        self.assertNotIn("item.hostname", password_form.split('$("#cancel")')[0])
         self.assertNotIn("codex-dashboard-token", core_js + conversation_js)
         self.assertNotIn("?token=", conversation_js)
 
@@ -4540,7 +5154,8 @@ process.stdout.write(JSON.stringify([
         self.assertIn('button.dataset.dispatching === "1"', app_js)
         self.assertIn("result.dispatch_error", app_js)
         self.assertIn('const delivery = activeTurn && !takeoverTerminal ? "queue" : "auto"', app_js)
-        self.assertIn('const steerCurrentTurn = mode === "steer" && activeTurn && !terminalActive', app_js)
+        self.assertIn('const steerCurrentTurn = mode === "steer"', app_js)
+        self.assertIn('state.selectedTask?.execution_source === "dashboard"', app_js)
         self.assertIn('steerCurrentTurn ? `/tasks/${taskId}/steer` : `/tasks/${taskId}/messages`', app_js)
         self.assertIn('await submitMessage("steer")', app_js)
         self.assertNotIn('await submitMessage("queue")', app_js)
@@ -4589,12 +5204,12 @@ process.stdout.write(JSON.stringify([
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260824-session-drafts-file-preview', html)
+        self.assertIn('/conversation.js?v=20260825-fast-conversation-load', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
-        self.assertIn('/app.js?v=20260824-session-drafts-file-preview', html)
+        self.assertIn('/app.js?v=20260825-interaction-state-machine', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
-        self.assertIn('/styles.css?v=20260824-partner-update-confirm', html)
+        self.assertIn('/styles.css?v=20260825-directed-ssh-login', html)
         self.assertIn('/vendor/katex/katex.min.css', html)
         self.assertIn('<span id="goal-run-label">暂停</span>', html)
         self.assertNotIn('id="goal-run-label" class="sr-only"', html)
@@ -4659,7 +5274,7 @@ process.stdout.write(JSON.stringify([
         self.assertIn('const sessionList = $("#task-list")', conversation)
         self.assertIn("void selectSession(pointerSelectedSessionId)", conversation)
         self.assertIn('aria-current="${selected ? "true" : "false"}"', conversation)
-        self.assertIn('/conversation.js?v=20260824-session-drafts-file-preview', html)
+        self.assertIn('/conversation.js?v=20260825-fast-conversation-load', html)
 
     def test_live_chat_rendering_coalesces_expensive_work(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -4686,8 +5301,8 @@ process.stdout.write(JSON.stringify([
         socket_start = conversation.index("if (openSocket) connectSocket(id)", select_start)
         timeline_wait = conversation.index("timeline = await timelinePromise", select_start)
         self.assertLess(socket_start, timeline_wait)
-        self.assertIn('/core.js?v=20260824-partner-update-confirm', html)
-        self.assertIn('/conversation.js?v=20260824-session-drafts-file-preview', html)
+        self.assertIn('/core.js?v=20260825-fast-conversation-load', html)
+        self.assertIn('/conversation.js?v=20260825-fast-conversation-load', html)
         styles = (static / "styles.css").read_text(encoding="utf-8")
         app_js = (static / "app.js").read_text(encoding="utf-8")
         self.assertNotIn("content-visibility: auto", styles)
@@ -4706,8 +5321,8 @@ process.stdout.write(JSON.stringify([
         self.assertIn("if (chatIsNearBottom(stream))", conversation)
         self.assertNotIn("stream.scrollTop = target * state.chatAverageHeight", conversation)
         self.assertIn("function syncPageVisibility", app_js)
-        self.assertIn('/styles.css?v=20260824-partner-update-confirm', html)
-        self.assertIn('/app.js?v=20260824-session-drafts-file-preview', html)
+        self.assertIn('/styles.css?v=20260825-directed-ssh-login', html)
+        self.assertIn('/app.js?v=20260825-interaction-state-machine', html)
 
     def test_optimistic_queue_messages_survive_authoritative_refresh(self):
         static = Path(__file__).resolve().parents[1] / "static"

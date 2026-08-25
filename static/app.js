@@ -275,6 +275,11 @@ async function submitMessage(mode = "codex") {
   const activeTurn = ["running", "retrying", "queued"].includes(state.selectedTask?.status);
   if (!message && !pendingAttachments.length) {
     if (mode === "codex" && activeTurn && !state.editingQueuedId) {
+      const controls = interactionState(state.selectedTask);
+      if (controls.goalStatus === "active" && controls.retryOn) {
+        const confirmed = await appConfirm(uiLabel("stopActiveGoalConfirm"), { danger: true });
+        if (!confirmed) return;
+      }
       await changeSelectedRun("stop");
     }
     return;
@@ -306,7 +311,10 @@ async function submitMessage(mode = "codex") {
   }
   let takeoverTerminal = false;
   const terminalActive = Boolean(state.selectedTask?.external_running) && state.selectedTask?.execution_source === "terminal";
-  const steerCurrentTurn = mode === "steer" && activeTurn && !terminalActive;
+  const steerCurrentTurn = mode === "steer"
+    && ["running", "retrying"].includes(state.selectedTask?.status)
+    && state.selectedTask?.execution_source === "dashboard"
+    && !terminalActive;
   if (mode === "steer" && terminalActive) {
     takeoverTerminal = await appConfirm(uiLabel("terminalTakeoverConfirm"), { danger: true, confirmLabel: uiLabel("terminalTakeoverAction") });
     if (!takeoverTerminal) return;
@@ -392,14 +400,20 @@ async function changeSelectedRun(action, announce = true) {
 async function toggleGoalRun() {
   const task = state.selectedTask;
   const goal = String(task?.goal || "").trim();
-  if (!task || !state.selectedId || !goal) return toast("请先设置 Goal");
-  const goalActive = goalIsActive(task);
-  if (goalActive && task.retry_forever) return toast(uiLabel("goalPauseRetryEnabled"));
+  if (!task || !state.selectedId) return;
+  const controls = interactionState(task);
+  if (controls.goalAction === "set") return openGoalEditor();
+  if (!controls.goalActionEnabled) return toast(controls.goalActionDisabledReason === "disable_retry" ? uiLabel("goalPauseRetryEnabled") : uiLabel("recoveringGoal"));
+  const goalActive = controls.goalAction === "pause";
+  const button = $("#goal-run-toggle");
+  button.disabled = true;
+  $("#goal-run-icon").textContent = "↻";
+  $("#goal-run-label").textContent = goalActive ? "暂停中…" : uiLabel("startingGoal");
   try {
     const updated = await api(`/tasks/${state.selectedId}/goal/${goalActive ? "pause" : "start"}`, { method: "POST" });
     state.selectedTask = { ...state.selectedTask, ...updated }; mergeTask(updated); renderConversation();
     toast(updated.goal_sync_error || (goalActive ? "Goal 和会话已暂停" : "Goal 和会话已启动"));
-  } catch (error) { toast(error.message); }
+  } catch (error) { toast(error.message); renderGoalBar(); }
 }
 $("#goal-run-toggle").onclick = toggleGoalRun;
 $("#goal-retry-toggle").onclick = async () => {

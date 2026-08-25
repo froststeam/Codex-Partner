@@ -377,6 +377,26 @@ function goalCanAutoResume(status, retryForever = false) {
   if (["complete", "none"].includes(value)) return false;
   return retryForever || !["paused", "blocked"].includes(value);
 }
+function interactionState(task) {
+  if (task?.interaction) return task.interaction;
+  const goal = String(task?.goal || "").trim();
+  const goalStatus = goal ? (task.goal_status || "paused") : "none";
+  const sessionBusy = ["running", "queued", "retrying"].includes(task?.status) || Boolean(task?.external_running);
+  const retryOn = Boolean(goal && goalStatus !== "complete" && task?.retry_forever);
+  let goalAction = !goal ? "set" : goalStatus === "active" ? "pause" : goalStatus === "blocked" ? "continue" : goalStatus === "complete" ? "restart" : "start";
+  if (goalStatus === "active" && !sessionBusy) goalAction = "starting";
+  else if (goalStatus === "active" && task?.status === "queued" && task?.run_mode === "goal_resume") goalAction = "starting";
+  else if (["paused", "blocked", "planned"].includes(goalStatus) && retryOn) goalAction = "recovering";
+  return {
+    goalStatus, goalAction, retryOn, sessionBusy,
+    composerAction: sessionBusy ? "pause" : "send",
+    goalActionEnabled: !["starting", "pausing", "recovering"].includes(goalAction) && !(goalAction === "pause" && retryOn),
+    goalActionDisabledReason: goalAction === "pause" && retryOn ? "disable_retry" : "",
+    goalEditEnabled: Boolean(goal && !["starting", "recovering"].includes(goalAction)),
+    goalClearEnabled: Boolean(goal && goalStatus !== "active" && !["starting", "recovering"].includes(goalAction)),
+    retryEnabled: Boolean(goal && goalStatus !== "complete" && !["starting", "recovering"].includes(goalAction)),
+  };
+}
 function goalIsActive(task) {
   return Boolean(String(task?.goal || "").trim()) && (task.goal_status || "none") === "active";
 }
@@ -386,29 +406,29 @@ function renderGoalBar() {
   if (!task) { bar.hidden = true; return; }
   bar.hidden = false;
   const goal = String(task.goal || "").trim();
-  const activeTurn = ["running", "retrying", "queued"].includes(task.status);
-  const goalActive = goalIsActive(task);
+  const controls = interactionState(task);
+  const activeTurn = controls.sessionBusy;
+  const goalActive = controls.goalStatus === "active";
   const inputHasContent = Boolean($("#message-input")?.value.trim() || pendingAttachments.length);
   $("#goal-text").textContent = goal;
   $("#goal-text").classList.toggle("empty", !goal);
-  $("#goal-task-status").textContent = goalStatusSummary(task, goal);
-  $("#goal-run-toggle").classList.toggle("active", goalActive);
-  const goalPauseBlocked = goalActive && Boolean(task.retry_forever);
-  $("#goal-run-toggle").disabled = !goal || goalPauseBlocked;
-  $("#goal-run-toggle").title = !goal
-    ? uiLabel("setGoal")
-    : goalPauseBlocked
-      ? uiLabel("goalPauseRetryEnabled")
-      : (goalActive ? uiLabel("goalPause") : uiLabel("goalStart"));
+  $("#goal-task-status").textContent = `${uiLabel("goalStatusPrefix")}：${goalStatusLabel(controls.goalStatus)}`;
+  $("#goal-run-toggle").classList.toggle("active", controls.goalAction === "pause");
+  $("#goal-run-toggle").disabled = !controls.goalActionEnabled;
+  const actionLabels = { set: "setGoal", start: "start", pause: "pause", continue: "continueGoal", restart: "restartGoal", starting: "startingGoal", recovering: "recoveringGoal", pausing: "pause" };
+  const actionLabel = uiLabel(actionLabels[controls.goalAction] || "start");
+  $("#goal-run-toggle").title = controls.goalActionDisabledReason === "disable_retry" ? uiLabel("goalPauseRetryEnabled") : actionLabel;
   $("#goal-run-toggle").setAttribute("aria-label", $("#goal-run-toggle").title);
-  $("#goal-run-icon").textContent = goalActive ? "Ⅱ" : "▶";
-  $("#goal-run-label").textContent = goalActive ? uiLabel("pause") : uiLabel("start");
+  $("#goal-run-icon").textContent = controls.goalAction === "pause" ? "Ⅱ" : controls.goalAction === "set" ? "+" : ["starting", "recovering"].includes(controls.goalAction) ? "↻" : "▶";
+  $("#goal-run-label").textContent = actionLabel;
+  $("#goal-edit").disabled = !controls.goalEditEnabled;
+  $("#goal-clear").disabled = !controls.goalClearEnabled;
   const retryToggle = $("#goal-retry-toggle");
-  retryToggle.disabled = !goal;
-  retryToggle.classList.toggle("active", Boolean(goal && task.retry_forever));
-  retryToggle.title = goal ? (task.retry_forever ? uiLabel("retryOff") : uiLabel("retryOn")) : uiLabel("setGoal");
+  retryToggle.disabled = !controls.retryEnabled;
+  retryToggle.classList.toggle("active", controls.retryOn);
+  retryToggle.title = goal ? (controls.retryOn ? uiLabel("retryOff") : uiLabel("retryOn")) : uiLabel("setGoal");
   retryToggle.setAttribute("aria-label", retryToggle.title);
-  $("#goal-retry-label").textContent = goal && task.retry_forever ? uiLabel("on") : uiLabel("off");
+  $("#goal-retry-label").textContent = controls.retryOn ? uiLabel("on") : uiLabel("off");
   const liveState = $("#composer-live-state");
   liveState.className = `composer-live-state ${esc(task.status || "available")}`;
   $("#composer-live-state span").textContent = statusLabel(task.status);
