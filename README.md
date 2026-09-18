@@ -21,6 +21,7 @@ Codex Partner is a self-hosted control panel for long-running Codex work. It kee
 - Codex memories, Skills, archive, recycle bin, and SSH workspace support
 - Default YOLO mode for newly created sessions
 - Explicit delivery controls: `Enter` queues behind a running turn, `Alt+Enter` inserts into the current dashboard turn, and terminal takeover always asks before stopping terminal work
+- External thread-owner indicator: when a Codex process this dashboard did not start still holds a thread's writer lock, the session is marked, retries stop instead of looping, and one click can send it `SIGTERM` so the dashboard takes the thread over
 
 ## Platform support
 

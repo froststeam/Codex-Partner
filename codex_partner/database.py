@@ -181,6 +181,7 @@ class Database:
             "execution_turn_id": "TEXT DEFAULT ''",
             "run_mode": "TEXT DEFAULT ''",
             "ssh_host": "TEXT DEFAULT ''",
+            "foreign_writer": "TEXT DEFAULT ''",
         }
         for column, definition in task_migrations.items():
             if column not in task_columns:

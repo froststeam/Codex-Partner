@@ -31,7 +31,7 @@ function renderSidebarStats() {
 function renderSessionList() {
   const list = $("#task-list"); const tasks = sortTasks(state.tasks.filter(taskMatches));
   if (!tasks.length) { list.innerHTML = `<div class="empty">${state.query ? "没有匹配的会话" : "还没有 Codex 会话"}</div>`; return; }
-  list.innerHTML = tasks.map(task => { const active = taskIsRunningGroup(task); const selected = task.id === state.selectedId; const name = task.name || t("sessions"); const stateText = statusLabel(task.status); return `<button class="session-card ${selected ? "selected" : ""} ${active ? "running" : "paused"}" data-session-id="${esc(task.id)}" title="${esc(name)} · ${esc(stateText)}" aria-label="${esc(name)} · ${esc(stateText)}" aria-current="${selected ? "true" : "false"}"><span class="session-card-body"><strong title="${esc(name)}">${esc(name)}</strong><time class="session-card-time">${esc(shortDate(task.updated_at))}</time></span></button>`; }).join("");
+  list.innerHTML = tasks.map(task => { const active = taskIsRunningGroup(task); const selected = task.id === state.selectedId; const name = task.name || t("sessions"); const ownerActive = Boolean(task.foreign_writer_active); const stateText = statusLabel(task.status); const cardTitle = ownerActive ? `${name} · ${stateText} · ${uiLabel("foreignWriterSessionTitle")}` : `${name} · ${stateText}`; return `<button class="session-card ${selected ? "selected" : ""} ${active ? "running" : "paused"} ${ownerActive ? "foreign-owned" : ""}" data-session-id="${esc(task.id)}" title="${esc(cardTitle)}" aria-label="${esc(cardTitle)}" aria-current="${selected ? "true" : "false"}"><span class="session-card-body"><strong title="${esc(name)}">${esc(name)}</strong><time class="session-card-time">${esc(shortDate(task.updated_at))}</time></span>${ownerActive ? `<span class="session-owner-badge" title="${esc(uiLabel("foreignWriterSessionTitle"))}" aria-label="${esc(uiLabel("foreignWriterSessionTitle"))}">🔒 ${esc(uiLabel("foreignWriterShort"))}</span>` : ""}</button>`; }).join("");
 }
 
 let pointerSelectedSessionId = "";
@@ -80,7 +80,7 @@ async function syncQueuedMessages() {
     queueSyncInFlight = false;
   }
 }
-function showEmptyConversation() { if (terminalTaskId) destroyTerminal(); stopQueueSync(); state.sessionAbortController?.abort(); state.sessionAbortController = null; state.editingQueuedId = null; state.pendingApprovals = []; state.inspectorClosed = true; state.explorationNodes = []; state.explorationEdges = []; state.explorationEvents = []; state.explorationPrecomputed = false; state.explorationRequestId += 1; if (typeof closeExplorationMap === "function") closeExplorationMap(); $("#empty-conversation").hidden = false; $("#conversation-view").hidden = true; $("#goal-bar").hidden = true; $("#queued-messages").hidden = true; $("#approval-center").hidden = true; setInspectorOpen(false); }
+function showEmptyConversation() { if (terminalTaskId) destroyTerminal(); stopQueueSync(); state.sessionAbortController?.abort(); state.sessionAbortController = null; state.editingQueuedId = null; state.pendingApprovals = []; state.inspectorClosed = true; state.explorationNodes = []; state.explorationEdges = []; state.explorationEvents = []; state.explorationPrecomputed = false; state.explorationRequestId += 1; if (typeof closeExplorationMap === "function") closeExplorationMap(); $("#empty-conversation").hidden = false; $("#conversation-view").hidden = true; $("#goal-bar").hidden = true; $("#queued-messages").hidden = true; $("#approval-center").hidden = true; $("#thread-owner-alert").hidden = true; setInspectorOpen(false); }
 function resetWorkspaceBrowser() {
   state.workspacePath = "";
   state.workspaceFile = null;
@@ -218,6 +218,7 @@ function renderConversation(renderMessages = true) {
   renderTurnProgress();
   renderGoalBar();
   renderApprovalCenter();
+  renderThreadOwnerAlert();
   refreshComposerHistory();
   renderQueuedMessages();
   if (renderMessages) renderChat();
@@ -439,6 +440,17 @@ function renderGoalBar() {
   $("#send-codex").querySelector("span:last-child").textContent = stopping ? "■" : "↑";
   $("#send-codex").title = state.editingQueuedId ? uiLabel("saveQueued") : (stopping ? uiLabel("stopCodex") : uiLabel("startCodex"));
   $("#message-input").placeholder = state.editingQueuedId ? uiLabel("editQueued") : t("composerPlaceholder");
+}
+function renderThreadOwnerAlert() {
+  const node = $("#thread-owner-alert");
+  if (!node) return;
+  const task = state.selectedTask || {};
+  const pids = Array.isArray(task.foreign_writer_pids) ? task.foreign_writer_pids : [];
+  if (!task.foreign_writer_active || !pids.length) { node.hidden = true; node.innerHTML = ""; return; }
+  const commands = Array.isArray(task.foreign_writer_commands) ? task.foreign_writer_commands : [];
+  const owners = pids.map((pid, index) => `<code>pid ${esc(String(pid))}${commands[index] ? ` · ${esc(commands[index])}` : ""}</code>`).join("");
+  node.hidden = false;
+  node.innerHTML = `<article class="thread-owner-card"><div class="thread-owner-copy"><div class="thread-owner-heading"><span aria-hidden="true">🔒</span><strong>${uiLabel("foreignWriterTitle")}</strong><small>${uiLabel("foreignWriterBadge")}</small></div><p>${uiLabel("foreignWriterBody")}</p><div class="thread-owner-owners">${owners}</div></div><div class="thread-owner-actions"><button type="button" class="thread-owner-action danger" id="thread-owner-takeover">${uiLabel("foreignWriterTakeover")}</button></div></article>`;
 }
 function renderQueuedMessages() {
   const strip = $("#queued-messages");

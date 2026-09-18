@@ -5043,6 +5043,247 @@ process.stdout.write(JSON.stringify([
         self.assertNotIn("codex-dashboard-token", core_js + conversation_js)
         self.assertNotIn("?token=", conversation_js)
 
+    def start_lock_holder(self, thread_id: str):
+        """Start a real process that holds one thread's Codex writer lock."""
+        lock = self.app.thread_writer_lock_path(thread_id)
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        holder = subprocess.Popen(
+            [sys.executable, "-c", "import sys,time;f=open(sys.argv[1],'w');time.sleep(60)", str(lock)],
+        )
+        for _ in range(100):
+            if lock.is_file() and self.app.rollout_writer_pids(str(lock), refresh=True):
+                return holder
+            time.sleep(0.05)
+        holder.terminate()
+        holder.wait()
+        self.fail("lock holder never appeared")
+
+    def insert_session(self, task_id: str, session_id: str) -> None:
+        self.app.db.execute(
+            "INSERT INTO sessions (id,task_id,status,attempt,command,started_at) VALUES (?,?,?,?,?,?)",
+            (session_id, task_id, "running", 1, "codex app-server turn/start", self.app.now()),
+        )
+
+    def test_foreign_thread_writers_only_report_processes_outside_the_dashboard(self):
+        thread_id = "external-owner-1"
+        holder = self.start_lock_holder(thread_id)
+        try:
+            writers = self.app.foreign_thread_writers(thread_id)
+            self.assertEqual([holder.pid], [writer["pid"] for writer in writers])
+            self.assertIn("time.sleep", writers[0]["command"])
+            self.assertEqual([], self.app.foreign_thread_writers("no-such-thread"))
+        finally:
+            holder.terminate()
+            holder.wait()
+
+    def test_foreign_writer_marker_survives_restarts_and_clears_when_the_process_exits(self):
+        task_id = "foreign-writer-marker"
+        self.make_task(task_id, "running")
+        state = self.app.persist_foreign_writer(task_id, [{"pid": os.getpid(), "command": "codex --yolo"}])
+        self.assertTrue(state["detected_at"])
+        snapshot = self.app.task_or_404(task_id)
+        self.assertTrue(snapshot["foreign_writer_active"])
+        self.assertEqual([os.getpid()], snapshot["foreign_writer_pids"])
+        self.assertEqual(["codex --yolo"], snapshot["foreign_writer_commands"])
+        # A process that already exited must clear the marker instead of pinning the badge.
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        self.app.persist_foreign_writer(task_id, [{"pid": dead.pid, "command": "codex"}])
+        snapshot = self.app.task_or_404(task_id)
+        self.assertFalse(snapshot["foreign_writer_active"])
+        self.assertEqual([], snapshot["foreign_writer_pids"])
+        self.assertEqual("", self.app.db.one("SELECT foreign_writer FROM tasks WHERE id=?", (task_id,))["foreign_writer"])
+        self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_foreign_writer_failure_marks_the_task_and_stops_retrying(self):
+        task_id = "foreign-writer-failure"
+        session_id = "foreign-writer-session"
+        message_id = "foreign-writer-message"
+        self.make_task(task_id, "running")
+        self.insert_session(task_id, session_id)
+        self.app.db.execute(
+            "UPDATE tasks SET retry_forever=1,goal='keep going',goal_status='active' WHERE id=?",
+            (task_id,),
+        )
+        task = self.app.task_or_404(task_id)
+        error = json.dumps({"code": -32600, "message": f"thread {task_id} already has an active writer"})
+        self.assertTrue(self.app.active_writer_error(error))
+        asyncio.run(self.app.fail_on_foreign_thread_writer(
+            task, task_id, session_id, message_id, error, [{"pid": os.getpid(), "command": "codex --yolo"}],
+        ))
+        row = self.app.db.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        self.assertEqual("failed", row["status"])
+        self.assertIn("owned by another Codex process", row["last_error"])
+        self.assertIn(f"pid {os.getpid()}", row["last_error"])
+        self.assertEqual("", row["execution_source"])
+        self.assertEqual("", row["run_mode"])
+        session = self.app.db.one("SELECT * FROM sessions WHERE id=?", (session_id,))
+        # Nothing was queued for another attempt: the writer can never be satisfied.
+        self.assertEqual("failed", session["status"])
+        self.assertTrue(self.app.task_or_404(task_id)["foreign_writer_active"])
+        self.app.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+        self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_supervise_turn_reports_an_external_writer_instead_of_looping(self):
+        task_id = "foreign-writer-supervisor"
+        session_id = "foreign-writer-supervisor-session"
+        self.make_task(task_id, "running")
+        self.insert_session(task_id, session_id)
+        self.app.db.execute(
+            "UPDATE tasks SET retry_forever=1,goal='keep going',goal_status='active',retry_count=7 WHERE id=?",
+            (task_id,),
+        )
+        task = self.app.task_or_404(task_id)
+        error = RuntimeError(json.dumps({"code": -32600, "message": "thread already has an active writer"}))
+        with mock.patch.object(self.app, "appserver_for", new=mock.AsyncMock(side_effect=error)), \
+             mock.patch.object(self.app, "foreign_thread_writers", return_value=[{"pid": os.getpid(), "command": "codex --yolo"}]), \
+             mock.patch.object(self.app, "launch_after_turn_cleanup", new=mock.AsyncMock()) as retry:
+            asyncio.run(self.app.supervise_appserver_turn(task, None, "message", "", "hello", "", session_id, set()))
+        retry.assert_not_awaited()
+        row = self.app.db.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        self.assertEqual("failed", row["status"])
+        self.assertIn("owned by another Codex process", row["last_error"])
+        self.assertIn(f"pid {os.getpid()}", row["last_error"])
+        # Goal auto-resume and the queue worker both stay parked on the marker.
+        self.assertTrue(self.app.task_or_404(task_id)["foreign_writer_active"])
+        self.assertEqual([], self.app.db.all("SELECT id FROM sessions WHERE task_id=? AND status!='failed'", (task_id,)))
+        self.app.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+        self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_any_codex_process_holding_a_thread_is_marked_without_a_failed_turn(self):
+        task_id = "foreign-writer-proactive"
+        thread_id = "foreign-writer-proactive-thread"
+        self.make_task(task_id, "running")
+        self.app.db.execute("UPDATE tasks SET codex_session_id=?,status='available' WHERE id=?", (thread_id, task_id))
+        self.assertFalse(self.app.task_or_404(task_id)["foreign_writer_active"])
+        holder = self.start_lock_holder(thread_id)
+        try:
+            self.app.refresh_foreign_writer_cache(force=True)
+            snapshot = self.app.task_or_404(task_id)
+            self.assertTrue(snapshot["foreign_writer_active"])
+            self.assertEqual([holder.pid], snapshot["foreign_writer_pids"])
+            self.assertIn("time.sleep", snapshot["foreign_writer_commands"][0])
+            stored = self.app.db.one("SELECT foreign_writer FROM tasks WHERE id=?", (task_id,))["foreign_writer"]
+            self.assertIn(str(holder.pid), stored)
+        finally:
+            holder.terminate()
+            holder.wait()
+        # Once that process exits the marker clears itself again.
+        self.app.refresh_foreign_writer_cache(force=True)
+        self.assertFalse(self.app.task_or_404(task_id)["foreign_writer_active"])
+        self.assertEqual("", self.app.db.one("SELECT foreign_writer FROM tasks WHERE id=?", (task_id,))["foreign_writer"])
+        self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_proactive_scan_ignores_app_server_transports(self):
+        thread_id = "foreign-writer-appserver"
+        lock = self.app.thread_writer_lock_path(thread_id)
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        holder = subprocess.Popen(
+            [sys.executable, "-c", "import sys,time;f=open(sys.argv[1],'w');time.sleep(60)", str(lock), "app-server"],
+        )
+        try:
+            for _ in range(100):
+                if lock.is_file() and self.app.rollout_writer_pids(str(lock), refresh=True):
+                    break
+                time.sleep(0.05)
+            self.assertEqual({}, self.app.foreign_writer_scan([thread_id]))
+            # The failing-turn path still reports whatever really holds the lock.
+            self.assertEqual([holder.pid], [writer["pid"] for writer in self.app.foreign_thread_writers(thread_id)])
+        finally:
+            holder.terminate()
+            holder.wait()
+
+    def test_foreign_writer_watch_loop_is_wired_into_the_lifespan(self):
+        lifespan = inspect.getsource(self.app.lifespan)
+        self.assertIn("foreign_writer_watch_loop()", lifespan)
+        self.assertIn("foreign_writer_task.cancel()", lifespan)
+        loop = inspect.getsource(self.app.foreign_writer_watch_loop)
+        self.assertIn("refresh_foreign_writer_cache, True", loop)
+        self.assertIn("persist_foreign_writer", loop)
+        self.assertIn("clear_foreign_writer", loop)
+
+    def test_thread_loading_reports_the_external_owner_instead_of_a_500(self):
+        task_id = "foreign-writer-load"
+        self.make_task(task_id, "running")
+        task = self.app.task_or_404(task_id)
+        error = RuntimeError(json.dumps({"code": -32600, "message": "thread already has an active writer"}))
+
+        class BlockedClient:
+            async def request(self, _method, _params):
+                raise error
+
+        with mock.patch.object(self.app, "foreign_thread_writers", return_value=[{"pid": os.getpid(), "command": "codex --yolo"}]):
+            with self.assertRaises(self.app.HTTPException) as raised:
+                asyncio.run(self.app.ensure_thread_loaded(task, BlockedClient()))
+        self.assertEqual(409, raised.exception.status_code)
+        self.assertIn("owned by another Codex process", raised.exception.detail)
+        self.assertTrue(self.app.task_or_404(task_id)["foreign_writer_active"])
+
+        # A resume error without an external owner keeps its original type.
+        with mock.patch.object(self.app, "foreign_thread_writers", return_value=[]):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(self.app.ensure_thread_loaded(task, BlockedClient()))
+        self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_takeover_endpoint_ends_the_external_writer_and_frees_the_thread(self):
+        task_id = "foreign-writer-takeover"
+        thread_id = "foreign-writer-takeover-thread"
+        self.make_task(task_id, "failed")
+        self.app.db.execute(
+            "UPDATE tasks SET codex_session_id=?,last_error=? WHERE id=?",
+            (thread_id, json.dumps({"code": -32600, "message": "already has an active writer"}), task_id),
+        )
+        holder = self.start_lock_holder(thread_id)
+        try:
+            result = asyncio.run(self.app.take_over_thread(task_id, _=None))
+            self.assertEqual([holder.pid], result["stopped"])
+            self.assertEqual([], result["remaining"])
+            holder.wait(timeout=10)
+            row = self.app.db.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+            self.assertEqual("available", row["status"])
+            self.assertEqual("", row["last_error"])
+            self.assertEqual("", row["foreign_writer"])
+            self.assertFalse(self.app.task_or_404(task_id)["foreign_writer_active"])
+        finally:
+            if holder.poll() is None:
+                holder.kill()
+                holder.wait()
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_thread_owner_indicator_is_wired_through_the_browser(self):
+        root = Path(__file__).resolve().parents[1]
+        static = root / "static"
+        html = (static / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="thread-owner-alert"', html)
+        self.assertLess(html.index('id="thread-owner-alert"'), html.index('id="approval-center"'))
+        core_js = (static / "core.js").read_text(encoding="utf-8")
+        for key in ("foreignWriterTitle", "foreignWriterBadge", "foreignWriterBody", "foreignWriterTakeover",
+                    "foreignWriterTakeoverConfirm", "foreignWriterTakeoverDone", "foreignWriterTakeoverFailed",
+                    "foreignWriterShort", "foreignWriterSessionTitle"):
+            self.assertIn(f"{key}: {{", core_js)
+        conversation_js = (static / "conversation.js").read_text(encoding="utf-8")
+        render = conversation_js[conversation_js.index("function renderThreadOwnerAlert") : conversation_js.index("function renderQueuedMessages")]
+        self.assertIn("foreign_writer_active", render)
+        self.assertIn("foreign_writer_pids", render)
+        self.assertIn("thread-owner-takeover", render)
+        self.assertIn("renderThreadOwnerAlert();", conversation_js)
+        self.assertIn("session-owner-badge", conversation_js)
+        app_js = (static / "app.js").read_text(encoding="utf-8")
+        self.assertIn('button.id === "thread-owner-takeover"', app_js)
+        self.assertIn("/takeover`, { method: \"POST\" }", app_js)
+        styles = (static / "styles.css").read_text(encoding="utf-8")
+        self.assertIn(".thread-owner-card", styles)
+        self.assertIn(".session-owner-badge", styles)
+        database = (root / "codex_partner" / "database.py").read_text(encoding="utf-8")
+        self.assertIn('"foreign_writer": "TEXT DEFAULT \'\'",', database)
+        snapshot = inspect.getsource(self.app.attach_external_task_state)
+        self.assertIn("attach_foreign_writer_state(task)", snapshot)
+        endpoint = inspect.getsource(self.app.take_over_thread)
+        self.assertIn("signal.SIGTERM", endpoint)
+        self.assertIn("foreign_thread_writers", endpoint)
+        mutable = inspect.getsource(self.app.broadcast_task)
+        self.assertIn('"foreign_writer_active"', mutable)
+
     def test_browser_auth_login_dialog_accepts_a_custom_ssh_port(self):
         root = Path(__file__).resolve().parents[1]
         static = root / "static"
