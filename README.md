@@ -59,6 +59,8 @@ Open <http://127.0.0.1:8787>.
 
 Linux keeps SSH browser authentication enabled by default. macOS and Windows default to unauthenticated loopback access because desktop installations normally do not run an SSH server. For access from other devices, set `CODEX_DASHBOARD_HOST=0.0.0.0`, configure `CODEX_DASHBOARD_AUTH=ssh`, and put HTTPS in front of the service. When authentication is handled by a reverse proxy, explicitly set `CODEX_DASHBOARD_AUTH=none`; Codex Partner rejects a non-loopback bind with an implicit unauthenticated default.
 
+The sign-in dialog has an optional `SSH port` field for daemons that do not listen on port 22. It defaults to `22`, remembers the last port you used, and overrides `CODEX_DASHBOARD_AUTH_SSH_PORT` (default `22`) for that one sign-in.
+
 ### macOS
 
 Install Python and Node.js with Homebrew if they are not already available, then install and authenticate Codex:

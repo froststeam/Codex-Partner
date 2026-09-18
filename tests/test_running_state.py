@@ -5043,6 +5043,58 @@ process.stdout.write(JSON.stringify([
         self.assertNotIn("codex-dashboard-token", core_js + conversation_js)
         self.assertNotIn("?token=", conversation_js)
 
+    def test_browser_auth_login_dialog_accepts_a_custom_ssh_port(self):
+        root = Path(__file__).resolve().parents[1]
+        static = root / "static"
+        html = (static / "index.html").read_text(encoding="utf-8")
+        core_js = (static / "core.js").read_text(encoding="utf-8")
+        self.assertIn('id="ssh-login-port"', html)
+        self.assertIn('name="port"', html)
+        self.assertIn('placeholder="22"', html)
+        login_block = core_js[core_js.index("async function requestSSHLogin") : core_js.index("async function api")]
+        self.assertNotIn("/api/auth/status", login_block)
+        self.assertIn("port: port && port.value ? Number(port.value) : null", login_block)
+        self.assertIn('localStorage.getItem("codexPartner.sshLoginPort")', core_js)
+        schema = (root / "codex_partner" / "schemas.py").read_text(encoding="utf-8")
+        login_schema = schema[schema.index("class SSHLoginIn") : schema.index("class SkillIn")]
+        self.assertIn("port: Optional[int] = Field(default=None, ge=1, le=65535)", login_schema)
+        source = inspect.getsource(self.app.ssh_login)
+        self.assertIn("login_port = payload.port or AUTH_SSH_PORT", source)
+        self.assertIn("port=login_port", source)
+
+    def test_ssh_login_verifies_against_the_requested_port(self):
+        def run(username, port):
+            calls = []
+
+            def fake_verify(user, password, **kwargs):
+                calls.append((user, password, kwargs))
+                return False, "SSH authentication failed"
+
+            async def attempt():
+                payload = self.app.SSHLoginIn(username=username, password="secret", port=port)
+                request = SimpleNamespace(
+                    client=SimpleNamespace(host="203.0.113.9"),
+                    headers={},
+                    cookies={},
+                    url=SimpleNamespace(scheme="http"),
+                )
+                with mock.patch.object(self.app, "verify_ssh_password", fake_verify):
+                    with self.assertRaises(self.app.HTTPException):
+                        await self.app.ssh_login(payload, request)
+
+            self.app.login_throttle.clear("203.0.113.9")
+            with mock.patch.object(self.app, "AUTH_MODE", "ssh"):
+                asyncio.run(attempt())
+            return calls
+
+        requested = run("root", 62288)
+        self.assertEqual("root", requested[0][0])
+        self.assertEqual(62288, requested[0][2]["port"])
+        self.assertEqual(self.app.AUTH_SSH_HOST, requested[0][2]["host"])
+
+        defaulted = run("root", None)
+        self.assertEqual(self.app.AUTH_SSH_PORT, defaulted[0][2]["port"])
+
     def test_direct_local_access_is_passwordless_but_proxied_or_remote_access_is_not(self):
         local_request = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"), headers={}, cookies={})
         local_session = self.app.request_auth_session(local_request)

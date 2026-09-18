@@ -5255,12 +5255,13 @@ async def ssh_login(payload: SSHLoginIn, request: Request):
     if not login_throttle.allowed(client):
         raise HTTPException(429, "Too many failed SSH login attempts; try again later")
     username = payload.username.strip()
+    login_port = payload.port or AUTH_SSH_PORT
     valid, _detail = await asyncio.to_thread(
         verify_ssh_password,
         username,
         payload.password.get_secret_value(),
         host=AUTH_SSH_HOST,
-        port=AUTH_SSH_PORT,
+        port=login_port,
         known_hosts=DATA_DIR / "ssh-login-known-hosts",
     )
     if not valid:
