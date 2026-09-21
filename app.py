@@ -946,7 +946,13 @@ async def appserver_for(provider: Optional[dict], task: Optional[dict] = None) -
                     client_version=app.version,
                 )
             else:
-                persistent = await ensure_persistent_appserver(key, CODEX_BIN, env, DATA_DIR)
+                try:
+                    persistent = await ensure_persistent_appserver(key, CODEX_BIN, env, DATA_DIR)
+                except RuntimeError as exc:
+                    # A Codex process the dashboard cannot detach is still far
+                    # better than no Codex process: keep it as a child.
+                    print(f"codex-partner: persistent app-server unavailable ({exc}); using a stdio child", file=sys.stderr, flush=True)
+                    persistent = None
                 app_servers[key] = AppServerClient(
                     env,
                     key,
@@ -4021,6 +4027,10 @@ async def supervise_appserver_turn(
         should_retry = context_recovered or (
             goal_auto_resume_enabled(current_task) if goal_continues else task_retry_allowed(current_task)
         )
+        if appserver_startup_error(error):
+            # Codex never started, so an auto-resume can only spin: a task with an
+            # unreachable app-server burned thousands of attempts this way.
+            should_retry = False
         pending_message = db.one(
             "SELECT id FROM task_messages WHERE task_id=? AND status='queued' ORDER BY created_at, id LIMIT 1",
             (task["id"],),
@@ -4713,6 +4723,19 @@ def goal_auto_resume_enabled(task: dict) -> bool:
     return goal_should_run(task)
 
 
+APPSERVER_STARTUP_ERRORS = (
+    "Unable to start persistent Codex app-server",
+    "Persistent Codex app-server did not open",
+    "Failed to connect to bus",
+)
+
+
+def appserver_startup_error(error: Any) -> bool:
+    """True when Codex never started, so resuming the task cannot help."""
+    text = str(error or "")
+    return any(marker in text for marker in APPSERVER_STARTUP_ERRORS)
+
+
 def task_retry_allowed(task: dict) -> bool:
     """Retry only when the explicit auto-resume switch is enabled."""
     if task.get("goal"):
@@ -5205,6 +5228,11 @@ async def drain_task_messages(task_id: str) -> None:
         if not row:
             goal_resume = goal_auto_resume_enabled(current)
             if not goal_resume:
+                return
+            if current.get("status") == "failed" and appserver_startup_error(current.get("last_error")):
+                # Codex could not start at all, so an automatic resume would
+                # fail the same way. This loop once ran tens of thousands of
+                # times; a manual retry still clears the error and runs.
                 return
             # Durable auto-resume owns unfinished Goal work whenever no user
             # message or active turn has priority.
@@ -7253,7 +7281,7 @@ async def supervise(task: dict, session_id: str, providers: list[Optional[dict]]
     async with running_lock:
         running.pop(task_id, None)
     latest = task_or_404(task_id)
-    if task_retry_allowed(latest):
+    if task_retry_allowed(latest) and not appserver_startup_error(last_error):
         db.execute("UPDATE sessions SET status='retrying', finished_at=?, exit_code=?, summary=? WHERE id=?", (now(), 1, last_error, session_id))
         db.execute(
             "UPDATE tasks SET status='retrying',execution_source='dashboard',last_error=?,updated_at=? WHERE id=?",

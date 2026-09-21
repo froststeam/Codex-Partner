@@ -302,6 +302,92 @@ class RunningStateTests(unittest.TestCase):
         self.assertIn(("systemctl", "--user", "stop", "--no-block", stale_unit), calls)
         self.assertNotIn(("systemctl", "--user", "stop", "--no-block", active_unit), calls)
 
+    def test_persistent_appserver_requires_a_booted_systemd_user_manager(self):
+        from codex_partner import persistent_appserver
+
+        root = Path(self.temp.name)
+        booted = root / "run-systemd-system"
+        booted.mkdir(exist_ok=True)
+        bus = root / "bus"
+
+        with mock.patch.object(persistent_appserver.shutil, "which", return_value="/usr/bin/systemctl"):
+            # systemctl/systemd-run exist, but PID 1 is not systemd: unsupported.
+            with mock.patch.object(persistent_appserver, "SYSTEMD_BOOT_DIR", root / "missing"):
+                self.assertFalse(persistent_appserver.supported())
+            # Booted, but no session bus to talk to a user manager: still unsupported.
+            with mock.patch.object(persistent_appserver, "SYSTEMD_BOOT_DIR", booted), \
+                 mock.patch.object(persistent_appserver, "session_bus_path", return_value=bus):
+                self.assertFalse(persistent_appserver.supported())
+            # A live bus socket is the final requirement.
+            bus.touch()
+            with mock.patch.object(persistent_appserver, "SYSTEMD_BOOT_DIR", booted), \
+                 mock.patch.object(persistent_appserver, "session_bus_path", return_value=bus):
+                self.assertTrue(persistent_appserver.supported())
+        with mock.patch.object(persistent_appserver.shutil, "which", return_value=None):
+            self.assertFalse(persistent_appserver.supported())
+
+    def test_appserver_startup_error_ignores_turn_failures(self):
+        bus_error = ("Unable to start persistent Codex app-server: Failed to connect to bus: "
+                     "$DBUS_SESSION_BUS_ADDRESS and $XDG_RUNTIME_DIR not defined")
+        self.assertTrue(self.app.appserver_startup_error(bus_error))
+        self.assertTrue(self.app.appserver_startup_error("Persistent Codex app-server did not open its control endpoint"))
+        self.assertFalse(self.app.appserver_startup_error("stream disconnected before completion: [ArrayParam]"))
+        self.assertFalse(self.app.appserver_startup_error(""))
+
+    def test_appserver_for_falls_back_to_a_stdio_child_without_a_user_manager(self):
+        task = {"id": "no-user-manager", "workspace": self.temp.name, "ssh_host": ""}
+        started = []
+
+        class FakeClient:
+            daemon_pid = 0
+
+            def __init__(self, env, key, command=None, **kwargs):
+                self.key = key
+                self.command = command
+
+            async def start(self):
+                started.append(self.command)
+
+            async def close(self):
+                return None
+
+        async def run():
+            with mock.patch.object(self.app, "ensure_persistent_appserver",
+                                   new=mock.AsyncMock(side_effect=RuntimeError("Failed to connect to bus"))), \
+                 mock.patch.object(self.app, "AppServerClient", FakeClient), \
+                 mock.patch.object(self.app, "remove_stale_task_appservers", new=mock.AsyncMock()):
+                return await self.app.appserver_for(None, task)
+
+        client = asyncio.run(run())
+        try:
+            self.assertEqual([[self.app.CODEX_BIN, "app-server", "--stdio"]], started)
+            self.assertEqual([self.app.CODEX_BIN, "app-server", "--stdio"], client.command)
+        finally:
+            self.app.app_servers.pop(self.app.appserver_key(None, task), None)
+
+    def test_supervise_turn_stops_retrying_when_the_appserver_cannot_start(self):
+        task_id = "no-user-manager-supervisor"
+        session_id = "no-user-manager-supervisor-session"
+        self.make_task(task_id, "running")
+        self.insert_session(task_id, session_id)
+        self.app.db.execute(
+            "UPDATE tasks SET retry_forever=1,goal='keep going',goal_status='active',retry_count=17785 WHERE id=?",
+            (task_id,),
+        )
+        task = self.app.task_or_404(task_id)
+        error = RuntimeError("Unable to start persistent Codex app-server: Failed to connect to bus: "
+                             "$DBUS_SESSION_BUS_ADDRESS and $XDG_RUNTIME_DIR not defined")
+        with mock.patch.object(self.app, "appserver_for", new=mock.AsyncMock(side_effect=error)), \
+             mock.patch.object(self.app, "refresh_external_primary", return_value=None), \
+             mock.patch.object(self.app, "launch_after_turn_cleanup", new=mock.AsyncMock()) as retry:
+            asyncio.run(self.app.supervise_appserver_turn(task, None, "message", "", "hello", "", session_id, set()))
+        retry.assert_not_awaited()
+        row = self.app.db.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        self.assertEqual("failed", row["status"])
+        self.assertIn("Failed to connect to bus", row["last_error"])
+        self.app.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+        self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
     def test_persistent_appserver_restarts_an_active_stale_endpoint(self):
         from codex_partner import persistent_appserver
 
