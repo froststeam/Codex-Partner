@@ -843,6 +843,7 @@ async def lifespan(_: FastAPI):
     app_shutting_down = False
     reconcile_legacy_interaction_states()
     observer_task: Optional[asyncio.Task] = None
+    foreign_writer_task: Optional[asyncio.Task] = None
     inactive_trash_task: Optional[asyncio.Task] = None
     activity_graph_task: Optional[asyncio.Task] = None
     reconcile_task_session_ids()
@@ -856,6 +857,7 @@ async def lifespan(_: FastAPI):
         await refresh_native_rollouts()
         reconcile_delivered_task_messages()
         observer_task = asyncio.create_task(native_rollout_watch_loop())
+        foreign_writer_task = asyncio.create_task(foreign_writer_watch_loop())
     except Exception:
         # Rollout observation augments native Codex sessions. A malformed or
         # temporarily locked state database must not prevent the UI starting.
@@ -899,6 +901,9 @@ async def lifespan(_: FastAPI):
         if observer_task:
             observer_task.cancel()
             await asyncio.gather(observer_task, return_exceptions=True)
+        if foreign_writer_task:
+            foreign_writer_task.cancel()
+            await asyncio.gather(foreign_writer_task, return_exceptions=True)
         if inactive_trash_task:
             inactive_trash_task.cancel()
             await asyncio.gather(inactive_trash_task, return_exceptions=True)
@@ -1062,7 +1067,13 @@ async def appserver_for(provider: Optional[dict], task: Optional[dict] = None) -
                     client_version=app.version,
                 )
             else:
-                persistent = await ensure_persistent_appserver(key, CODEX_BIN, env, DATA_DIR)
+                try:
+                    persistent = await ensure_persistent_appserver(key, CODEX_BIN, env, DATA_DIR)
+                except RuntimeError as exc:
+                    # A Codex process the dashboard cannot detach is still far
+                    # better than no Codex process: keep it as a child.
+                    print(f"codex-partner: persistent app-server unavailable ({exc}); using a stdio child", file=sys.stderr, flush=True)
+                    persistent = None
                 app_servers[key] = AppServerClient(
                     env,
                     key,
@@ -1762,16 +1773,187 @@ def process_tree_pids(roots: set[int]) -> set[int]:
     return found
 
 
-def native_rollout_writer_pids(path: str, refresh: bool = False) -> set[int]:
-    """Return writers outside this dashboard's app-server children."""
-    dashboard_roots = {
+def dashboard_process_pids() -> set[int]:
+    """Every process this dashboard owns: shared app-servers and browser terminals."""
+    roots = {
         client.process.pid
         for client in app_servers.values()
         if client.process and client.process.returncode is None
     }
-    dashboard_roots.update(client.daemon_pid for client in app_servers.values() if getattr(client, "daemon_pid", 0))
-    dashboard_pids = process_tree_pids(dashboard_roots)
-    return rollout_writer_pids(path, refresh=refresh) - dashboard_pids - {os.getpid()}
+    roots.update(client.daemon_pid for client in app_servers.values() if getattr(client, "daemon_pid", 0))
+    roots.update(int(session.get("pid") or 0) for session in terminal_sessions.values())
+    return process_tree_pids({pid for pid in roots if pid}) | {os.getpid()}
+
+
+def process_command_label(pid: int, limit: int = 200) -> str:
+    """Read one process command line as a short single-line label."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()[:limit]
+
+
+def native_rollout_writer_pids(path: str, refresh: bool = False) -> set[int]:
+    """Return writers outside this dashboard's app-server children."""
+    return rollout_writer_pids(path, refresh=refresh) - dashboard_process_pids()
+
+
+def thread_writer_lock_path(thread_id: str) -> Path:
+    """Codex keeps a per-thread writer lock next to the rollout file."""
+    return CODEX_HOME / "thread-writer-locks" / f"{safe_thread_id(thread_id)}.lock"
+
+
+def foreign_thread_writers(thread_id: str) -> list[dict[str, Any]]:
+    """Report Codex processes outside this dashboard that own one thread.
+
+    Codex holds the thread lock and the rollout file open for writing while a
+    process owns the thread. Anything still holding them that this dashboard
+    did not start belongs to someone else (a terminal Codex, another
+    dashboard, ...), so a dashboard turn can never take the thread over.
+    """
+    thread_id = safe_thread_id(thread_id)
+    if not thread_id:
+        return []
+    rollout_path = native_rollout_path(thread_id)
+    candidates = [thread_writer_lock_path(thread_id)] + ([Path(rollout_path)] if rollout_path else [])
+    writers: set[int] = set()
+    for candidate in candidates:
+        if candidate.is_file():
+            writers |= rollout_writer_pids(str(candidate), refresh=True)
+    writers -= dashboard_process_pids()
+    return [{"pid": pid, "command": process_command_label(pid)} for pid in sorted(writers)]
+
+
+ACTIVE_WRITER_ERROR = "already has an active writer"
+
+
+def active_writer_error(error: Any) -> bool:
+    """True when Codex refused work because another process owns the thread."""
+    return ACTIVE_WRITER_ERROR in str(error)
+
+
+def process_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def persist_foreign_writer(task_id: str, writers: list[dict[str, Any]]) -> dict[str, Any]:
+    """Remember which external processes hold a task's thread."""
+    state = {"writers": writers, "detected_at": now()}
+    db.execute(
+        "UPDATE tasks SET foreign_writer=?,updated_at=? WHERE id=?",
+        (json.dumps(state, ensure_ascii=False), state["detected_at"], task_id),
+    )
+    return state
+
+
+def clear_foreign_writer(task_id: str) -> None:
+    db.execute("UPDATE tasks SET foreign_writer='' WHERE id=? AND COALESCE(foreign_writer,'')!=''", (task_id,))
+
+
+def foreign_writer_state(task: dict) -> Optional[dict[str, Any]]:
+    """Return the stored external owner, dropping writers that already exited."""
+    raw = str(task.get("foreign_writer") or "")
+    if not raw:
+        return None
+    try:
+        state = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    writers = [writer for writer in state.get("writers") or [] if isinstance(writer, dict)]
+    live = [writer for writer in writers if process_is_alive(int(writer.get("pid") or 0))]
+    if not live:
+        clear_foreign_writer(task["id"])
+        return None
+    if len(live) != len(writers):
+        state = persist_foreign_writer(task["id"], live)
+    return {"writers": live, "detected_at": state.get("detected_at", "")}
+
+
+FOREIGN_WRITER_CACHE_TTL = 2.0
+foreign_writer_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+foreign_writer_cache_stamp = 0.0
+
+
+def foreign_writer_scan(thread_ids: Iterable[str], refresh: bool = False) -> dict[str, list[dict[str, Any]]]:
+    """Find external writers for many threads with one process-table scan.
+
+    Only the per-thread lock is inspected here. Its holder is the same process
+    that would answer ``already has an active writer``, and one batched scan
+    keeps a full task list cheap to refresh.
+    """
+    locks = {
+        thread_id: thread_writer_lock_path(thread_id)
+        for thread_id in {safe_thread_id(value) for value in thread_ids}
+        if thread_id
+    }
+    locks = {thread_id: path for thread_id, path in locks.items() if path.is_file()}
+    if not locks:
+        return {}
+    writer_map = rollout_writer_pid_map([str(path) for path in locks.values()], refresh=refresh)
+    excluded = dashboard_process_pids()
+    found: dict[str, list[dict[str, Any]]] = {}
+    for thread_id, path in locks.items():
+        pids = set(writer_map.get(os.path.realpath(str(path)), set())) - excluded
+        owners = []
+        for pid in sorted(pids):
+            command = process_command_label(pid)
+            # A persistent app-server unit outlives the dashboard on purpose,
+            # so its transport process is not a foreign thread owner.
+            if "app-server" in command:
+                continue
+            owners.append({"pid": pid, "command": command})
+        if owners:
+            found[thread_id] = owners
+    return found
+
+
+def refresh_foreign_writer_cache(force: bool = False) -> None:
+    global foreign_writer_cache_stamp
+    stamp = time.monotonic()
+    if not force and stamp - foreign_writer_cache_stamp < FOREIGN_WRITER_CACHE_TTL:
+        return
+    thread_ids = [row["codex_session_id"] for row in db.all("SELECT codex_session_id FROM tasks WHERE COALESCE(codex_session_id,'')!='' AND trashed=0")]
+    found = foreign_writer_scan(thread_ids, refresh=force)
+    foreign_writer_cache.clear()
+    for thread_id, writers in found.items():
+        foreign_writer_cache[thread_id] = (stamp, writers)
+    foreign_writer_cache_stamp = stamp
+
+
+def cached_foreign_thread_writers(thread_id: str) -> list[dict[str, Any]]:
+    if not thread_id:
+        return []
+    refresh_foreign_writer_cache()
+    entry = foreign_writer_cache.get(safe_thread_id(thread_id))
+    return list(entry[1]) if entry else []
+
+
+def attach_foreign_writer_state(task: dict) -> dict:
+    """Expose the external thread owner on every snapshot, including its cleared state."""
+    state = foreign_writer_state(task) if task else None
+    if not state and task and not task.get("trashed"):
+        thread_id = latest_codex_session(task)
+        writers = cached_foreign_thread_writers(thread_id)
+        if writers:
+            # Detected without a failed turn: any Codex process this dashboard
+            # did not take over must be visible on the task.
+            persist_foreign_writer(task["id"], writers)
+            state = {"writers": writers, "detected_at": now()}
+    writers = state["writers"] if state else []
+    task["foreign_writer_active"] = bool(writers)
+    task["foreign_writer_pids"] = [int(writer["pid"]) for writer in writers]
+    task["foreign_writer_commands"] = [str(writer.get("command") or "") for writer in writers]
+    task["foreign_writer_since"] = state["detected_at"] if state else ""
+    return task
 
 
 def rollout_is_live(path: str) -> bool:
@@ -2118,6 +2300,62 @@ async def settle_inactive_external_turn(task_id: str, reason: str, current: Opti
     schedule_task_drain(task_id)
 
 
+def foreign_writer_message(thread_id: str, writers: list[dict[str, Any]]) -> str:
+    owners = ", ".join(
+        f"pid {writer['pid']}" + (f" ({writer['command']})" if writer.get("command") else "")
+        for writer in writers
+    )
+    return (
+        f"thread {thread_id} is owned by another Codex process ({owners}); "
+        "Codex Partner cannot take over this thread"
+    )
+
+
+async def record_foreign_thread_writer(task_id: str, thread_id: str, writers: list[dict[str, Any]]) -> str:
+    """Persist and surface an external thread owner without touching the turn."""
+    persist_foreign_writer(task_id, writers)
+    message = foreign_writer_message(thread_id, writers)
+    await broadcast_task(task_id, {"type": "task_status", "task": task_or_404(task_id), "source": {"kind": "foreign_thread_writer"}})
+    await broadcast_overview(task_id, {"kind": "foreign_thread_writer"})
+    await broadcast_task(task_id, {"type": "system", "status": "failed", "text": message})
+    return message
+
+
+async def fail_on_foreign_thread_writer(
+    task: dict,
+    thread_id: str,
+    session_id: str,
+    message_id: str,
+    error: str,
+    writers: list[dict[str, Any]],
+) -> None:
+    """Stop retrying a thread an external Codex process still owns, and say so.
+
+    Retrying can never succeed while the lock is held, so the task fails with a
+    durable marker instead of looping forever. The marker is also what the
+    browser uses to explain why the dashboard cannot take this thread over.
+    """
+    state = persist_foreign_writer(task["id"], writers)
+    stamp = state["detected_at"]
+    message = foreign_writer_message(thread_id, writers)
+    if error and not active_writer_error(error):
+        message = f"{message}: {error}"
+    current_task = task_or_404(task["id"])
+    next_goal_status = goal_status_after_failure(current_task, user_stopped=False)
+    if next_goal_status != canonical_goal_status(current_task):
+        persist_observed_goal_status(task["id"], next_goal_status, current_task.get("goal_tokens_used", 0))
+    db.execute("UPDATE sessions SET status='failed',finished_at=?,exit_code=1,summary=? WHERE id=?", (stamp, message, session_id))
+    db.execute(
+        "UPDATE tasks SET status='failed',active_session_id=NULL,execution_source='',execution_turn_id='',run_mode='',last_error=?,updated_at=? WHERE id=?",
+        (message, stamp, task["id"]),
+    )
+    if message_id:
+        db.execute("UPDATE task_messages SET status='failed',finished_at=?,error=?,session_id=? WHERE id=?", (stamp, message, session_id, message_id))
+        await broadcast_task(task["id"], {"type": "message", "message_id": message_id, "status": "failed", "error": message, "session_id": session_id})
+    await broadcast_task(task["id"], {"type": "session", "session_id": session_id, "status": "failed", "error": message})
+    await record_foreign_thread_writer(task["id"], thread_id, writers)
+
+
 async def reconcile_initial_rollout(task_id: str, thread_id: str, path: str, boundary: dict, phase: str) -> None:
     boundary_type = str((boundary.get("payload") or {}).get("type") or "")
     if boundary_type == "task_started" and await asyncio.to_thread(rollout_is_live, path):
@@ -2306,6 +2544,30 @@ async def refresh_live_external_turn(task_id: str) -> bool:
         return False
     await apply_external_turn_boundary(task_id, thread_id, boundary, phase, initial=True, path=path)
     return bool(external_turns.get(task_id))
+
+
+async def foreign_writer_watch_loop() -> None:
+    """Surface Codex processes that hold task threads without dashboard ownership."""
+    while True:
+        try:
+            await asyncio.to_thread(refresh_foreign_writer_cache, True)
+            for row in db.all("SELECT * FROM tasks WHERE COALESCE(codex_session_id,'')!='' AND trashed=0"):
+                thread_id = str(row.get("codex_session_id") or "")
+                writers = foreign_writer_cache.get(thread_id, (0, []))[1]
+                stored = foreign_writer_state(row)
+                if bool(writers) == bool(stored):
+                    continue
+                if writers:
+                    persist_foreign_writer(row["id"], writers)
+                else:
+                    clear_foreign_writer(row["id"])
+                await broadcast_task(row["id"], {"type": "task_status", "task": task_or_404(row["id"]), "source": {"kind": "foreign_thread_writer"}})
+                await broadcast_overview(row["id"], {"kind": "foreign_thread_writer"})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        await asyncio.sleep(2)
 
 
 async def native_rollout_watch_loop() -> None:
@@ -3748,6 +4010,8 @@ async def supervise_appserver_turn(
             thread_id = (result.get("thread") or {}).get("id")
         if not thread_id:
             raise RuntimeError("Codex app-server did not return a thread id")
+        # Resuming the thread proves no external Codex process owns it anymore.
+        clear_foreign_writer(task["id"])
         aligned_workspace = align_session_workspace(task["id"], thread_id)
         if aligned_workspace:
             task["workspace"] = str(aligned_workspace)
@@ -3944,6 +4208,13 @@ async def supervise_appserver_turn(
             await broadcast_task(task["id"], {"type": "task_status", "task": task_or_404(task["id"]), "source": {"kind": "terminal_owner"}})
             await broadcast_overview(task["id"], {"kind": "terminal_owner"})
             return
+        owned_thread = thread_id or latest_codex_session(task)
+        foreign_writers = await asyncio.to_thread(foreign_thread_writers, owned_thread) if not stopped and owned_thread else []
+        if foreign_writers:
+            # The thread is locked by a Codex process this dashboard did not
+            # start, so no retry can ever succeed. Report it instead of looping.
+            await fail_on_foreign_thread_writer(task, owned_thread, session_id, message_id, error, foreign_writers)
+            return
         if provider and not stopped and provider_failed:
             record_provider_outcome(provider, False, error)
         tried_provider_ids = set(attempted_provider_ids)
@@ -3991,6 +4262,10 @@ async def supervise_appserver_turn(
         should_retry = context_recovered or (
             goal_auto_resume_enabled(current_task) if goal_continues else task_retry_allowed(current_task)
         )
+        if appserver_startup_error(error):
+            # Codex never started, so an auto-resume can only spin: a task with an
+            # unreachable app-server burned thousands of attempts this way.
+            should_retry = False
         pending_message = db.one(
             "SELECT id FROM task_messages WHERE task_id=? AND status='queued' ORDER BY created_at, id LIMIT 1",
             (task["id"],),
@@ -4231,6 +4506,7 @@ def attach_external_task_state(task: dict, task_id: str) -> dict:
     task["external_phase"] = external.get("phase") if external else None
     task["external_turn_id"] = external.get("turn_id") if external else None
     task["external_turn_count"] = len(external_turn_sets.get(task_id) or {}) if external else 0
+    attach_foreign_writer_state(task)
     return task
 
 
@@ -4691,6 +4967,19 @@ def goal_auto_resume_enabled(task: dict) -> bool:
     return goal_should_run(task)
 
 
+APPSERVER_STARTUP_ERRORS = (
+    "Unable to start persistent Codex app-server",
+    "Persistent Codex app-server did not open",
+    "Failed to connect to bus",
+)
+
+
+def appserver_startup_error(error: Any) -> bool:
+    """True when Codex never started, so resuming the task cannot help."""
+    text = str(error or "")
+    return any(marker in text for marker in APPSERVER_STARTUP_ERRORS)
+
+
 def task_retry_allowed(task: dict) -> bool:
     """Retry only when the explicit auto-resume switch is enabled."""
     if task.get("goal"):
@@ -4883,6 +5172,7 @@ async def broadcast_task(task_id: str, payload: dict) -> None:
             "active_session_id", "goal_status", "goal_tokens_used", "updated_at", "archived",
             "trashed", "execution_source", "execution_turn_id", "run_mode", "external_running",
             "external_started_at", "external_phase", "external_turn_id", "external_turn_count",
+            "foreign_writer_active", "foreign_writer_pids", "foreign_writer_commands", "foreign_writer_since",
         }
         payload = {
             "type": "task_patch",
@@ -5171,6 +5461,12 @@ async def drain_task_messages(task_id: str) -> None:
     adopted terminal Goal turn resumes only after queued user messages.
     """
     await release_completed_dashboard_owner(task_id)
+    if foreign_writer_state(task_or_404(task_id)):
+        # A Codex process this dashboard does not own still holds the thread,
+        # so neither a queued message nor Goal auto-resume can run right now.
+        # The marker clears itself once that process exits, and the worker
+        # wakes up again on the next drain tick.
+        return
     lock = task_message_locks.setdefault(task_id, asyncio.Lock())
     async with lock:
         current = task_or_404(task_id)
@@ -5182,6 +5478,11 @@ async def drain_task_messages(task_id: str) -> None:
         if not row:
             goal_resume = goal_auto_resume_enabled(current)
             if not goal_resume:
+                return
+            if current.get("status") == "failed" and appserver_startup_error(current.get("last_error")):
+                # Codex could not start at all, so an automatic resume would
+                # fail the same way. This loop once ran tens of thousands of
+                # times; a manual retry still clears the error and runs.
                 return
             # Durable auto-resume owns unfinished Goal work whenever no user
             # message or active turn has priority.
@@ -5434,7 +5735,14 @@ async def ensure_thread_loaded(task: dict, client: AppServerClient, provider: Op
         params["modelProvider"] = provider["model_provider"]
     if task.get("personality"):
         params["personality"] = task["personality"]
-    await client.request("thread/resume", params)
+    try:
+        await client.request("thread/resume", params)
+    except Exception as exc:
+        if active_writer_error(exc):
+            writers = await asyncio.to_thread(foreign_thread_writers, thread_id)
+            if writers:
+                raise HTTPException(409, await record_foreign_thread_writer(task["id"], thread_id, writers)) from exc
+        raise
     return thread_id
 
 
@@ -5515,12 +5823,13 @@ async def ssh_login(payload: SSHLoginIn, request: Request):
     if not login_throttle.allowed(client):
         raise HTTPException(429, "Too many failed SSH login attempts; try again later")
     username = payload.username.strip()
+    login_port = payload.port or AUTH_SSH_PORT
     valid, _detail = await asyncio.to_thread(
         verify_ssh_password,
         username,
         payload.password.get_secret_value(),
         host=AUTH_SSH_HOST,
-        port=AUTH_SSH_PORT,
+        port=login_port,
         known_hosts=DATA_DIR / "ssh-login-known-hosts",
     )
     if not valid:
@@ -7236,7 +7545,7 @@ async def supervise(task: dict, session_id: str, providers: list[Optional[dict]]
     async with running_lock:
         running.pop(task_id, None)
     latest = task_or_404(task_id)
-    if task_retry_allowed(latest):
+    if task_retry_allowed(latest) and not appserver_startup_error(last_error):
         db.execute("UPDATE sessions SET status='retrying', finished_at=?, exit_code=?, summary=? WHERE id=?", (now(), 1, last_error, session_id))
         db.execute(
             "UPDATE tasks SET status='retrying',execution_source='dashboard',last_error=?,updated_at=? WHERE id=?",
@@ -7612,6 +7921,43 @@ async def retry_task(task_id: str, _: Any = Depends(auth)):
         raise HTTPException(409, "Task is already running")
     db.execute("UPDATE tasks SET retry_count=0, status='queued', updated_at=? WHERE id=?", (now(), task_id))
     return await launch(task_id, "resume" if task.get("native") else "manual-retry")
+
+
+@app.post("/api/tasks/{task_id}/takeover")
+async def take_over_thread(task_id: str, _: Any = Depends(auth)):
+    """End the external Codex processes that own a task thread and clear the marker.
+
+    The dashboard can never take over a thread while another Codex process holds
+    its writer lock, so this is the explicit escape hatch behind the browser
+    indicator. It only signals processes this dashboard did not start.
+    """
+    task = task_or_404(task_id)
+    thread_id = str(task.get("codex_session_id") or task_id)
+    writers = await asyncio.to_thread(foreign_thread_writers, thread_id)
+    stopped: list[int] = []
+    for writer in writers:
+        pid = int(writer["pid"])
+        try:
+            os.kill(pid, signal.SIGTERM)
+            stopped.append(pid)
+        except (OSError, ValueError):
+            continue
+    deadline = time.monotonic() + 3
+    while stopped and time.monotonic() < deadline and any(process_is_alive(pid) for pid in stopped):
+        await asyncio.sleep(0.1)
+    remaining = await asyncio.to_thread(foreign_thread_writers, thread_id)
+    if remaining:
+        persist_foreign_writer(task_id, remaining)
+    else:
+        clear_foreign_writer(task_id)
+        if task["status"] == "failed" and active_writer_error(task.get("last_error")):
+            db.execute(
+                "UPDATE tasks SET status='available',last_error='',updated_at=? WHERE id=? AND status='failed'",
+                (now(), task_id),
+            )
+    await broadcast_task(task_id, {"type": "task_status", "task": task_or_404(task_id), "source": {"kind": "takeover"}})
+    await broadcast_overview(task_id, {"kind": "takeover"})
+    return {"ok": True, "thread_id": thread_id, "stopped": stopped, "remaining": [int(writer["pid"]) for writer in remaining]}
 
 
 @app.post("/api/tasks/{task_id}/approvals/{request_id}")

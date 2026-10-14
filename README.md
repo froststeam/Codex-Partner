@@ -21,6 +21,7 @@ Codex Partner is a self-hosted control panel for long-running Codex work. It kee
 - Codex memories, Skills, archive, recycle bin, and SSH workspace support
 - Default YOLO mode for newly created sessions
 - Explicit delivery controls: `Enter` queues behind a running turn, `Alt+Enter` inserts into the current dashboard turn, and terminal takeover always asks before stopping terminal work
+- External thread-owner indicator: when a Codex process this dashboard did not start still holds a thread's writer lock, the session is marked, retries stop instead of looping, and one click can send it `SIGTERM` so the dashboard takes the thread over
 
 ## Platform support
 
@@ -58,6 +59,8 @@ codex-partner
 Open <http://127.0.0.1:8787>.
 
 Linux keeps SSH browser authentication enabled by default. macOS and Windows default to unauthenticated loopback access because desktop installations normally do not run an SSH server. For access from other devices, set `CODEX_DASHBOARD_HOST=0.0.0.0`, configure `CODEX_DASHBOARD_AUTH=ssh`, and put HTTPS in front of the service. When authentication is handled by a reverse proxy, explicitly set `CODEX_DASHBOARD_AUTH=none`; Codex Partner rejects a non-loopback bind with an implicit unauthenticated default.
+
+The sign-in dialog has an optional `SSH port` field for daemons that do not listen on port 22. It defaults to `22`, remembers the last port you used, and overrides `CODEX_DASHBOARD_AUTH_SSH_PORT` (default `22`) for that one sign-in.
 
 ### macOS
 

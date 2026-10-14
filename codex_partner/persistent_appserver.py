@@ -13,8 +13,35 @@ from pathlib import Path
 from typing import Optional
 
 
+SYSTEMD_BOOT_DIR = Path("/run/systemd/system")
+
+
+def session_bus_path() -> Path:
+    """Where this process would reach a session bus, mirroring systemd-run."""
+    address = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
+    if address.startswith("unix:path="):
+        return Path(address.split("unix:path=", 1)[1].split(",", 1)[0])
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return Path(runtime) / "bus"
+
+
+def _user_manager_available() -> bool:
+    """True only when systemd can actually run a user service.
+
+    The binaries are not enough: a container often ships systemctl/systemd-run
+    while PID 1 is not systemd, so `systemd-run --user` fails with
+    "Failed to connect to bus". Requiring a systemd boot plus a live session bus
+    keeps that failure from replacing a working Codex process.
+    """
+    if not SYSTEMD_BOOT_DIR.is_dir():
+        return False
+    return session_bus_path().exists()
+
+
 def supported() -> bool:
-    return platform.system() == "Linux" and bool(shutil.which("systemctl") and shutil.which("systemd-run"))
+    if platform.system() != "Linux" or not (shutil.which("systemctl") and shutil.which("systemd-run")):
+        return False
+    return _user_manager_available()
 
 
 def _identity(key: str) -> str:

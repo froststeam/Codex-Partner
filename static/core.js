@@ -476,6 +476,17 @@ const UI_LABELS = {
   authMessage: { zh: "使用这台服务器的 SSH 账户登录。密码只用于本次 SSH 验证，不会保存。", en: "Sign in with an SSH account on this server. The password is used only for this verification and is not stored.", fr: "Connectez-vous avec un compte SSH de ce serveur. Le mot de passe sert uniquement à cette vérification et n’est pas stocké.", ja: "このサーバーの SSH アカウントでログインします。パスワードは今回の認証にのみ使用され、保存されません。", ko: "이 서버의 SSH 계정으로 로그인하세요. 비밀번호는 이번 인증에만 사용되며 저장되지 않습니다." },
   sshUsername: { zh: "SSH 用户名", en: "SSH username", fr: "Nom d’utilisateur SSH", ja: "SSH ユーザー名", ko: "SSH 사용자 이름" },
   sshPassword: { zh: "SSH 密码", en: "SSH password", fr: "Mot de passe SSH", ja: "SSH パスワード", ko: "SSH 비밀번호" },
+  sshPort: { zh: "SSH 端口", en: "SSH port", fr: "Port SSH", ja: "SSH ポート", ko: "SSH 포트" },
+  sshPortHint: { zh: "默认 22，可按需修改。", en: "Defaults to 22; change it if needed.", fr: "22 par défaut ; modifiable si besoin.", ja: "既定は 22 です。必要に応じて変更してください。", ko: "기본값은 22이며 필요하면 변경하세요." },
+  foreignWriterTitle: { zh: "线程被其他 Codex 进程占用", en: "Thread owned by another Codex process", fr: "Fil détenu par un autre processus Codex", ja: "スレッドは別の Codex プロセスが使用中", ko: "다른 Codex 프로세스가 스레드를 점유 중" },
+  foreignWriterBadge: { zh: "无法接管", en: "Cannot take over", fr: "Prise en charge impossible", ja: "引き継ぎ不可", ko: "인계 불가" },
+  foreignWriterBody: { zh: "Codex Partner 无法访问这个线程：它仍被下面这些进程以写入方式占用，重启或重试都不会生效。请关闭对应终端，或直接强制接管。", en: "Codex Partner cannot access this thread: the processes below still hold it open for writing, so restarts and retries cannot help. Close that terminal or take over by force.", fr: "Codex Partner ne peut pas accéder à ce fil : les processus ci-dessous le détiennent toujours en écriture. Fermez ce terminal ou forcez la prise en charge.", ja: "Codex Partner はこのスレッドにアクセスできません。以下のプロセスが書き込み用に保持しているため、再起動や再試行は効きません。ターミナルを閉じるか強制引き継ぎしてください。", ko: "Codex Partner가 이 스레드에 접근할 수 없습니다. 아래 프로세스가 쓰기용으로 점유 중이라 재시작이나 재시도로는 해결되지 않습니다. 해당 터미널을 닫거나 강제 인계하세요." },
+  foreignWriterTakeover: { zh: "强制接管", en: "Take over by force", fr: "Forcer la prise en charge", ja: "強制引き継ぎ", ko: "강제 인계" },
+  foreignWriterTakeoverConfirm: { zh: "强制接管会向占用线程的外部 Codex 进程发送 SIGTERM（{{pids}}）。未完成的回合会丢失，确定继续？", en: "Taking over sends SIGTERM to the external Codex processes holding this thread ({{pids}}). An unfinished turn in that terminal is lost. Continue?", fr: "La prise en charge envoie SIGTERM aux processus Codex externes qui détiennent ce fil ({{pids}}). Un tour inachevé sera perdu. Continuer ?", ja: "強制引き継ぎは対象スレッドを保持する外部 Codex プロセスに SIGTERM を送ります（{{pids}}）。未完了のターンは失われます。続行しますか？", ko: "강제 인계는 스레드를 점유한 외부 Codex 프로세스에 SIGTERM을 보냅니다({{pids}}). 진행 중이던 턴은 사라집니다. 계속할까요?" },
+  foreignWriterTakeoverDone: { zh: "已结束外部 Codex 进程（{{pids}}），线程已释放", en: "Ended the external Codex processes ({{pids}}); the thread is free", fr: "Processus Codex externes terminés ({{pids}}) ; le fil est libre", ja: "外部 Codex プロセスを終了しました（{{pids}}）。スレッドは解放されました", ko: "외부 Codex 프로세스를 종료했습니다({{pids}}). 스레드가 해제되었습니다" },
+  foreignWriterTakeoverFailed: { zh: "外部 Codex 进程仍未退出：{{pids}}", en: "The external Codex processes are still running: {{pids}}", fr: "Les processus Codex externes sont toujours actifs : {{pids}}", ja: "外部 Codex プロセスはまだ終了していません：{{pids}}", ko: "외부 Codex 프로세스가 아직 실행 중입니다: {{pids}}" },
+  foreignWriterShort: { zh: "外部占用", en: "Externally owned", fr: "Détenu ailleurs", ja: "外部占有", ko: "외부 점유" },
+  foreignWriterSessionTitle: { zh: "线程被其他 Codex 进程占用，Codex Partner 无法接管", en: "Another Codex process owns this thread; Codex Partner cannot take it over", fr: "Un autre processus Codex détient ce fil ; Codex Partner ne peut pas le reprendre", ja: "別の Codex プロセスがスレッドを占有しているため Codex Partner は引き継げません", ko: "다른 Codex 프로세스가 스레드를 점유하여 Codex Partner가 인계할 수 없습니다" },
   sshLoginFailed: { zh: "SSH 登录失败", en: "SSH sign-in failed", fr: "Échec de la connexion SSH", ja: "SSH ログインに失敗しました", ko: "SSH 로그인 실패" },
   connect: { zh: "连接", en: "Connect", fr: "Se connecter", ja: "接続", ko: "연결" },
   renameSessionTitle: { zh: "重命名会话", en: "Rename session", fr: "Renommer la session", ja: "セッション名を変更", ko: "세션 이름 변경" },
@@ -733,7 +744,34 @@ function updateSSHLoginDialog() {
   $("#ssh-login-message").textContent = uiLabel("authMessage");
   $("#ssh-login-username-label").textContent = uiLabel("sshUsername");
   $("#ssh-login-password-label").textContent = uiLabel("sshPassword");
+  const portLabel = $("#ssh-login-port-label");
+  if (portLabel) portLabel.textContent = uiLabel("sshPort");
+  const portHint = $("#ssh-login-port-hint");
+  if (portHint) portHint.textContent = uiLabel("sshPortHint");
   $("#ssh-login-submit").textContent = uiLabel("connect");
+}
+
+function rememberedSSHLoginPort() {
+  try {
+    return localStorage.getItem("codexPartner.sshLoginPort") || "";
+  } catch (_ignored) {
+    return "";
+  }
+}
+
+function rememberSSHLoginPort(value) {
+  try {
+    const text = String(value ?? "").trim();
+    if (text) localStorage.setItem("codexPartner.sshLoginPort", text);
+    else localStorage.removeItem("codexPartner.sshLoginPort");
+  } catch (_ignored) {
+    /* storage unavailable: keep the field value only */
+  }
+}
+
+function prefillSSHLoginPort(input) {
+  const remembered = rememberedSSHLoginPort();
+  if (remembered) input.value = remembered;
 }
 
 async function requestSSHLogin() {
@@ -743,11 +781,13 @@ async function requestSSHLogin() {
     const form = $("#ssh-login-form");
     const username = $("#ssh-login-username");
     const password = $("#ssh-login-password");
+    const port = $("#ssh-login-port");
     const error = $("#ssh-login-error");
     const submit = $("#ssh-login-submit");
     updateSSHLoginDialog();
     error.textContent = "";
     password.value = "";
+    if (port) prefillSSHLoginPort(port);
     dialog.oncancel = event => event.preventDefault();
     form.onsubmit = async event => {
       event.preventDefault();
@@ -755,13 +795,21 @@ async function requestSSHLogin() {
       submit.disabled = true;
       error.textContent = "";
       try {
+        if (port) rememberSSHLoginPort(port.value);
         const response = await fetch("/api/auth/login", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ username: username.value.trim(), password: password.value }),
+          body: JSON.stringify({
+            username: username.value.trim(),
+            password: password.value,
+            port: port && port.value ? Number(port.value) : null,
+          }),
         });
         const payload = await response.json().catch(() => ({}));
-        if (!response.ok) throw Error(payload.detail || uiLabel("sshLoginFailed"));
+        if (!response.ok) {
+          const detail = typeof payload.detail === "string" ? payload.detail : uiLabel("sshLoginFailed");
+          throw Error(detail);
+        }
         password.value = "";
         dialog.close();
         resolve(true);

@@ -40,6 +40,18 @@ document.addEventListener("click", async event => {
       } catch (error) { renderApprovalCenter(); toast(error.message); }
       return;
     }
+    if (button.id === "thread-owner-takeover") {
+      if (!state.selectedId) return toast("请先选择一个会话");
+      const pids = (state.selectedTask?.foreign_writer_pids || []).join(", ");
+      if (!await appConfirm(uiLabel("foreignWriterTakeoverConfirm", { pids }), { danger: true })) return;
+      button.disabled = true;
+      const result = await api(`/tasks/${encodeURIComponent(state.selectedId)}/takeover`, { method: "POST" });
+      const stopped = (result.stopped || []).join(", ");
+      const remaining = (result.remaining || []).join(", ");
+      toast(remaining ? uiLabel("foreignWriterTakeoverFailed", { pids: remaining }) : uiLabel("foreignWriterTakeoverDone", { pids: stopped || pids }));
+      await refresh(false);
+      return;
+    }
     if (button.dataset.sessionId) return selectSession(button.dataset.sessionId);
     if (button.dataset.queueClear !== undefined) {
       if (!state.selectedId || !await appConfirm(uiLabel("clearQueueConfirm"), { danger: true })) return;
