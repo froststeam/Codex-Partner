@@ -2,7 +2,7 @@
 const DEFAULT_USER_AVATAR = "/default-user-avatar.webp?v=20260818";
 const state = {
   tasks: [], sessions: [], skills: [], providers: [], memories: [], generatedMemories: [], commands: [], sshHosts: [], sshConfig: "", activeSSHHost: localStorage.getItem("codex-dashboard-ssh-host") || "",
-  selectedId: null, selectedTask: null, selectedEvents: [], selectedMessages: [], pendingApprovals: [], sessionRequestId: 0, sessionAbortController: null, workspacePath: "", workspaceFile: null, workspaceRequestId: 0, workspacePickerPath: "", workspaceUploading: false, inspectorClosed: false, filter: "all", query: "",
+  selectedId: null, selectedTask: null, selectedEvents: [], selectedMessages: [], pendingApprovals: [], sessionRequestId: 0, sessionAbortController: null, workspacePath: "", workspaceFile: null, workspaceRequestId: 0, workspacePickerPath: "", workspaceUploading: false, inspectorClosed: false, focusMode: localStorage.getItem("codex-partner-focus-mode") === "1", focusRestoreLayout: null, chatSearchQuery: "", chatSearchResults: [], chatSearchIndex: -1, chatSearchRequestId: 0, filter: "all", query: "",
   historyCursor: "", historyHasMore: false, historyLoading: false, chatBlocks: [], chatVirtualStart: null, chatAverageHeight: 112, activityVisibleCounts: {}, activityOutputOpen: {}, explorationNodes: [], explorationEdges: [], explorationEvents: [], explorationOpen: false, explorationSelectedNodeId: "", explorationLoading: false, explorationHistoryComplete: false, explorationLoadedEventCount: 0, explorationLoadError: "", explorationRequestId: 0, explorationRevision: 0, explorationNeedsSync: false, explorationPrecomputed: false, explorationMapStatus: "pending", explorationProcessedEvents: 0,
   commandIndex: 0, rawActivity: true, composerHistory: [], historyIndex: -1, editingQueuedId: null, defaultWorkspace: "", codexAvailable: true, codexInstall: null, codexInfo: null,
   runtimeMetrics: { taskId: "", ttftMs: null, tpotMs: null, estimated: true, outputTokens: 0 }, serverInfo: { user: "", hostname: "" }, chatSnapToBottom: false, chatSelectionActive: false, chatPointerSelecting: false, chatPointerDragged: false, chatPointerStartX: 0, chatPointerStartY: 0, userAvatar: localStorage.getItem("codex-dashboard-user-avatar") || DEFAULT_USER_AVATAR,
@@ -42,6 +42,28 @@ const UI_LABELS = {
   activityTool: { zh: "正在调用工具", en: "Using tool", fr: "Utilisation d’un outil", ja: "ツールを使用中", ko: "도구 사용 중" },
   activityToolDone: { zh: "工具调用完成", en: "Tool completed", fr: "Outil terminé", ja: "ツール完了", ko: "도구 호출 완료" },
   activitySearch: { zh: "正在检索资料", en: "Searching", fr: "Recherche", ja: "検索中", ko: "검색 중" },
+  activityPlanned: { zh: "已规划", en: "Planned", fr: "Planifié", ja: "計画済み", ko: "계획됨" },
+  activityWaited: { zh: "已等待", en: "Waited", fr: "Attente terminée", ja: "待機済み", ko: "대기 완료" },
+  activityEdited: { zh: "已修改", en: "Edited", fr: "Modifié", ja: "編集済み", ko: "수정됨" },
+  activityCalled: { zh: "已调用", en: "Called", fr: "Appelé", ja: "呼び出し済み", ko: "호출됨" },
+  activityExplored: { zh: "已探索", en: "Explored", fr: "Exploré", ja: "探索済み", ko: "탐색됨" },
+  activityReasoned: { zh: "已分析", en: "Reasoned", fr: "Raisonné", ja: "分析済み", ko: "분석됨" },
+  activityRan: { zh: "已运行", en: "Ran", fr: "Exécuté", ja: "実行済み", ko: "실행됨" },
+  activityRunning: { zh: "执行中", en: "Running", fr: "En cours", ja: "実行中", ko: "실행 중" },
+  activityCompleted: { zh: "已完成", en: "Completed", fr: "Terminé", ja: "완료", ko: "완료" },
+  activityFailed: { zh: "失败", en: "Failed", fr: "Échec", ja: "失敗", ko: "실패" },
+  activityNoOutput: { zh: "无输出", en: "No output", fr: "Aucune sortie", ja: "出力なし", ko: "출력 없음" },
+  activityViewTranscript: { zh: "查看完整输出", en: "View full transcript", fr: "Voir la sortie complète", ja: "完全な出力を表示", ko: "전체 출력 보기" },
+  activityErrorOutput: { zh: "错误输出", en: "Error output", fr: "Sortie d’erreur", ja: "エラー出力", ko: "오류 출력" },
+  activityHistory: { zh: "已完成活动", en: "Completed activity", fr: "Activité terminée", ja: "完了したアクティビティ", ko: "완료된 활동" },
+  activitySteps: { zh: "{{completed}}/{{total}} 步骤", en: "{{completed}}/{{total}} steps", fr: "{{completed}}/{{total}} étapes", ja: "{{completed}}/{{total}} ステップ", ko: "{{completed}}/{{total}} 단계" },
+  activityBackgroundTask: { zh: "后台任务", en: "background task", fr: "tâche en arrière-plan", ja: "バックグラウンドタスク", ko: "백그라운드 작업" },
+  searchConversation: { zh: "搜索当前会话", en: "Search this conversation", fr: "Rechercher dans cette conversation", ja: "この会話を検索", ko: "현재 대화 검색" },
+  searchNoResults: { zh: "没有匹配内容", en: "No matches", fr: "Aucun résultat", ja: "一致する内容なし", ko: "일치하는 내용 없음" },
+  searchLoading: { zh: "正在加载更早消息…", en: "Loading older messages…", fr: "Chargement des messages précédents…", ja: "以前のメッセージを読み込み中…", ko: "이전 메시지 로드 중…" },
+  searchMatchCount: { zh: "{{current}}/{{total}}", en: "{{current}}/{{total}}", fr: "{{current}}/{{total}}", ja: "{{current}}/{{total}}", ko: "{{current}}/{{total}}" },
+  searchMessage: { zh: "消息", en: "Message", fr: "Message", ja: "メッセージ", ko: "메시지" },
+  searchActivity: { zh: "活动", en: "Activity", fr: "Activité", ja: "アクティビティ", ko: "활동" },
   loadEarlierActivity: { zh: "查看较早活动（{{count}}）", en: "Load earlier activity ({{count}})", fr: "Charger les activités précédentes ({{count}})", ja: "以前のアクティビティを表示（{{count}}）", ko: "이전 활동 보기 ({{count}})" },
   sending: { zh: "发送中", en: "Sending", fr: "Envoi", ja: "送信中", ko: "전송 중" },
   steering: { zh: "当前 turn", en: "Current turn", fr: "Tour actuel", ja: "現在のターン", ko: "현재 턴" },
@@ -200,6 +222,12 @@ const UI_LABELS = {
   shortcutPrevious: { zh: "上个会话", en: "Previous", fr: "Précédente", ja: "前へ", ko: "이전" },
   shortcutFirst: { zh: "首个会话", en: "First", fr: "Première", ja: "先頭", ko: "처음" },
   shortcutComposer: { zh: "输入框", en: "Composer", fr: "Saisie", ja: "入力欄", ko: "입력창" },
+  shortcutFocus: { zh: "专注模式", en: "Focus", fr: "Concentration", ja: "集中", ko: "집중 모드" },
+  shortcutSend: { zh: "发送", en: "Send", fr: "Envoyer", ja: "送信", ko: "보내기" },
+  shortcutNewline: { zh: "换行", en: "New line", fr: "Nouvelle ligne", ja: "改行", ko: "줄바꿈" },
+  shortcutInsert: { zh: "插入", en: "Insert", fr: "Insérer", ja: "挿入", ko: "삽입" },
+  composerPlaceholderWithShortcuts: { zh: "给 Codex 发送消息…\nEnter 发送 · Shift+Enter 换行 · Alt+Enter 插入", en: "Message Codex…\nEnter send · Shift+Enter new line · Alt+Enter insert", fr: "Écrire à Codex…\nEntrée envoyer · Maj+Entrée nouvelle ligne · Alt+Entrée insérer", ja: "Codex にメッセージ…\nEnter 送信 · Shift+Enter 改行 · Alt+Enter 挿入", ko: "Codex에 메시지 보내기…\nEnter 전송 · Shift+Enter 줄바꿈 · Alt+Enter 삽입" },
+  composerPlaceholderShortcuts: { zh: "Enter 发送 · Shift Enter 换行 · Alt Enter 插入", en: "Enter send · Shift Enter new line · Alt Enter insert", fr: "Entrée envoyer · Maj Entrée nouvelle ligne · Alt Entrée insérer", ja: "Enter 送信 · Shift Enter 改行 · Alt Enter 挿入", ko: "Enter 전송 · Shift Enter 줄바꿈 · Alt Enter 삽입" },
   shortcutComposerToggle: { zh: "聚焦/取消聚焦输入框", en: "Focus or unfocus the composer", fr: "Activer ou quitter la zone de saisie", ja: "入力欄のフォーカスを切り替え", ko: "입력창 포커스 전환" },
   stopAction: { zh: "停止", en: "Stop", fr: "Arrêter", ja: "停止", ko: "중지" },
   stopActiveGoalConfirm: { zh: "停止会话会同时关闭自动重试并暂停当前 Goal，是否继续？", en: "Stopping the session will also disable auto-resume and pause the active Goal. Continue?", fr: "Arrêter la session désactivera aussi la reprise automatique et mettra l’objectif en pause. Continuer ?", ja: "セッションを停止すると自動再開が無効になり、Goal も一時停止します。続行しますか？", ko: "세션을 중지하면 자동 재개가 꺼지고 현재 Goal도 일시 중지됩니다. 계속할까요?" },
@@ -212,6 +240,7 @@ const UI_LABELS = {
   serverDirectory: { zh: "服务器目录", en: "Server directory", fr: "Dossier serveur", ja: "サーバーディレクトリ", ko: "서버 디렉터리" },
   attachments: { zh: "附件", en: "Attachments", fr: "Pièces jointes", ja: "添付ファイル", ko: "첨부 파일" },
   filesReady: { zh: "{{count}} 个文件已加入下一条消息", en: "{{count}} files added to the next message", fr: "{{count}} fichiers ajoutés au prochain message", ja: "{{count}}個のファイルを次のメッセージに追加", ko: "{{count}}개 파일을 다음 메시지에 추가" },
+  longPasteAttached: { zh: "长文本已转换为文件附件", en: "Long pasted text was attached as a file", fr: "Le texte long a été joint comme fichier", ja: "長いテキストをファイルとして添付しました", ko: "긴 텍스트를 파일로 첨부했습니다" },
   fileReadFailed: { zh: "文件读取失败：{{name}}", en: "Could not read file: {{name}}", fr: "Lecture impossible : {{name}}", ja: "ファイルを読み込めません：{{name}}", ko: "파일을 읽을 수 없음: {{name}}" },
   fileUploadFailed: { zh: "文件上传失败：{{name}}", en: "Could not upload file: {{name}}", fr: "Envoi impossible : {{name}}", ja: "ファイルをアップロードできません：{{name}}", ko: "파일을 업로드할 수 없음: {{name}}" },
   binaryAttachment: { zh: "已上传到工作区：{{path}}", en: "Uploaded to workspace: {{path}}", fr: "Téléversé dans l’espace : {{path}}", ja: "ワークスペースにアップロード済み：{{path}}", ko: "작업 공간에 업로드됨: {{path}}" },
@@ -479,7 +508,7 @@ window.i18next.init({
   interpolation: { escapeValue: false },
 });
 function uiLabel(key, options = {}) { return t(key, key, options); }
-function mascotMarkup(className = "") { return `<span class="mascot mascot-inline ${className}" aria-hidden="true"><i></i><b></b><em></em></span>`; }
+function mascotMarkup(className = "") { return `<span class="mascot mascot-inline ${className}" aria-hidden="true"><i></i><b></b><em></em><span class="mascot-steam mascot-steam-a"></span><span class="mascot-steam mascot-steam-b"></span></span>`; }
 function humanMarkup(className = "") {
   if (state.userAvatar) return `<span class="human-avatar image-avatar ${className}" aria-hidden="true"><img class="human-avatar-image" src="${esc(state.userAvatar)}" alt="" /></span>`;
   return `<span class="human-avatar ${className}" aria-hidden="true"><i></i><b></b></span>`;
@@ -526,9 +555,9 @@ function applyLanguage(language = state.language) {
   window.i18next.changeLanguage(state.language);
   localStorage.setItem("codex-dashboard-language", state.language);
   document.documentElement.lang = state.language === "zh" ? "zh-CN" : state.language;
-  const text = { "#new-task span": "newSession", ".shortcut-hint:nth-child(1) .shortcut-label": "terminal", ".shortcut-hint:nth-child(2) .shortcut-label": "shortcutNext", ".shortcut-hint:nth-child(3) .shortcut-label": "shortcutPrevious", ".shortcut-hint:nth-child(4) .shortcut-label": "shortcutFirst", ".shortcut-hint:nth-child(5) .shortcut-label": "shortcutComposer", ".sidebar-top h1": "sessions", ".filter[data-filter=all]": "all", ".filter[data-filter=running]": "running", ".filter[data-filter=available]": "available", ".trash-filter": "trash", ".sidebar-link[data-panel=memories] span": "memories", ".sidebar-link[data-panel=skills] span": "skills", "#empty-conversation h2": "emptyTitle", "#empty-conversation p": "emptyCopy", "#empty-new-task": "create", "#send-codex-label": "send", "#message-input": "composerPlaceholder", "#session-search": "searchSessions", ".composer-model-control > span": "model", ".composer-effort-control > span": "effort", "#inspector .inspector-head h2": "workspace", "#goal-bar .eyebrow": "goal", "#goal-clear": "clear", "#goal-edit-cancel": "cancel", "#goal-edit-form .primary-small": "save", "#goal-input": "goalInput", "#composer-live-state > span": "ready", "#terminal-eyebrow": "terminalRemoteShell", "#terminal-title": "terminalTitle", "#terminal-cwd": "terminalNotConnected", "#terminal-hint": "terminalHint", "#terminal-reconnect": "terminalReconnect", "#terminal-screen": "terminalOutput", "#exploration-map-open-label": "explorationOpen", "#exploration-map-eyebrow": "explorationEyebrow", "#exploration-map-title": "explorationTitle", "#exploration-map-description": "explorationDescription", "#exploration-zoom-fit": "explorationFit", "#exploration-follow-label": "explorationFollow", "#exploration-load-older": "explorationRetry" };
+  const text = { "#new-task span": "newSession", ".shortcut-hints > .shortcut-hint:nth-child(1) .shortcut-label": "terminal", ".shortcut-hints > .shortcut-hint:nth-child(2) .shortcut-label": "shortcutNext", ".shortcut-hints > .shortcut-hint:nth-child(3) .shortcut-label": "shortcutPrevious", ".shortcut-hints > .shortcut-hint:nth-child(4) .shortcut-label": "shortcutFirst", ".shortcut-hints > .shortcut-hint:nth-child(5) .shortcut-label": "shortcutComposer", ".shortcut-hints > .shortcut-hint:nth-child(6) .shortcut-label": "shortcutFocus", ".sidebar-top h1": "sessions", ".filter[data-filter=all]": "all", ".filter[data-filter=running]": "running", ".filter[data-filter=available]": "available", ".trash-filter": "trash", ".sidebar-link[data-panel=memories] span": "memories", ".sidebar-link[data-panel=skills] span": "skills", "#empty-conversation h2": "emptyTitle", "#empty-conversation p": "emptyCopy", "#empty-new-task": "create", "#send-codex-label": "send", "#message-input": "composerPlaceholderWithShortcuts", "#session-search": "searchSessions", ".composer-model-control > span": "model", ".composer-effort-control > span": "effort", "#inspector .inspector-head h2": "workspace", "#goal-bar .eyebrow": "goal", "#goal-clear": "clear", "#goal-edit-cancel": "cancel", "#goal-edit-form .primary-small": "save", "#goal-input": "goalInput", "#composer-live-state > span": "ready", "#terminal-eyebrow": "terminalRemoteShell", "#terminal-title": "terminalTitle", "#terminal-cwd": "terminalNotConnected", "#terminal-hint": "terminalHint", "#terminal-reconnect": "terminalReconnect", "#terminal-screen": "terminalOutput", "#exploration-map-open-label": "explorationOpen", "#exploration-map-eyebrow": "explorationEyebrow", "#exploration-map-title": "explorationTitle", "#exploration-map-description": "explorationDescription", "#exploration-zoom-fit": "explorationFit", "#exploration-follow-label": "explorationFollow", "#exploration-load-older": "explorationRetry" };
   for (const [selector, key] of Object.entries(text)) { const node = $(selector); if (!node) continue; if (["#message-input", "#session-search"].includes(selector)) node.placeholder = t(key); else if (selector === "#terminal-screen") node.setAttribute("aria-label", t(key)); else node.textContent = t(key); }
-  const titles = { "#open-terminal": "terminal", "#sync-native": "sync", "#conversation-rename": "rename", "#conversation-fork": "fork", "#conversation-more": "more", "#language-select": "language", "#goal-edit": "editGoal", "#inspector": "workspace", "#composer-meta": "session", "#terminal-close": "terminalClose", ".shortcut-hint:nth-child(1)": "shortcutTerminal", ".shortcut-hint:nth-child(2)": "shortcutNext", ".shortcut-hint:nth-child(3)": "shortcutPrevious", ".shortcut-hint:nth-child(4)": "shortcutFirst", ".shortcut-hint:nth-child(5)": "shortcutComposerToggle", "#exploration-map-open": "explorationOpen", "#exploration-zoom-out": "explorationZoomOut", "#exploration-zoom-reset": "explorationZoomReset", "#exploration-zoom-in": "explorationZoomIn", "#exploration-zoom-fit": "explorationFitTitle", "#exploration-map-close": "explorationClose" };
+  const titles = { "#open-terminal": "terminal", "#sync-native": "sync", "#conversation-rename": "rename", "#conversation-fork": "fork", "#conversation-more": "more", "#language-select": "language", "#goal-edit": "editGoal", "#inspector": "workspace", "#composer-meta": "session", "#terminal-close": "terminalClose", ".shortcut-hints > .shortcut-hint:nth-child(1)": "shortcutTerminal", ".shortcut-hints > .shortcut-hint:nth-child(2)": "shortcutNext", ".shortcut-hints > .shortcut-hint:nth-child(3)": "shortcutPrevious", ".shortcut-hints > .shortcut-hint:nth-child(4)": "shortcutFirst", ".shortcut-hints > .shortcut-hint:nth-child(5)": "shortcutComposerToggle", ".shortcut-hints > .shortcut-hint:nth-child(6)": "shortcutFocus", "#exploration-map-open": "explorationOpen", "#exploration-zoom-out": "explorationZoomOut", "#exploration-zoom-reset": "explorationZoomReset", "#exploration-zoom-in": "explorationZoomIn", "#exploration-zoom-fit": "explorationFitTitle", "#exploration-map-close": "explorationClose" };
   for (const [selector, key] of Object.entries(titles)) { const node = $(selector); if (node) { node.title = t(key); node.setAttribute("aria-label", t(key)); } }
   const explorationZoom = $("#exploration-map .exploration-zoom"); if (explorationZoom) explorationZoom.setAttribute("aria-label", t("explorationZoomGroup"));
   const explorationViewport = $("#exploration-map-viewport"); if (explorationViewport) explorationViewport.title = t("explorationViewportHint");
@@ -540,7 +569,19 @@ function applyLanguage(language = state.language) {
 }
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+function decorateMascots() {
+  $$(".mascot").forEach(mascot => {
+    if (mascot.querySelector(".mascot-steam")) return;
+    mascot.insertAdjacentHTML("beforeend", '<span class="mascot-steam mascot-steam-a"></span><span class="mascot-steam mascot-steam-b"></span>');
+  });
+}
 const esc = (value = "") => String(value).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;", "'":"&#39;"}[c]));
+function placeComposerShortcuts() {
+  const source = $(".shortcut-hints");
+  if (!source) return;
+  $$(".shortcut-hint", source).slice(6).forEach(item => item.remove());
+}
+placeComposerShortcuts();
 applyLanguage();
 function setInspectorOpen(open) {
   const inspector = $("#inspector");
@@ -549,11 +590,12 @@ function setInspectorOpen(open) {
   inspector.classList.toggle("closed", !open);
   inspector.setAttribute("aria-hidden", open ? "false" : "true");
 }
-function sessionSidebarIsOpen() {
+function sessionSidebarLayoutIsOpen() {
   const sidebar = $(".session-sidebar");
   if (!sidebar) return false;
   return window.innerWidth <= 860 ? sidebar.classList.contains("open") : !$(".workspace-app").classList.contains("sidebar-collapsed");
 }
+function sessionSidebarIsOpen() { return state.focusMode ? false : sessionSidebarLayoutIsOpen(); }
 function updateSessionSidebarControls() {
   const open = sessionSidebarIsOpen();
   const toggle = $("#sidebar-toggle");
@@ -569,6 +611,7 @@ function setSessionSidebarOpen(open, persist = true) {
   const sidebar = $(".session-sidebar");
   const workspace = $(".workspace-app");
   if (!sidebar || !workspace) return;
+  if (state.focusMode && persist) state.focusRestoreLayout = { ...(state.focusRestoreLayout || {}), sidebarOpen: Boolean(open) };
   if (window.innerWidth <= 860) {
     sidebar.classList.toggle("open", open);
     workspace.classList.remove("sidebar-collapsed");
@@ -583,6 +626,31 @@ function toggleSessionSidebar() { setSessionSidebarOpen(!sessionSidebarIsOpen())
 function restoreSessionSidebar() {
   setSessionSidebarOpen(window.innerWidth <= 860 ? false : localStorage.getItem("codex-partner-sidebar-collapsed") !== "1", false);
 }
+function setFocusMode(enabled, persist = true) {
+  const next = Boolean(enabled);
+  if (next && (!state.focusMode || !state.focusRestoreLayout)) {
+    state.focusRestoreLayout = {
+      sidebarOpen: sessionSidebarLayoutIsOpen(),
+      inspectorOpen: Boolean($("#inspector")?.classList.contains("open")),
+    };
+  }
+  const restore = !next && state.focusRestoreLayout ? { ...state.focusRestoreLayout } : null;
+  state.focusMode = next;
+  $(".workspace-app")?.classList.toggle("focus-mode", state.focusMode);
+  document.documentElement.classList.toggle("focus-mode", state.focusMode);
+  if (persist) localStorage.setItem("codex-partner-focus-mode", state.focusMode ? "1" : "0");
+  if (restore) {
+    state.focusRestoreLayout = null;
+    setSessionSidebarOpen(restore.sidebarOpen !== false, false);
+    state.inspectorClosed = !restore.inspectorOpen;
+    setInspectorOpen(restore.inspectorOpen && window.innerWidth >= 861);
+  }
+  updateSessionSidebarControls();
+  $(".session-sidebar")?.setAttribute("aria-hidden", state.focusMode ? "true" : String(!sessionSidebarIsOpen()));
+  $("#inspector")?.setAttribute("aria-hidden", state.focusMode ? "true" : String(state.inspectorClosed));
+  if (persist) toast(state.focusMode ? "已进入专注模式" : "已退出专注模式");
+}
+function toggleFocusMode() { setFocusMode(!state.focusMode); }
 let socket = null;
 let socketTaskId = null;
 let socketReconnectTimer = null;
@@ -972,6 +1040,8 @@ function activityPhase(value) {
   if (type.includes("file") || method.includes("file")) return "phaseFiles";
   if (type.includes("tool") || type.includes("mcp") || method.includes("tool")) return "phaseTools";
   if (type.includes("search") || method.includes("search")) return "phaseSearch";
+  if (method === "thread/tokenusage/updated") return "phaseCompact";
+  if (method === "thread/compacted") return "";
   if (type === "contextcompaction" || method.includes("compact")) return "phaseCompact";
   if (type === "provider_failover") return "phaseProvider";
   if (type === "externalturnstarted") return "phaseTerminalSynced";

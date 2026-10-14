@@ -2,8 +2,10 @@
 const chatFileObjectUrls = new Map();
 const chatThumbnailObjectUrls = new Map();
 const chatThumbnailLoads = new Map();
-const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260821-stream-markdown-preview") : null;
+const chatWorker = typeof Worker === "function" ? new Worker("/chat-worker.js?v=20260831-focus-wide") : null;
 const conversationSnapshots = new Map();
+const terminalSockets = new Map();
+const terminalBuffers = new Map();
 let chatBuildRequestId = 0;
 let chatBuildInFlight = false;
 let chatBuildQueued = false;
@@ -113,11 +115,12 @@ async function selectSession(id, openSocket = true) {
   state.sessionAbortController?.abort();
   const controller = new AbortController();
   state.sessionAbortController = controller;
-  if (terminalTaskId && terminalTaskId !== id) closeTerminal();
+  if (terminalTaskId && terminalTaskId !== id) hideTerminal();
   if (socket && socketTaskId !== id) { socket.onclose = null; socket.close(); socket = null; socketTaskId = ""; }
   const wasEmpty = $("#conversation-view").hidden;
   if (state.selectedId !== id) {
     resetWorkspaceBrowser(); state.titleExpanded = false; state.historyCursor = ""; state.historyHasMore = false;
+    state.chatSearchQuery = ""; state.chatSearchResults = []; state.chatSearchIndex = -1; state.chatSearchRequestId += 1; state.chatSearchLoading = false;
     state.historyLoading = false; state.chatBlocks = []; state.chatVirtualStart = null; state.activityVisibleCounts = {}; state.activityOutputOpen = {}; state.explorationNodes = []; state.explorationEdges = []; state.explorationEvents = []; state.explorationSelectedNodeId = ""; state.explorationLoading = false; state.explorationHistoryComplete = false; state.explorationLoadedEventCount = 0; state.explorationLoadError = ""; state.explorationRequestId += 1; state.explorationRevision = 0; state.explorationNeedsSync = false; state.explorationPrecomputed = false; state.explorationMapStatus = "pending"; state.explorationProcessedEvents = 0; state.pendingApprovals = [];
     state.selectedEvents = []; state.selectedMessages = []; state.composerHistory = []; state.historyIndex = -1;
     if (typeof renderExplorationMap === "function") renderExplorationMap();
@@ -438,7 +441,7 @@ function renderGoalBar() {
   $("#send-codex").classList.toggle("stop-mode", stopping);
   $("#send-codex").querySelector("span:last-child").textContent = stopping ? "■" : "↑";
   $("#send-codex").title = state.editingQueuedId ? uiLabel("saveQueued") : (stopping ? uiLabel("stopCodex") : uiLabel("startCodex"));
-  $("#message-input").placeholder = state.editingQueuedId ? uiLabel("editQueued") : t("composerPlaceholder");
+  $("#message-input").placeholder = state.editingQueuedId ? uiLabel("editQueued") : t("composerPlaceholderWithShortcuts");
 }
 function renderQueuedMessages() {
   const strip = $("#queued-messages");
@@ -495,6 +498,62 @@ function approvalAnswers() {
   });
   return answers;
 }
+function chatSearchText(block) {
+  if (!block) return "";
+  if (block.role === "activities") return (block.items || []).map(activityCopyText).filter(Boolean).join("\n");
+  return String(block.text || block.rawText || "").trim();
+}
+function chatSearchSnippet(text, query) {
+  const source = String(text || "").replace(/\s+/g, " ").trim();
+  const at = source.toLocaleLowerCase().indexOf(String(query || "").toLocaleLowerCase());
+  if (at < 0) return source.slice(0, 150);
+  const start = Math.max(0, at - 58), end = Math.min(source.length, at + String(query).length + 92);
+  return `${start ? "…" : ""}${source.slice(start, end)}${end < source.length ? "…" : ""}`;
+}
+function collectChatSearchResults() {
+  const query = String(state.chatSearchQuery || "").trim().toLocaleLowerCase();
+  if (!query) return [];
+  return (state.chatBlocks || []).reduce((matches, block, blockIndex) => {
+    const text = chatSearchText(block);
+    if (text.toLocaleLowerCase().includes(query)) matches.push({ blockIndex, role: block.role === "activities" ? "activity" : block.role, snippet: chatSearchSnippet(text, query) });
+    return matches;
+  }, []);
+}
+function applyChatSearchHighlight() {
+  const active = state.chatSearchResults?.[state.chatSearchIndex];
+  $$(`[data-chat-block-index]`, $("#chat-log") || document).forEach(node => node.classList.toggle("chat-search-hit", Boolean(active && Number(node.dataset.chatBlockIndex) === active.blockIndex)));
+}
+function renderChatSearchResults() {
+  const count = $("#conversation-search-count"), results = $("#conversation-search-results");
+  if (!count || !results) return;
+  const matches = state.chatSearchResults || [], current = matches.length ? Math.max(0, state.chatSearchIndex) + 1 : 0;
+  count.textContent = state.chatSearchLoading ? uiLabel("searchLoading") : matches.length ? uiLabel("searchMatchCount", { current, total: matches.length }) : state.chatSearchQuery ? uiLabel("searchNoResults") : "";
+  results.hidden = !matches.length;
+  results.innerHTML = matches.map((match, index) => `<button class="conversation-search-result${index === state.chatSearchIndex ? " active" : ""}" type="button" role="option" aria-selected="${index === state.chatSearchIndex}" data-chat-search-index="${index}"><span class="conversation-search-result-role">${esc(match.role === "activity" ? uiLabel("searchActivity") : uiLabel("searchMessage"))}</span><span>${esc(match.snippet)}</span></button>`).join("");
+  applyChatSearchHighlight();
+}
+function jumpToChatSearchResult(index) {
+  const result = state.chatSearchResults?.[index];
+  if (!result) return;
+  state.chatSearchIndex = index; state.chatVirtualStart = Math.max(0, result.blockIndex - 8); paintVirtualChat(false);
+  requestAnimationFrame(() => { const node = $(`[data-chat-block-index="${result.blockIndex}"]`, $("#chat-log")); node?.scrollIntoView({ block: "center", behavior: "smooth" }); node?.classList.add("chat-search-hit-pulse"); setTimeout(() => node?.classList.remove("chat-search-hit-pulse"), 900); renderChatSearchResults(); });
+}
+async function refreshChatSearch(loadOlder = true) {
+  const requestId = ++state.chatSearchRequestId;
+  state.chatSearchResults = collectChatSearchResults(); state.chatSearchIndex = state.chatSearchResults.length ? Math.min(Math.max(0, state.chatSearchIndex), state.chatSearchResults.length - 1) : -1; renderChatSearchResults();
+  while (loadOlder && state.historyHasMore && requestId === state.chatSearchRequestId) {
+    state.chatSearchLoading = true; renderChatSearchResults(); await loadOlderTimeline();
+    state.chatSearchResults = collectChatSearchResults(); if (state.chatSearchIndex < 0 && state.chatSearchResults.length) state.chatSearchIndex = 0; renderChatSearchResults();
+  }
+  state.chatSearchLoading = false; renderChatSearchResults();
+}
+function setChatSearchOpen(open) {
+  const bar = $("#conversation-searchbar"); if (!bar) return;
+  bar.hidden = !open;
+  if (open) { $("#conversation-search-input")?.focus(); $("#conversation-search-input")?.select(); }
+  else { state.chatSearchQuery = ""; state.chatSearchResults = []; state.chatSearchIndex = -1; renderChatSearchResults(); applyChatSearchHighlight(); }
+}
+
 function renderChat() {
   if (state.chatSelectionActive) { state.chatRenderDeferred = true; return; }
   const stream = $("#chat-log");
@@ -673,7 +732,7 @@ function activityEventIsVisible(item, active = false) {
 
 function renderActivityEvent(item, active = false, blockIndex = -1, itemIndex = -1, outputKey = "") {
   const status = String(item.status || "").toLowerCase();
-  const statusText = status === "failed" ? "失败" : active ? "执行中" : "";
+  const statusText = status === "failed" ? uiLabel("activityFailed") : active ? uiLabel("activityRunning") : status === "completed" || status === "succeeded" ? uiLabel("activityCompleted") : "";
   const statusClass = status === "failed" ? " failed" : status === "completed" || status === "succeeded" ? " completed" : "";
   const kind = String(item.kind || "").toLowerCase();
   const command = String(item.command || "").trim();
@@ -684,14 +743,19 @@ function renderActivityEvent(item, active = false, blockIndex = -1, itemIndex = 
   const isWait = kind.includes("wait") || /(?:^|[._])wait$/.test(String(item.tool || ""));
   const toolName = String(item.tool || "").toLowerCase();
   if (!activityEventIsVisible(item, active)) return "";
-  const action = plan.length || kind.includes("plan") ? "Planned" : isWait ? "Waited" : changes.length || kind.includes("file") ? "Edited" : kind.includes("mcp") || (!command && item.tool) ? "Called" : kind.includes("search") || kind.includes("explor") ? "Explored" : kind.includes("reason") ? "Reasoned" : command ? "Ran" : item.label || uiLabel("activityWorking");
+  const action = plan.length || kind.includes("plan") ? (active ? uiLabel("activityPlanning") : uiLabel("activityPlanned")) : isWait ? (active ? uiLabel("activityWorking") : uiLabel("activityWaited")) : changes.length || kind.includes("file") ? (active ? uiLabel("activityFile") : uiLabel("activityEdited")) : kind.includes("mcp") || (!command && item.tool) ? (active ? uiLabel("activityTool") : uiLabel("activityCalled")) : kind.includes("search") || kind.includes("explor") ? (active ? uiLabel("activitySearch") : uiLabel("activityExplored")) : kind.includes("reason") ? (active ? uiLabel("activityPlanning") : uiLabel("activityReasoned")) : command ? (active ? uiLabel("activityCommand") : uiLabel("activityRan")) : item.label || uiLabel("activityWorking");
   const inlineArgs = args ? args.replace(/\s+/g, " ") : "";
   const completedPlanSteps = plan.filter(step => step.status === "completed").length;
-  const subject = plan.length ? `${completedPlanSteps}/${plan.length} steps` : isWait ? "for background task" : command || (item.tool ? `${item.tool}${inlineArgs ? `(${inlineArgs})` : ""}` : String(item.detail || ""));
-  const cwd = item.cwd ? `<small class="activity-cwd" title="${esc(item.cwd)}">${esc(item.cwd)}</small>` : "";
+  const subject = plan.length ? uiLabel("activitySteps", { completed: completedPlanSteps, total: plan.length }) : isWait ? uiLabel("activityBackgroundTask") : command || (item.tool ? `${item.tool}${inlineArgs ? `(${inlineArgs})` : ""}` : String(item.detail || ""));
+  const cwd = item.cwd ? `<span class="activity-cwd-path"><small class="activity-cwd" title="${esc(item.cwd)}">${esc(item.cwd)}</small><button type="button" class="path-copy-button" data-copy-path="${esc(item.cwd)}" title="复制工作目录" aria-label="复制工作目录">⧉</button></span>` : "";
   const subjectBlock = subject ? `<code class="activity-inline-subject" title="${esc(subject)}">${esc(subject)}</code>` : "";
-  const changesBlock = changes.length ? `<div class="activity-changes">${changes.slice(0, 8).map(change => `<span>${esc(change.kind || "update")} · ${esc(change.path || change)}</span>`).join("")}</div>` : "";
-  const planBlock = plan.length ? `<ol class="activity-plan">${plan.map(step => { const state = String(step.status || "pending"); const mark = state === "completed" ? "✓" : state === "in_progress" ? "›" : "·"; return `<li class="${esc(state)}"><span>${mark}</span><span>${esc(step.step || step.text)}</span></li>`; }).join("")}</ol>` : "";
+  const changeValue = (change, key, fallback = "") => {
+    const value = change?.[key];
+    if (value && typeof value === "object") return value.type || value.path || fallback;
+    return value || fallback;
+  };
+  const changesBlock = changes.length ? `<div class="activity-changes">${changes.slice(0, 8).map(change => `<span>${esc(changeValue(change, "kind", "update"))} · ${esc(changeValue(change, "path", typeof change === "string" ? change : ""))}</span>`).join("")}</div>` : "";
+  const planBlock = plan.length ? `<ol class="activity-plan">${plan.map(step => { const state = String(step.status || "pending").toLowerCase().replace(/-/g, "_"); const mark = state === "completed" ? "✓" : state === "in_progress" ? "›" : "·"; return `<li class="${esc(state)}"><span>${mark}</span><span>${esc(step.step || step.text)}</span></li>`; }).join("")}</ol>` : "";
   let outputBlock = "";
   if (output && !isWait && !plan.length) {
     const outputLines = output.split(/\r?\n/);
@@ -703,10 +767,10 @@ function renderActivityEvent(item, active = false, blockIndex = -1, itemIndex = 
       const preview = [...outputLines.slice(0, 5), `… +${hidden} lines`, ...outputLines.slice(-2)].join("\n");
       const remembered = Object.prototype.hasOwnProperty.call(state.activityOutputOpen, outputKey) ? state.activityOutputOpen[outputKey] : null;
       const outputOpen = remembered === null ? status === "failed" : remembered;
-      outputBlock = `<details class="activity-output activity-output-long" data-activity-output-key="${esc(outputKey)}"${outputOpen ? " open" : ""}><summary><code>${esc(preview)}</code><small>${status === "failed" ? "错误输出" : "查看完整 transcript"}${meta ? ` · ${esc(meta)}` : ""}</small></summary><code class="activity-output-full">${esc(output)}</code></details>`;
+      outputBlock = `<details class="activity-output activity-output-long" data-activity-output-key="${esc(outputKey)}"${outputOpen ? " open" : ""}><summary><code>${esc(preview)}</code><small>${status === "failed" ? uiLabel("activityErrorOutput") : uiLabel("activityViewTranscript")}${meta ? ` · ${esc(meta)}` : ""}</small></summary><code class="activity-output-full">${esc(output)}</code></details>`;
     }
   } else if (!active && (status === "completed" || status === "succeeded") && command) {
-    outputBlock = `<div class="activity-output empty"><code>(no output)</code></div>`;
+    outputBlock = `<div class="activity-output empty"><code>${esc(uiLabel("activityNoOutput"))}</code></div>`;
   }
   const copyButton = activityCopyText(item) ? `<button type="button" class="chat-copy-button activity-copy-button" data-copy-chat-block="${blockIndex}" data-copy-activity-item="${itemIndex}" title="复制这条活动" aria-label="复制这条活动">⧉</button>` : "";
   return `<div class="activity-event${active ? " current" : ""}${statusClass}"><span class="activity-event-dot" aria-hidden="true"></span><div class="activity-event-body"><div class="activity-event-head"><strong>${action}</strong>${subjectBlock}${cwd}<span class="activity-event-status">${statusText}</span>${copyButton}</div>${planBlock}${changesBlock}${outputBlock}</div></div>`;
@@ -716,15 +780,18 @@ function renderChatBlock(block, blockIndex, liveActivity = false) {
   const blockAttribute = ` data-chat-block-index="${blockIndex}"`;
   if (block.role === "activities") {
     const activityKey = String(block.activityKey || `activity-${blockIndex}`);
-    const displayItems = block.items.filter((item, index) => activityEventIsVisible(item, liveActivity && index === block.items.length - 1));
+    const liveItemCandidate = liveActivity ? [...block.items].reverse().find(item => !["completed", "succeeded", "failed"].includes(String(item.status || "").toLowerCase())) : null;
+    const displayItems = block.items.filter(item => activityEventIsVisible(item, liveItemCandidate === item));
     if (!displayItems.length) return "";
     const visibleCount = Math.max(16, Number(state.activityVisibleCounts[activityKey]) || 16);
     const items = displayItems.slice(-visibleCount);
     const latest = items[items.length - 1] || {};
-    const current = liveActivity ? `<span class="activity-current">${esc(latest.text || uiLabel("activityWorking"))}</span>` : "";
+    const liveItem = liveItemCandidate && items.includes(liveItemCandidate) ? liveItemCandidate : null;
+    const currentItem = liveItem || latest;
+    const current = liveActivity ? `<span class="activity-summary-state">${uiLabel("activityCurrent")}</span><span class="activity-current">${esc(currentItem.text || uiLabel("activityWorking"))}</span>` : `<span class="activity-summary-state">${uiLabel("activityHistory")}</span>`;
     const hiddenCount = displayItems.length - items.length;
     const older = hiddenCount ? `<button type="button" class="activity-load-older" data-activity-key="${esc(activityKey)}">${uiLabel("loadEarlierActivity", { count: hiddenCount })}</button>` : "";
-    return `<details class="activity-group${liveActivity ? " live" : ""}"${blockAttribute}${liveActivity ? ' data-live="true" open' : ""}><summary><span class="activity-pulse" aria-hidden="true"><i></i></span><strong>${uiLabel("activity")}</strong>${current}<small>${displayItems.length}</small></summary><div class="activity-events">${older}${items.map(item => { const itemIndex = block.items.indexOf(item); const outputKey = `activity-output:${activityKey}:${item.itemId || itemIndex}`; return renderActivityEvent(item, liveActivity && itemIndex === block.items.length - 1, blockIndex, itemIndex, outputKey); }).join("")}</div></details>`;
+    return `<details class="activity-group${liveActivity ? " live" : ""}"${blockAttribute}${liveActivity ? ' data-live="true" open' : ""}><summary><span class="activity-pulse" aria-hidden="true"><i></i></span><strong>${uiLabel("activity")}</strong>${current}<small>${displayItems.length}</small></summary><div class="activity-events">${older}${items.map(item => { const itemIndex = block.items.indexOf(item); const outputKey = `activity-output:${activityKey}:${item.itemId || itemIndex}`; return renderActivityEvent(item, liveItem && item === liveItem, blockIndex, itemIndex, outputKey); }).join("")}</div></details>`;
   }
   const deliveryLabels = { sending: uiLabel("sending"), steering: uiLabel("steering"), steered: uiLabel("steering"), queued: uiLabel("queued"), running: `${statusLabel("running")} · Codex`, failed: uiLabel("failedSend") };
   const label = block.role === "user" ? (block.commandBlock ? uiLabel("commandLabel") : "") : (block.commandBlock ? uiLabel("commandResult") : uiLabel("codexPartner"));
@@ -779,6 +846,7 @@ function paintVirtualChat(stickToBottom = false) {
   $$(".activity-output-long[data-activity-output-key]", stream).forEach(output => output.addEventListener("toggle", () => {
     state.activityOutputOpen[output.dataset.activityOutputKey] = output.open;
   }));
+  decorateCopyablePaths(stream);
   hydrateChatFiles();
   if (!stream.dataset.virtualScroll) {
     stream.dataset.virtualScroll = "1";
@@ -796,6 +864,7 @@ function paintVirtualChat(stickToBottom = false) {
     }, { passive: true });
   }
   restoreChatViewport(stream, viewport, stickToBottom);
+  applyChatSearchHighlight();
   state.chatSnapToBottom = false;
 }
 
@@ -845,6 +914,19 @@ function installChatSelectionGuard() {
       event.preventDefault(); event.stopImmediatePropagation(); return;
     }
     state.chatPointerDragged = false;
+    const pathButton = event.target.closest("[data-copy-path]");
+    if (pathButton) {
+      event.preventDefault(); event.stopImmediatePropagation();
+      const path = pathButton.dataset.copyPath || "";
+      if (!path) return;
+      try {
+        await copyText(path);
+        pathButton.classList.add("copied"); pathButton.textContent = "✓";
+        setTimeout(() => { pathButton.classList.remove("copied"); pathButton.textContent = "⧉"; }, 1200);
+        toast("已复制完整路径");
+      } catch (error) { toast(`复制失败：${error.message}`); }
+      return;
+    }
     const button = event.target.closest("[data-copy-chat-block]");
     if (!button) return;
     event.preventDefault(); event.stopPropagation();
@@ -868,6 +950,44 @@ function installChatSelectionGuard() {
   document.addEventListener("selectionchange", () => {
     if (state.chatSelectionActive && !state.chatPointerSelecting) setTimeout(releaseChatSelectionLock, 0);
   });
+}
+
+function looksLikeCopyablePath(value) {
+  const path = String(value || "").trim();
+  if (!path || /[\r\n]/.test(path) || /^[a-z]+:\/\//i.test(path)) return false;
+  return /^(?:~[\\/]|[\\/]|[a-z]:[\\/]|\.{1,2}[\\/])/i.test(path)
+    || path.length >= 12 && /^[\w.@+-]+[\\/][^<>|]+$/.test(path);
+}
+function decorateCopyablePaths(root = document) {
+  for (const link of $$(".message-content a[href]", root)) {
+    if (link.closest(".inline-path")) continue;
+    const href = link.getAttribute("href") || "";
+    if (!looksLikeCopyablePath(href)) continue;
+    const wrapper = document.createElement("span");
+    wrapper.className = "inline-path inline-path-link";
+    wrapper.title = href;
+    link.parentNode.insertBefore(wrapper, link);
+    wrapper.append(link);
+    const button = document.createElement("button");
+    button.type = "button"; button.className = "path-copy-button";
+    button.dataset.copyPath = href; button.title = "复制完整路径"; button.setAttribute("aria-label", "复制完整路径");
+    button.textContent = "⧉";
+    wrapper.append(button);
+  }
+  for (const code of $$(".message-content code:not(pre code)", root)) {
+    if (code.closest(".inline-path") || !looksLikeCopyablePath(code.textContent)) continue;
+    const path = code.textContent.trim();
+    const wrapper = document.createElement("span");
+    wrapper.className = "inline-path";
+    wrapper.title = path;
+    code.parentNode.insertBefore(wrapper, code);
+    wrapper.append(code);
+    const button = document.createElement("button");
+    button.type = "button"; button.className = "path-copy-button";
+    button.dataset.copyPath = path; button.title = "复制完整路径"; button.setAttribute("aria-label", "复制完整路径");
+    button.textContent = "⧉";
+    wrapper.append(button);
+  }
 }
 
 installChatSelectionGuard();
@@ -983,7 +1103,9 @@ async function hydrateChatFiles() {
 }
 
 function chatFileReference(path) {
-  const value = String(path || "");
+  let value = String(path || "");
+  try { value = decodeURIComponent(value); } catch (_) {}
+  if (/^(?:home|mnt|opt|tmp|var|data|workspace|workspaces)\//i.test(value)) value = `/${value}`;
   const hash = value.match(/^(.*)#L(\d+)(?:C(\d+))?$/i);
   if (hash) return { path: hash[1], line: Number(hash[2]), column: Number(hash[3] || 0) };
   const location = value.match(/^(.*\.[a-z0-9][a-z0-9._+-]*):(\d+)(?::(\d+))?$/i);
@@ -1041,6 +1163,17 @@ function closeChatFileViewer() {
   viewer.setAttribute("aria-hidden", "true");
 }
 $("#media-viewer-close")?.addEventListener("click", closeChatFileViewer);
+$("#media-viewer-copy-path")?.addEventListener("click", async event => {
+  const button = event.currentTarget;
+  const path = button.dataset.copyPath || "";
+  if (!path) return;
+  try {
+    await copyText(path);
+    button.classList.add("copied"); button.textContent = "✓";
+    setTimeout(() => { button.classList.remove("copied"); button.textContent = "⧉"; }, 1200);
+    toast("已复制完整路径");
+  } catch (error) { toast(`复制失败：${error.message}`); }
+});
 $("#media-viewer")?.addEventListener("click", event => {
   if (event.target === event.currentTarget) closeChatFileViewer();
 });
@@ -1155,7 +1288,10 @@ async function openChatFileViewer({ taskId, path, kind }) {
   const filename = path.split("/").filter(Boolean).pop() || path;
   clearMediaViewerBody();
   $("#media-viewer-title").textContent = filename;
-  $("#media-viewer-path").textContent = path;
+  const pathNode = $("#media-viewer-path");
+  pathNode.textContent = path;
+  pathNode.title = path;
+  $("#media-viewer-copy-path").dataset.copyPath = path;
   $("#media-viewer-kind").textContent = chatViewerLabel(kind);
   const download = $("#media-viewer-download");
   download.href = chatDownloadUrl(taskId, path);
@@ -1226,7 +1362,7 @@ function renderInspector() {
   const archiveLabel = task.archived ? uiLabel("unarchive") : uiLabel("archive");
   const memoryAction = memoryEnabled ? "memory-disable" : "memory-enable";
   const memoryLabel = memoryEnabled ? uiLabel("disableMemory") : uiLabel("enableMemory");
-  content.innerHTML = `<section class="inspector-section"><span class="inspector-label">SESSION</span><div class="inspector-row"><span>状态</span>${status(task.status)}</div><div class="inspector-row"><span>Thread</span><button class="path-button thread-copy" data-copy-thread="${esc(threadId)}" title="${threadId ? "点击复制 Thread ID" : "Thread 尚未创建"}" ${threadId ? "" : "disabled"}>${esc(threadId || "未创建")}</button></div>${task.ssh_host ? `<div class="inspector-row"><span>SSH 主机</span><button class="path-button" data-panel="ssh">${esc(task.ssh_host)}</button></div>` : ""}<div class="inspector-row"><span>工作目录</span><button class="path-button" data-workspace-change title="重新设置工作目录">${esc(task.workspace)}</button></div></section><section class="inspector-section"><span class="inspector-label">GOAL</span><p class="inspector-goal">${esc(task.goal || "没有设置 Goal")}</p><div class="inspector-row"><span>进度</span><span>${esc(task.goal_status || "none")}</span></div></section><details class="inspector-section run-history"><summary><span>运行记录</span><small>${sessions.length}</small></summary><div class="run-history-list">${sessions.length ? sessions.map(session => `<div class="run-row"><span class="run-dot ${esc(session.status)}"></span><span><strong>尝试 ${session.attempt || 0}</strong><small>${esc(session.provider_id || "自动 Provider")} · ${esc(shortDate(session.started_at))}</small></span>${status(session.status)}</div>`).join("") : `<p class="muted">暂无运行记录</p>`}</div></details><section class="inspector-section"><span class="inspector-label">THREAD CONTROLS</span><div class="inspector-actions"><button data-session-restart>${uiLabel("restartSessionCodex")}</button><button data-thread-action="fork">复制会话</button><button data-thread-action="compact">压缩上下文</button><button data-thread-action="${archiveAction}">${archiveLabel}</button><button data-thread-action="delete" class="danger">移到回收站</button><button data-thread-action="${memoryAction}" title="当前状态：记忆${memoryEnabled ? "已开启" : "已关闭"}">${memoryLabel}</button></div></section>`;
+  content.innerHTML = `<section class="inspector-section"><span class="inspector-label">SESSION</span><div class="inspector-row"><span>状态</span>${status(task.status)}</div><div class="inspector-row"><span>Thread</span><button class="path-button thread-copy" data-copy-thread="${esc(threadId)}" title="${threadId ? "点击复制 Thread ID" : "Thread 尚未创建"}" ${threadId ? "" : "disabled"}>${esc(threadId || "未创建")}</button></div>${task.ssh_host ? `<div class="inspector-row"><span>SSH 主机</span><button class="path-button" data-panel="ssh">${esc(task.ssh_host)}</button></div>` : ""}<div class="inspector-row"><span>工作目录</span><span class="inspector-path-control"><code class="workspace-path-value" title="${esc(task.workspace)}">${esc(task.workspace)}</code><button type="button" class="path-copy-button" data-copy-workspace="${esc(task.workspace)}" title="复制完整工作目录" aria-label="复制完整工作目录">⧉</button><button class="path-copy-button workspace-change-button" data-workspace-change title="重新设置工作目录" aria-label="重新设置工作目录">⌂</button></span></div></section><section class="inspector-section"><span class="inspector-label">GOAL</span><p class="inspector-goal">${esc(task.goal || "没有设置 Goal")}</p><div class="inspector-row"><span>进度</span><span>${esc(task.goal_status || "none")}</span></div></section><details class="inspector-section run-history"><summary><span>运行记录</span><small>${sessions.length}</small></summary><div class="run-history-list">${sessions.length ? sessions.map(session => `<div class="run-row"><span class="run-dot ${esc(session.status)}"></span><span><strong>尝试 ${session.attempt || 0}</strong><small>${esc(session.provider_id || "自动 Provider")} · ${esc(shortDate(session.started_at))}</small></span>${status(session.status)}</div>`).join("") : `<p class="muted">暂无运行记录</p>`}</div></details><section class="inspector-section"><span class="inspector-label">THREAD CONTROLS</span><div class="inspector-actions"><button data-session-restart>${uiLabel("restartSessionCodex")}</button><button data-thread-action="fork">复制会话</button><button data-thread-action="compact">压缩上下文</button><button data-thread-action="${archiveAction}">${archiveLabel}</button><button data-thread-action="delete" class="danger">移到回收站</button><button data-thread-action="${memoryAction}" title="当前状态：记忆${memoryEnabled ? "已开启" : "已关闭"}">${memoryLabel}</button></div></section>`;
   if (workspaceSection?.dataset.taskId === task.id) content.append(workspaceSection);
   else if (workspaceError?.dataset.taskId === task.id) content.append(workspaceError);
   localizeInspectorText(content);
@@ -1580,8 +1716,10 @@ function connectSocket(id, reconnect = false) {
       }
       if (tokenUsage) renderContextUsage();
       if (!protocolNoise) scheduleRuntimeMetricsRefresh();
-      const phase = protocolNoise ? "" : activityPhase(data.payload);
+      const phase = activityPhase(data.payload);
+      const method = String(data.payload?.method || "").toLowerCase();
       if (phase) { livePhases.set(id, phase); renderTurnProgress(); }
+      else if (method === "thread/compacted") { livePhases.delete(id); renderTurnProgress(); }
       if (!protocolNoise) {
         const isDelta = String(data.payload?.type || "").toLowerCase() === "agent_delta";
         const painted = isDelta ? appendStreamingDelta(data.payload) : false;
@@ -1658,6 +1796,17 @@ function sendTerminal(payload) {
   terminalSocket.send(JSON.stringify(payload));
   return true;
 }
+function restoreTerminalBuffer(taskId) {
+  if (!terminalEmulator) return;
+  terminalEmulator.reset();
+  const buffer = terminalBuffers.get(taskId);
+  if (buffer) terminalEmulator.write(buffer);
+}
+function rememberTerminalOutput(taskId, data) {
+  const maxBytes = 2 * 1024 * 1024;
+  const next = `${terminalBuffers.get(taskId) || ""}${data}`;
+  terminalBuffers.set(taskId, next.length > maxBytes ? next.slice(-maxBytes) : next);
+}
 function sendTerminalResize() {
   fitTerminal();
   if (!terminalSocket || terminalSocket.readyState !== WebSocket.OPEN || !terminalEmulator) return;
@@ -1667,29 +1816,38 @@ function connectTerminal(taskId, reconnect = false) {
   if (!taskId) return toast(uiLabel("selectSessionFirst"));
   if (!ensureTerminalEmulator()) return;
   clearTimeout(terminalReconnectTimer);
-  if (terminalSocket) { terminalSocket.onclose = null; terminalSocket.close(); terminalSocket = null; }
   terminalTaskId = taskId;
   terminalShouldReconnect = true;
+  const existingSocket = terminalSockets.get(taskId);
+  if (existingSocket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(existingSocket.readyState)) {
+    terminalSocket = existingSocket;
+    restoreTerminalBuffer(taskId);
+    if (existingSocket.readyState === WebSocket.OPEN) sendTerminalResize();
+    terminalEmulator.focus();
+    return;
+  }
+  restoreTerminalBuffer(taskId);
   if (reconnect) terminalEmulator.write(`\r\n[${uiLabel("terminalReconnectNotice")}]\r\n`);
-  else terminalEmulator.reset();
   terminalStatus(reconnect ? uiLabel("terminalReconnecting") : uiLabel("terminalConnecting"), reconnect ? "reconnecting" : "");
   setRealtimeChannel("terminal", reconnect ? "reconnecting" : "connecting");
   const scheme = location.protocol === "https:" ? "wss" : "ws";
   const nextSocket = new WebSocket(`${scheme}://${location.host}/ws/terminal/${encodeURIComponent(taskId)}`);
+  terminalSockets.set(taskId, nextSocket);
   terminalSocket = nextSocket;
-  nextSocket.onopen = () => { noteRealtime("terminal"); terminalStatus(uiLabel("terminalConnecting")); sendTerminalResize(); terminalEmulator.focus(); };
+  nextSocket.onopen = () => { noteRealtime("terminal"); if (terminalTaskId === taskId) terminalStatus(uiLabel("terminalConnecting")); sendTerminalResize(); if (terminalTaskId === taskId) terminalEmulator.focus(); };
   nextSocket.onmessage = event => {
     noteRealtime("terminal");
     const data = JSON.parse(event.data);
-    if (data.type === "ready") { terminalReconnectAttempt = 0; $("#terminal-cwd").textContent = `${data.cwd} · ${data.shell}`; terminalStatus(uiLabel("terminalConnected"), "connected"); setRealtimeChannel("terminal", "live"); sendTerminalResize(); return; }
-    if (data.type === "output") { terminalEmulator.write(data.data); return; }
-    if (data.type === "exit") { terminalShouldReconnect = false; setRealtimeChannel("terminal", "closed"); terminalStatus(`${uiLabel("terminalClosed")}${data.code == null ? "" : ` · ${data.code}`}`, "error"); terminalEmulator.write(`\r\n[${uiLabel("terminalClosed")}]\r\n`); return; }
+    if (data.type === "ready") { terminalReconnectAttempt = 0; if (terminalTaskId === taskId) { $("#terminal-cwd").textContent = `${data.cwd} · ${data.shell}`; terminalStatus(uiLabel("terminalConnected"), "connected"); setRealtimeChannel("terminal", "live"); sendTerminalResize(); } return; }
+    if (data.type === "output") { rememberTerminalOutput(taskId, data.data); if (terminalTaskId === taskId) terminalEmulator.write(data.data); return; }
+    if (data.type === "exit") { terminalSockets.delete(taskId); if (terminalTaskId === taskId) { terminalShouldReconnect = false; setRealtimeChannel("terminal", "closed"); terminalStatus(`${uiLabel("terminalClosed")}${data.code == null ? "" : ` · ${data.code}`}`, "error"); terminalEmulator.write(`\r\n[${uiLabel("terminalClosed")}]\r\n`); } return; }
     if (data.type === "pong") { terminalStatus(uiLabel("terminalConnected"), "connected"); setRealtimeChannel("terminal", "live"); }
   };
   nextSocket.onerror = () => { if (terminalSocket === nextSocket) { terminalStatus(uiLabel("terminalReconnecting"), "reconnecting"); setRealtimeChannel("terminal", "reconnecting"); } };
   nextSocket.onclose = event => {
-    if (terminalSocket !== nextSocket) return;
-    terminalSocket = null;
+    if (terminalSockets.get(taskId) !== nextSocket) return;
+    terminalSockets.delete(taskId);
+    if (terminalSocket === nextSocket) terminalSocket = null;
     const stillOpen = $("#terminal-window").classList.contains("open") && terminalTaskId === taskId;
     if (event.code === 4401) { requestSSHLogin().then(ok => { if (ok && stillOpen) connectTerminal(taskId, true); }); return; }
     if (!terminalShouldReconnect || !stillOpen) { setRealtimeChannel("terminal", terminalShouldReconnect ? "idle" : "closed"); return; }
@@ -1721,7 +1879,8 @@ function hideTerminal() {
 function closeTerminal() { hideTerminal(); }
 function destroyTerminal() {
   clearTimeout(terminalReconnectTimer); terminalShouldReconnect = false; terminalReconnectAttempt = 0;
-  if (terminalSocket) { terminalSocket.onclose = null; try { terminalSocket.send(JSON.stringify({ type: "close" })); } catch (_) {} terminalSocket.close(); terminalSocket = null; }
+  for (const socket of terminalSockets.values()) { socket.onclose = null; try { socket.send(JSON.stringify({ type: "close" })); } catch (_) {} socket.close(); }
+  terminalSockets.clear(); terminalBuffers.clear(); terminalSocket = null;
   terminalTaskId = null;
   hideTerminal();
   setRealtimeChannel("terminal", "idle"); terminalStatus(uiLabel("terminalNotConnected")); $("#terminal-cwd").textContent = uiLabel("terminalNotConnected");

@@ -89,6 +89,7 @@ document.addEventListener("click", async event => {
     if (button.id === "sidebar-close") return setSessionSidebarOpen(false);
     if (button.id === "close-inspector") { state.inspectorClosed = true; setInspectorOpen(false); return; }
     if (button.dataset.workspaceChange !== undefined) return openWorkspacePicker();
+    if (button.dataset.copyWorkspace !== undefined) { await copyText(button.dataset.copyWorkspace); return toast("工作目录已复制"); }
     if (button.dataset.workspaceUpload !== undefined) {
       const input = $("#workspace-upload-input"); input.dataset.path = state.workspacePath; input.click(); return;
     }
@@ -478,7 +479,9 @@ function attachmentUploadName(name) {
   const ext = dot > 0 ? value.slice(dot) : "";
   return `${stem}-${Date.now().toString(36)}${ext}`;
 }
-async function attachComposerFiles(fileList) {
+async function attachComposerFiles(fileList, options = {}) {
+  const forceUploadText = Boolean(options.forceUploadText);
+  const suppressReadyToast = Boolean(options.suppressReadyToast);
   const files = [...(fileList || [])].filter(Boolean);
   if (!files.length) return;
   const added = [];
@@ -499,7 +502,7 @@ async function attachComposerFiles(fileList) {
         textFile = !binarySignature && !sample.includes(0) && (() => { try { new TextDecoder("utf-8", { fatal: true }).decode(sample); return true; } catch (_) { return false; } })();
         if (textFile) text = await file.text();
       }
-      if (textFile && inlineChars + text.length <= 12000) {
+      if (textFile && !forceUploadText && inlineChars + text.length <= 12000) {
         added.push({ name, size: file.size || 0, content: text, binary: false });
         inlineChars += text.length;
         continue;
@@ -521,13 +524,14 @@ async function attachComposerFiles(fileList) {
       toast(error?.message ? `${uiLabel("fileUploadFailed", { name })}：${error.message}` : uiLabel("fileReadFailed", { name }));
     }
   }
-  if (!added.length) return;
+  if (!added.length) return 0;
   pendingAttachments.push(...added);
   renderComposerAttachments();
   saveComposerDraft();
   renderGoalBar();
-  toast(uiLabel("filesReady", { count: added.length }));
+  if (!suppressReadyToast) toast(uiLabel("filesReady", { count: added.length }));
   $("#message-input").focus();
+  return added.length;
 }
 $("#message-input").addEventListener("input", event => { resizeComposerInput(event.target); saveComposerDraft(); state.commandIndex = 0; state.historyIndex = -1; renderCommandPalette(); renderGoalBar(); });
 $("#message-input").addEventListener("keydown", async event => {
@@ -588,11 +592,30 @@ $("#user-avatar-file").onchange = event => {
   reader.readAsDataURL(file);
   event.target.value = "";
 };
-$("#message-input").addEventListener("paste", event => {
+const LONG_PASTE_FILE_THRESHOLD = 6000;
+function insertComposerText(text) {
+  const input = $("#message-input");
+  const start = input.selectionStart ?? input.value.length;
+  const end = input.selectionEnd ?? start;
+  input.setRangeText(text, start, end, "end");
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+}
+$("#message-input").addEventListener("paste", async event => {
   const files = [...(event.clipboardData?.files || [])];
-  if (!files.length) return;
+  if (files.length) {
+    event.preventDefault();
+    await attachComposerFiles(files);
+    return;
+  }
+  const text = event.clipboardData?.getData("text/plain") || "";
+  if (text.length < LONG_PASTE_FILE_THRESHOLD) return;
   event.preventDefault();
-  attachComposerFiles(files);
+  if (!state.selectedId) { insertComposerText(text); return; }
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const file = new File([text], `pasted-text-${stamp}.txt`, { type: "text/plain" });
+  const added = await attachComposerFiles([file], { forceUploadText: true, suppressReadyToast: true });
+  if (added) toast(uiLabel("longPasteAttached"));
+  else insertComposerText(text);
 });
 const composer = $("#message-form");
 for (const eventName of ["dragenter", "dragover"]) {
@@ -626,8 +649,27 @@ document.addEventListener("drop", event => {
 $("#permission-toggle").onclick = async () => { if (!state.selectedTask) return; try { const task = await api(`/tasks/${state.selectedId}`, { method: "PATCH", body: JSON.stringify({ yolo: !state.selectedTask.yolo }) }); state.selectedTask = { ...state.selectedTask, ...task }; renderConversation(); toast(task.yolo ? "YOLO 已开启" : "已切换为受控模式"); } catch (error) { toast(error.message); } };
 $("#command-button").onclick = () => { const input = $("#message-input"); if (!input.value.startsWith("/")) input.value = "/"; input.focus(); state.commandIndex = 0; renderCommandPalette(); };
 document.addEventListener("click", event => { const option = event.target.closest("[data-command-index]"); if (!option) return; const command = commandMatches($("#message-input").value)[Number(option.dataset.commandIndex)]; completeCommand(command); });
+document.addEventListener("click", event => {
+  const button = event.target.closest("button");
+  if (!button) return;
+  if (button.id === "conversation-search") return setChatSearchOpen(true);
+  if (button.id === "conversation-search-close") return setChatSearchOpen(false);
+  if (button.id === "conversation-search-prev" || button.id === "conversation-search-next") {
+    const matches = state.chatSearchResults || [];
+    if (!matches.length) return;
+    const delta = button.id === "conversation-search-next" ? 1 : -1;
+    return jumpToChatSearchResult((state.chatSearchIndex + delta + matches.length) % matches.length);
+  }
+  if (button.dataset.chatSearchIndex !== undefined) return jumpToChatSearchResult(Number(button.dataset.chatSearchIndex));
+});
+$("#conversation-search-input")?.addEventListener("input", event => { state.chatSearchQuery = event.target.value; state.chatSearchIndex = 0; refreshChatSearch(true); });
+$("#conversation-search-form")?.addEventListener("submit", event => { event.preventDefault(); refreshChatSearch(true); });
 // Capture the physical backquote key before xterm can turn it into terminal input.
 document.addEventListener("keydown", event => {
+  if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "f") { event.preventDefault(); const bar = $("#conversation-searchbar"); setChatSearchOpen(!bar || bar.hidden); return; }
+  if (event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey && event.key.toLowerCase() === "b") {
+    event.preventDefault(); event.stopImmediatePropagation(); toggleFocusMode(); return;
+  }
   if (event.code !== "Backquote" || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey || event.repeat) return;
   event.preventDefault();
   event.stopImmediatePropagation();
@@ -682,8 +724,10 @@ window.addEventListener("online", () => {
   heartbeatRealtime();
 });
 setTheme(localStorage.getItem("codex-dashboard-theme") || "dark");
+decorateMascots();
 let sidebarCompactViewport = window.innerWidth <= 860;
 restoreSessionSidebar();
+setFocusMode(state.focusMode, false);
 window.addEventListener("resize", () => {
   const compact = window.innerWidth <= 860;
   if (compact !== sidebarCompactViewport) { sidebarCompactViewport = compact; restoreSessionSidebar(); }

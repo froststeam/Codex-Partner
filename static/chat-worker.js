@@ -2,6 +2,19 @@
 const escapeHtml = (value = "") => String(value).replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
 const explorationCache = new Map();
 
+function decodeChatPath(value) {
+  let path = String(value || "");
+  try { path = decodeURIComponent(path); } catch (_) {}
+  if (/^(?:home|mnt|opt|tmp|var|data|workspace|workspaces)\//i.test(path)) path = `/${path}`;
+  return path;
+}
+
+function localChatPath(value) {
+  const path = decodeChatPath(value);
+  if (/^(?:\/|~[\\/]|[a-z]:[\\/])/i.test(path)) return path;
+  return "";
+}
+
 let chatMarkdownRenderer = null;
 if (typeof importScripts === "function") {
   try {
@@ -18,9 +31,10 @@ if (typeof importScripts === "function") {
       const defaultLinkOpen = chatMarkdownRenderer.renderer.rules.link_open || ((tokens, index, options, env, renderer) => renderer.renderToken(tokens, index, options));
       chatMarkdownRenderer.renderer.rules.link_open = (tokens, index, options, env, renderer) => {
         const href = String(tokens[index].attrGet("href") || "");
-        if (href.startsWith("/") && !href.startsWith("//")) {
+        const localPath = localChatPath(href);
+        if (localPath && !href.startsWith("//")) {
           tokens[index].attrSet("href", "#");
-          tokens[index].attrSet("data-chat-file", href);
+          tokens[index].attrSet("data-chat-file", localPath);
           tokens[index].attrSet("data-chat-kind", "mention");
         }
         tokens[index].attrSet("target", "_blank");
@@ -210,6 +224,13 @@ function mergeEvents(events, messages) {
   const merged = [];
   const seenUserKeys = new Set();
   const seenUserBodies = new Map();
+  const browserUserKeys = new Set(visible.map(message => String(message.id || "").trim()).filter(Boolean));
+  const browserUserBodies = new Map();
+  for (const message of visible) {
+    const body = userDedupeBody(message.body || "");
+    if (body) browserUserBodies.set(body, (browserUserBodies.get(body) || 0) + 1);
+  }
+  const matchedBrowserBodies = new Map();
   for (const event of events || []) {
     if (event.stream === "metrics") {
       merged.push(event);
@@ -218,10 +239,16 @@ function mergeEvents(events, messages) {
     const payload = valueOf(event.payload);
     if (payload?.type === "userMessage") {
       const body = userDedupeBody(eventText(payload, {}));
+      const key = String(payload.client_message_id || payload.item_id || "").trim();
+      const matchedBodies = matchedBrowserBodies.get(body) || 0;
+      if ((key && browserUserKeys.has(key)) || (body && matchedBodies < (browserUserBodies.get(body) || 0))) {
+        if (body) matchedBrowserBodies.set(body, matchedBodies + 1);
+        continue;
+      }
       if (body && (seenUserBodies.get(body) || 0) > 0) continue;
-      const key = String(payload.client_message_id || body || payload.item_id || "").trim();
-      if (key && seenUserKeys.has(key)) continue;
-      if (key) seenUserKeys.add(key);
+      const dedupeKey = key || body;
+      if (dedupeKey && seenUserKeys.has(dedupeKey)) continue;
+      if (dedupeKey) seenUserKeys.add(dedupeKey);
       if (body) seenUserBodies.set(body, (seenUserBodies.get(body) || 0) + 1);
     }
     merged.push(event);
@@ -279,7 +306,7 @@ function markdown(text) {
     const name = escapeHtml(path.split("/").pop() || path);
     const mediaKind = kind === "localAudio" || /\.(mp3|wav|m4a|aac|flac|ogg|opus)$/i.test(path) ? "audio" : /\.(mp4|webm|mov|m4v|ogv)$/i.test(path) ? "video" : /\.pdf$/i.test(path) ? "pdf" : "file";
     const icon = { audio: "AUD", video: "VID", pdf: "PDF", file: "FILE" }[mediaKind];
-    return `<div class="chat-file-attachment chat-${mediaKind}-attachment" data-chat-kind="${kind}" data-chat-media="${mediaKind}" data-chat-file="${safePath}"><span class="chat-file-icon">${icon}</span><span class="chat-file-copy"><strong>${name}</strong><small>${safePath}</small></span><span class="chat-file-preview" hidden></span></div>`;
+    return `<div class="chat-file-attachment chat-${mediaKind}-attachment" data-chat-kind="${kind}" data-chat-media="${mediaKind}" data-chat-file="${safePath}"><span class="chat-file-icon">${icon}</span><span class="chat-file-copy"><strong>${name}</strong><small title="${safePath}">${safePath}</small></span><button type="button" class="path-copy-button" data-copy-path="${safePath}" title="复制完整路径" aria-label="复制完整路径">⧉</button><span class="chat-file-preview" hidden></span></div>`;
   }).join("");
 }
 

@@ -232,7 +232,38 @@ CODEX_DISCOVERY: dict[str, Any] = {}
 CODEX_BIN = "codex"
 CODEX_AVAILABLE = False
 USE_APP_SERVER = False
+CODEX_EXEC_YOLO_FLAGS: dict[str, tuple[str, ...]] = {}
 refresh_codex_discovery()
+
+
+def codex_exec_yolo_flags(codex_bin: Optional[str] = None) -> list[str]:
+    """Return yolo flags supported by the installed Codex CLI."""
+    executable = str(codex_bin or CODEX_BIN)
+    cached = CODEX_EXEC_YOLO_FLAGS.get(executable)
+    if cached is not None:
+        return list(cached)
+    try:
+        result = subprocess.run(
+            prepare_subprocess_command([executable, "exec", "--help"]),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        help_text = result.stdout or ""
+    except (OSError, subprocess.SubprocessError):
+        help_text = ""
+    if "--dangerously-bypass-approvals-and-sandbox" in help_text:
+        flags = ("--dangerously-bypass-approvals-and-sandbox",)
+    elif "--ask-for-approval" in help_text:
+        flags = ("--ask-for-approval", "never")
+    else:
+        # Modern Codex uses this flag; retain it when help output is unavailable.
+        flags = ("--dangerously-bypass-approvals-and-sandbox",)
+    CODEX_EXEC_YOLO_FLAGS[executable] = flags
+    return list(flags)
 
 
 def require_codex() -> None:
@@ -1062,7 +1093,7 @@ def native_thread_settings() -> dict[str, dict]:
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         columns = {row[1] for row in conn.execute("PRAGMA table_info(threads)")}
-        selected = [name for name in ("id", "approval_mode", "sandbox_policy", "model", "model_provider", "archived", "memory_mode") if name in columns]
+        selected = [name for name in ("id", "approval_mode", "sandbox_policy", "model", "model_provider", "reasoning_effort", "archived", "memory_mode") if name in columns]
         rows = conn.execute(f"SELECT {','.join(selected)} FROM threads").fetchall()
         conn.close()
     except sqlite3.Error:
@@ -1088,6 +1119,43 @@ def persist_native_thread_model(thread_id: str, model: str) -> None:
         conn.close()
     except sqlite3.Error:
         return
+
+
+def persist_native_thread_permissions(thread_id: str, workspace: str, yolo: bool) -> None:
+    """Keep Codex's native thread settings aligned with the dashboard toggle."""
+    thread_id = safe_thread_id(thread_id)
+    path = CODEX_HOME / "state_5.sqlite"
+    if not thread_id or not path.is_file():
+        return
+    try:
+        conn = sqlite3.connect(str(path))
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(threads)")}
+        updates = []
+        args = []
+        if "approval_mode" in columns:
+            updates.append("approval_mode=?")
+            args.append("never" if yolo else "on-request")
+        if "sandbox_policy" in columns:
+            updates.append("sandbox_policy=?")
+            args.append(json.dumps(
+                {"type": "dangerFullAccess"} if yolo else {"type": "workspaceWrite", "writableRoots": [workspace]},
+                separators=(",", ":"),
+            ))
+        if updates:
+            conn.execute(f"UPDATE threads SET {','.join(updates)} WHERE id=?", (*args, thread_id))
+            conn.commit()
+        conn.close()
+    except sqlite3.Error:
+        return
+
+
+def apply_native_thread_settings(task: dict, thread_id: str) -> dict:
+    """Use native resume settings; dashboard edits already persist there."""
+    native = native_thread_settings().get(thread_id) or {}
+    for key in ("model", "model_provider", "reasoning_effort"):
+        if native.get(key):
+            task[key] = native[key]
+    return task
 
 
 def native_rollout_rows() -> list[dict[str, str]]:
@@ -3140,6 +3208,17 @@ async def handle_appserver_notification(server_key: str, message: dict) -> None:
         waiter = compaction_waiters.pop(thread_id, None)
         if waiter and not waiter.done():
             waiter.set_result(params)
+    elif method == "turn/completed" and thread_id in compaction_waiters:
+        # Manual compaction is represented as a turn. Newer Codex versions
+        # may omit the deprecated thread/compacted notification, and failed
+        # remote compactions only report their error on turn/completed.
+        turn = params.get("turn") or {}
+        waiter = compaction_waiters.pop(thread_id, None)
+        if waiter and not waiter.done():
+            if str(turn.get("status") or "completed") in {"failed", "interrupted"}:
+                waiter.set_exception(RuntimeError(json.dumps(turn.get("error") or {"status": turn.get("status")}, ensure_ascii=False)))
+            else:
+                waiter.set_result(params)
     binding = next(((task_id, sid) for task_id, (key, tid, sid) in app_thread_bindings.items() if key == server_key and tid == thread_id), None)
     if not binding:
         return
@@ -3490,9 +3569,11 @@ async def supervise_appserver_turn(
         sandbox_policy = {"type": "dangerFullAccess"} if task["yolo"] else {"type": "workspaceWrite", "writableRoots": [task["workspace"]]}
         binding = app_thread_bindings.get(task["id"])
         thread_id = latest_codex_session(task)
-        model_provider = (provider or {}).get("model_provider") or None
         if binding and binding[0] == key:
             thread_id = binding[1]
+        if thread_id:
+            task = apply_native_thread_settings(task, thread_id)
+        model_provider = task.get("model_provider") or (provider or {}).get("model_provider") or None
         if thread_id:
             params = {"threadId": thread_id, "cwd": task["workspace"], "approvalPolicy": approval}
             if task.get("permission_profile"):
@@ -3556,6 +3637,8 @@ async def supervise_appserver_turn(
         async with goal_sync_lock(task["id"]):
             task = task_or_404(task["id"])
             goal_revision_at_start = int(task.get("goal_revision") or 0)
+            if thread_id:
+                task = apply_native_thread_settings(task, thread_id)
             if task.get("goal"):
                 remote_goal_status = "paused" if run_mode == "goal_resume" else goal_status_for_turn(task, run_mode)
                 if run_mode == "goal_resume":
@@ -3573,7 +3656,12 @@ async def supervise_appserver_turn(
             turn_params = {
                 "threadId": thread_id,
                 "cwd": task["workspace"],
-                "input": appserver_turn_inputs(task, message, include_goal_memory=run_mode == "goal_resume"),
+                "input": appserver_turn_inputs(
+                    task,
+                    message,
+                    include_goal_memory=run_mode == "goal_resume",
+                    continue_existing=mode in {"resume", "auto-retry"},
+                ),
                 "approvalPolicy": approval,
                 "clientUserMessageId": message_id or None,
                 **turn_settings(task, provider, sandbox_policy),
@@ -3654,11 +3742,7 @@ async def supervise_appserver_turn(
         record_provider_outcome(provider, True, "Codex app-server turn completed")
         db.execute("UPDATE sessions SET status='succeeded', finished_at=?, exit_code=0, summary=? WHERE id=?", (now(), "Codex app-server turn completed", session_id))
         external = refresh_external_primary(task["id"])
-        resume_goal_after_cleanup = bool(
-            not external
-            and run_mode != "goal_resume"
-            and goal_should_run(goal_task)
-        )
+        resume_goal_after_cleanup = False
         if external:
             db.execute(
                 "UPDATE tasks SET status='running',active_session_id=?,execution_source='terminal',execution_turn_id=?,run_mode='terminal',last_error='',updated_at=? WHERE id=?",
@@ -3736,14 +3820,15 @@ async def supervise_appserver_turn(
         context_recovered = False
         if (
             not stopped
-            and "context_window_exceeded" in error.lower()
+            and is_context_window_error(error)
             and current_task.get("goal")
+            and run_mode == "goal_resume"
             and (current_task.get("goal_status") or "none") == "active"
             and client
             and thread_id
         ):
             try:
-                await compact_codex_thread(client, thread_id)
+                await compact_codex_thread_with_fallback(current_task, provider, client, thread_id)
                 context_recovered = True
                 goal_continues = True
                 await broadcast_task(task["id"], {
@@ -4354,11 +4439,6 @@ def prompt_for(task: dict, override: str = "") -> str:
 CODEX_INPUT_MARKER = re.compile(r"\[\[codex-input:(localImage|localAudio|mention):([^\]]+)\]\]")
 LEGACY_FILE_MARKER = re.compile(r"\[\[codex-file:([^\]]+)\]\]")
 IMAGE_FILE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-GOAL_RESUME_PROMPT = """Continue working toward the active thread goal.
-
-Before doing any new work, audit the existing conversation and current state against the objective. If the objective is already achieved, call update_goal with status \"complete\" before replying and do not create another variant or repeat the deliverable merely because more work is possible. For a finite requested deliverable, one complete deliverable is sufficient unless the objective explicitly requests a count, variants, iteration, or additional validation. If the objective is not achieved, continue the missing work. Never report success without explicitly updating the Goal state."""
-
-
 def appserver_attachment_path(task: dict, encoded_path: str) -> tuple[str, str] | None:
     """Resolve a browser attachment without allowing it to escape the task workspace."""
     relative = urllib.parse.unquote(encoded_path).strip().replace("\\", "/")
@@ -4377,7 +4457,15 @@ def appserver_attachment_path(task: dict, encoded_path: str) -> tuple[str, str] 
     return normalized, str(candidate)
 
 
-def appserver_turn_inputs(task: dict, message: str, include_goal_memory: bool = False) -> list[dict[str, Any]]:
+RESUME_CONTINUATION_PROMPT = "Continue from the previous turn."
+
+
+def appserver_turn_inputs(
+    task: dict,
+    message: str,
+    include_goal_memory: bool = False,
+    continue_existing: bool = False,
+) -> list[dict[str, Any]]:
     """Translate durable chat markers into the structured app-server input protocol."""
     attachments: list[tuple[str, str]] = []
 
@@ -4394,12 +4482,18 @@ def appserver_turn_inputs(task: dict, message: str, include_goal_memory: bool = 
     clean_message = LEGACY_FILE_MARKER.sub(lambda match: collect(match, True), clean_message)
     inputs: list[dict[str, Any]] = []
     clean_message = clean_message.strip()
-    if include_goal_memory and not clean_message:
-        clean_message = GOAL_RESUME_PROMPT
-    prompt = prompt_for(task, clean_message)
-    if prompt and task.get("id") and task.get("memory_mode", "enabled") != "disabled":
+    if include_goal_memory:
+        # Goal retry has one stable native equivalent. Never let a stale
+        # task prompt or a caller-provided message change its meaning.
+        clean_message = "/goal resume"
+    elif continue_existing and not clean_message:
+        # A normal resume still needs a turn input, but must not replay the
+        # task's creation prompt as a new user message.
+        clean_message = RESUME_CONTINUATION_PROMPT
+    prompt = clean_message if include_goal_memory or continue_existing else prompt_for(task, clean_message)
+    if prompt and not include_goal_memory and not continue_existing and task.get("id") and task.get("memory_mode", "enabled") != "disabled":
         snapshot = activity_graph_store.snapshot(task["id"])
-        memory = recall_context(clean_message, snapshot, task.get("goal", "") if include_goal_memory else "")
+        memory = recall_context(clean_message, snapshot)
         if memory:
             prompt = f"{prompt}\n\n{memory}"
     if prompt:
@@ -4512,7 +4606,7 @@ def command_for(task: dict, provider: Optional[dict], resume_id: str = "", promp
         cmd.append("resume")
     cmd += ["--json", "--color", "never", "--skip-git-repo-check"]
     if task["yolo"]:
-        cmd += ["--ask-for-approval", "never", "--dangerously-bypass-approvals-and-sandbox"]
+        cmd += codex_exec_yolo_flags()
     if task.get("model") or (provider and provider.get("model")):
         cmd += ["--model", task.get("model") or provider.get("model")]
     if provider and provider.get("profile"):
@@ -4520,10 +4614,16 @@ def command_for(task: dict, provider: Optional[dict], resume_id: str = "", promp
     cmd += ["-C", task["workspace"]]
     if resume_id:
         cmd.append(resume_id)
-    prompt = prompt_for(task, prompt_override)
+    if include_goal and not prompt_override:
+        # Keep the CLI fallback aligned with the app-server Goal path.
+        prompt = "/goal resume"
+    elif resume_id and not prompt_override:
+        prompt = RESUME_CONTINUATION_PROMPT
+    else:
+        prompt = prompt_for(task, prompt_override)
     # The legacy CLI fallback has no app-server goal RPC, so preserve the
     # native slash directive only on that transport.
-    if task.get("goal") and include_goal:
+    if task.get("goal") and include_goal and prompt_override:
         prompt = f"/goal {task['goal']}\n\n{prompt}"
     cmd.append(prompt)
     return cmd
@@ -4985,6 +5085,16 @@ def is_task_busy_error(exc: Exception) -> bool:
         return True
     text = str(exc).lower()
     return "already running" in text or "turn is already active" in text or "current turn" in text and "active" in text
+
+
+def is_context_window_error(error: Any) -> bool:
+    """Recognize Codex context exhaustion across JSON/casing variants."""
+    text = re.sub(r"[^a-z0-9]+", "", str(error or "").lower())
+    return (
+        "contextwindowexceeded" in text
+        or "contextwindow" in text and ("exceed" in text or "full" in text)
+        or "contextwindow" in text and "ranoutofroom" in text
+    )
 
 
 def steer_expected_turn_id(task_id: str, task: Optional[dict] = None) -> str:
@@ -5711,6 +5821,8 @@ async def patch_task(task_id: str, payload: TaskPatch, _: Any = Depends(auth)):
     result = task_or_404(task_id)
     if "model" in values:
         persist_native_thread_model(result.get("codex_session_id") or task_id, str(values.get("model") or ""))
+    if "yolo" in values:
+        persist_native_thread_permissions(result.get("codex_session_id") or task_id, result.get("workspace") or "", bool(result.get("yolo")))
     await broadcast_overview(task_id, {"type": "updated"})
     if values.get("retry_forever") and result.get("goal") and result.get("goal_status") != "complete":
         raw_goal_status = (db.one("SELECT goal_status FROM tasks WHERE id=?", (task_id,)) or {}).get("goal_status") or "none"
@@ -5824,8 +5936,8 @@ def persist_goal_paused(task_id: str) -> bool:
 def persist_observed_goal_status(task_id: str, status: str, tokens_used: int = 0) -> None:
     """Persist Codex Goal state and terminal control invariants."""
     db.execute(
-        "UPDATE tasks SET goal_status=?,goal_tokens_used=?,retry_forever=CASE WHEN ?='complete' THEN 0 ELSE retry_forever END,retry_explicit=CASE WHEN ?='complete' THEN 0 ELSE retry_explicit END,updated_at=? WHERE id=?",
-        (status, int(tokens_used or 0), status, status, now(), task_id),
+        "UPDATE tasks SET goal_status=?,goal_tokens_used=?,retry_forever=CASE WHEN ?='complete' THEN 0 ELSE retry_forever END,retry_explicit=CASE WHEN ?='complete' THEN 0 ELSE retry_explicit END,last_error=CASE WHEN ?='complete' THEN '' ELSE last_error END,updated_at=? WHERE id=?",
+        (status, int(tokens_used or 0), status, status, status, now(), task_id),
     )
 
 
@@ -6029,9 +6141,10 @@ def runtime_metric_events(events: list[dict], limit: int = 3) -> list[dict]:
             continue
         params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
         turn_id = str(payload.get("turn_id") or payload.get("turnId") or params.get("turnId") or "")
-        if not turn_id:
+        token_usage = payload.get("type") == "codex" and payload.get("method") == "thread/tokenUsage/updated"
+        if not turn_id and not token_usage:
             continue
-        parsed.append((event, payload, turn_id))
+        parsed.append((event, payload, turn_id or "__thread_metrics__"))
         if turn_id not in turns:
             turns.append(turn_id)
     keep = set(turns[-limit:])
@@ -6040,7 +6153,7 @@ def runtime_metric_events(events: list[dict], limit: int = 3) -> list[dict]:
     for event, payload, turn_id in parsed:
         event_type = str(payload.get("type") or "").lower()
         token_usage = event_type == "codex" and str(payload.get("method") or "") == "thread/tokenUsage/updated"
-        if turn_id not in keep or (event_type not in metric_types and not token_usage):
+        if (not token_usage and turn_id not in keep) or (event_type not in metric_types and not token_usage):
             continue
         selected.append((event, payload, turn_id))
     delta_boundaries: set[int] = set()
@@ -6312,7 +6425,8 @@ async def task_timeline(task_id: str, before: str = "", limit: int = 160, fast: 
                 (task_id, min(2000, max(800, limit * 6))),
             )
             rows = semantic_timeline_rows(candidates, limit)
-            return {"items": list(reversed(rows)), "next_cursor": "", "has_more": True, "metrics": [], "fast": True}
+            metrics = runtime_metric_events(candidates)
+            return {"items": list(reversed(rows)), "next_cursor": "", "has_more": True, "metrics": metrics, "fast": True}
         events, metrics = await native_timeline_events(task)
         if cursor:
             if cursor.get("kind") != "native" or not isinstance(cursor.get("ts"), str):
@@ -7469,18 +7583,94 @@ CODEX_OPERATIONS = {
 THREAD_RPC_OPERATIONS = {"archive", "unarchive", "delete", "fork", "rename", "compact", "memory-enable", "memory-disable"}
 
 
-async def compact_codex_thread(client: AppServerClient, thread_id: str) -> dict[str, Any]:
+async def compact_codex_thread(client: AppServerClient, thread_id: str, timeout: int = 900) -> dict[str, Any]:
     waiter = asyncio.get_running_loop().create_future()
     compaction_waiters[thread_id] = waiter
     try:
         result = await client.request("thread/compact/start", {"threadId": thread_id})
-        await asyncio.wait_for(waiter, timeout=180)
+        await asyncio.wait_for(waiter, timeout=timeout)
         return result if isinstance(result, dict) else {"result": result}
     except asyncio.TimeoutError as exc:
-        raise RuntimeError("Codex compaction did not complete within 180 seconds") from exc
+        raise RuntimeError(f"Codex compaction did not complete within {timeout} seconds") from exc
     finally:
         if compaction_waiters.get(thread_id) is waiter:
             compaction_waiters.pop(thread_id, None)
+
+
+async def compact_codex_thread_with_fallback(
+    task: dict,
+    provider: Optional[dict],
+    client: AppServerClient,
+    thread_id: str,
+) -> dict[str, Any]:
+    """Retry an overfull remote compaction with Codex's local compactor."""
+    exc: Optional[Exception] = None
+    # A terminal/VS Code owner may finish a turn between the dashboard
+    # request and compaction. Do not turn that expected race into a 500.
+    for attempt in range(30):
+        try:
+            return await compact_codex_thread(client, thread_id)
+        except Exception as candidate:
+            exc = candidate
+            if "already has an active writer" not in str(candidate):
+                break
+            # thread/resume can leave a failed app-server holding the native
+            # writer lock. Recreate the transport before the next probe;
+            # retrying the same client can never observe the lock release.
+            key = appserver_key(provider, task)
+            if app_servers.get(key) is client:
+                app_servers.pop(key, None)
+                await client.close()
+                await stop_persistent_appserver(key)
+            await asyncio.sleep(10)
+            client = await appserver_for(provider, task)
+            await ensure_thread_loaded(task, client, provider)
+    if exc is None or not is_context_window_error(exc):
+        raise exc or RuntimeError("Codex compaction failed")
+
+    # The remote compactor leaves the failed thread loaded in its app-server.
+    # Release that writer before starting the local-compactor process; without
+    # this hand-off the fallback is rejected as a second active writer.
+    key = appserver_key(provider, task)
+    if app_servers.get(key) is client:
+        app_servers.pop(key, None)
+        await client.close()
+        await stop_persistent_appserver(key)
+
+    env = os.environ.copy()
+    host = task.get("ssh_host") or ""
+    if provider and provider.get("base_url") and not host:
+        env["OPENAI_BASE_URL"] = provider["base_url"]
+    if key_value := provider_api_key(provider) if not host else "":
+        env["OPENAI_API_KEY"] = key_value
+    if host:
+        connection = await require_ssh_connection(host, codex=True)
+        remote_command = shlex.join([
+            connection["codex_bin"], "--disable", "remote_compaction_v2", "app-server", "--stdio",
+        ])
+        command = [*ssh_options(host, batch=True), ssh_destination(host), remote_command]
+    else:
+        command = [CODEX_BIN, "--disable", "remote_compaction_v2", "app-server", "--stdio"]
+    fallback = AppServerClient(
+        env,
+        f"compact-fallback:{thread_id}",
+        command=command,
+        local=not bool(host),
+        require_codex=require_codex,
+        notification_handler=handle_appserver_notification,
+        server_request_handler=handle_appserver_server_request,
+        thread_bindings=app_thread_bindings,
+        turn_waiters=turn_waiters,
+        client_name=APP_NAME.lower().replace(" ", "-"),
+        client_version=app.version,
+    )
+    try:
+        await fallback.start()
+        await ensure_thread_loaded(task, fallback, provider)
+        result = await compact_codex_thread(fallback, thread_id)
+        return {**result, "fallback": "local"}
+    finally:
+        await fallback.close()
 
 
 async def _run_thread_operation(task: dict, payload: OperationIn) -> dict:
@@ -7555,7 +7745,7 @@ async def _run_thread_operation(task: dict, payload: OperationIn) -> dict:
         await broadcast_task(task["id"], {"type": "task_status", "task": renamed, "source": {"kind": "thread", "operation": operation}})
         return {"ok": True, "operation": operation, "thread_id": thread_id, "result": result, "task": renamed}
     if operation == "compact":
-        result = await compact_codex_thread(client, thread_id)
+        result = await compact_codex_thread_with_fallback(task, provider, client, thread_id)
         return {"ok": True, "operation": operation, "thread_id": thread_id, "result": result}
     approval = "never" if task["yolo"] else "on-request"
     sandbox = "danger-full-access" if task["yolo"] else "workspace-write"
@@ -7849,9 +8039,11 @@ async def _execute_slash_command_body(task: dict, command: str, arg_text: str, a
         selected = args[0].lower()
         if selected in {"yolo", "never", "danger", "danger-full-access"}:
             db.execute("UPDATE tasks SET yolo=1,permission_profile='',updated_at=? WHERE id=?", (now(), task["id"]))
+            persist_native_thread_permissions(task.get("codex_session_id") or task["id"], task.get("workspace") or "", True)
             return result_message(command, "YOLO 已开启（不请求审批，danger-full-access）。")
         if selected in {"controlled", "on-request", "workspace-write", "off", "safe"}:
             db.execute("UPDATE tasks SET yolo=0,permission_profile='',updated_at=? WHERE id=?", (now(), task["id"]))
+            persist_native_thread_permissions(task.get("codex_session_id") or task["id"], task.get("workspace") or "", False)
             return result_message(command, "已切换为受控模式（workspace-write）。")
         db.execute("UPDATE tasks SET yolo=0,permission_profile=?,updated_at=? WHERE id=?", (args[0], now(), task["id"]))
         return result_message(command, f"权限 profile 已设置为 `{args[0]}`；下一条 turn 生效。")
@@ -8210,7 +8402,7 @@ async def codex_operation(task_id: str, payload: OperationIn, _: Any = Depends(a
         return await launch_appserver(task, provider, "resume" if payload.operation == "resume" else "start", payload.prompt or "", "")
     cmd = [CODEX_BIN, "-C", task["workspace"]]
     if task["yolo"]:
-        cmd += ["--ask-for-approval", "never", "--dangerously-bypass-approvals-and-sandbox"]
+        cmd += codex_exec_yolo_flags()
     cmd += [payload.operation, *payload.args]
     if payload.prompt:
         cmd.append(payload.prompt)

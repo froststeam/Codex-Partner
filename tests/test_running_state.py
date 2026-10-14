@@ -362,6 +362,106 @@ class RunningStateTests(unittest.TestCase):
         self.assertNotIn('api("/sessions")', refresh)
         self.assertIn("Promise.resolve([])", refresh)
 
+    def test_terminal_switch_keeps_each_task_socket_and_output_buffer(self):
+        conversation = (Path(__file__).resolve().parents[1] / "static" / "conversation.js").read_text(encoding="utf-8")
+        self.assertIn("const terminalSockets = new Map()", conversation)
+        self.assertIn("const terminalBuffers = new Map()", conversation)
+        self.assertIn("terminalSockets.set(taskId, nextSocket)", conversation)
+        self.assertIn("rememberTerminalOutput(taskId, data.data)", conversation)
+        self.assertIn("restoreTerminalBuffer(taskId)", conversation)
+        switch_block = conversation[conversation.index("function connectTerminal") : conversation.index("function openTerminal")]
+        self.assertNotIn("terminalSocket.close()", switch_block)
+
+    def test_composer_shortcuts_are_moved_out_of_the_topbar(self):
+        core = (Path(__file__).resolve().parents[1] / "static" / "core.js").read_text(encoding="utf-8")
+        self.assertIn("placeComposerShortcuts()", core)
+        self.assertIn('slice(6).forEach(item => item.remove())', core)
+        self.assertIn('"#message-input": "composerPlaceholderWithShortcuts"', core)
+        conversation = (Path(__file__).resolve().parents[1] / "static" / "conversation.js").read_text(encoding="utf-8")
+        self.assertIn('state.editingQueuedId ? uiLabel("editQueued") : t("composerPlaceholderWithShortcuts")', conversation)
+
+    def test_long_pasted_text_is_forced_to_a_workspace_attachment(self):
+        app_js = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("const LONG_PASTE_FILE_THRESHOLD = 6000", app_js)
+        self.assertIn('event.clipboardData?.getData("text/plain")', app_js)
+        self.assertIn('new File([text], `pasted-text-${stamp}.txt`', app_js)
+        self.assertIn('attachComposerFiles([file], { forceUploadText: true, suppressReadyToast: true })', app_js)
+        self.assertIn('textFile && !forceUploadText', app_js)
+        self.assertIn("else insertComposerText(text)", app_js)
+
+    def test_browser_user_message_anchors_tools_below_the_triggering_message(self):
+        worker = (Path(__file__).resolve().parents[1] / "static" / "chat-worker.js").read_text(encoding="utf-8")
+        self.assertIn("const browserUserKeys = new Set", worker)
+        self.assertIn("browserUserKeys.has(key)", worker)
+        self.assertIn("browserUserBodies.get(body)", worker)
+        self.assertIn("matchedBrowserBodies.set(body", worker)
+
+        script = f'''
+const fs = require("fs");
+const path = require("path");
+const vm = require("vm");
+const context = {{ self: {{ postMessage() {{}} }} }};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync({json.dumps(str(Path(__file__).resolve().parents[1] / "static/chat-worker.js"))}, "utf8"), context);
+const body = "trigger the tool";
+const merged = context.mergeEvents([
+  {{ id: "tool", ts: "2026-08-28T09:10:00Z", stream: "app-server", payload: JSON.stringify({{ type: "commandExecution", command: "pwd" }}) }},
+  {{ id: "late-native-user", ts: "2026-08-28T09:11:00Z", stream: "app-server", payload: JSON.stringify({{ type: "userMessage", text: body, client_message_id: "client-1" }}) }},
+], [
+  {{ id: "client-1", body, status: "running", created_at: "2026-08-28T09:08:49Z" }},
+]);
+process.stdout.write(JSON.stringify(merged.map(event => ({{ stream: event.stream, ts: event.ts, type: context.valueOf(event.payload).type }}))));
+'''
+        result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True, encoding="utf-8")
+        merged = json.loads(result.stdout)
+        self.assertEqual("user", merged[0]["stream"])
+        self.assertEqual("browserMessage", merged[0]["type"])
+        self.assertEqual("commandExecution", merged[1]["type"])
+
+    def test_long_paths_have_dedicated_full_value_copy_controls(self):
+        conversation = (Path(__file__).resolve().parents[1] / "static" / "conversation.js").read_text(encoding="utf-8")
+        worker = (Path(__file__).resolve().parents[1] / "static" / "chat-worker.js").read_text(encoding="utf-8")
+        styles = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(encoding="utf-8")
+        self.assertIn('data-copy-path="${esc(item.cwd)}"', conversation)
+        self.assertIn("function decorateCopyablePaths", conversation)
+        self.assertIn("function looksLikeCopyablePath", conversation)
+        self.assertIn('event.target.closest("[data-copy-path]")', conversation)
+        self.assertIn('data-copy-path="${safePath}"', worker)
+        self.assertIn(".inline-path", styles)
+        self.assertIn(".path-copy-button", styles)
+        self.assertIn('data-copy-workspace="${esc(task.workspace)}"', conversation)
+        self.assertIn("workspace-path-value", conversation)
+        self.assertIn('.message-content a[href]', conversation)
+        self.assertIn("inline-path-link", conversation)
+        app_js = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("button.dataset.copyWorkspace", app_js)
+        self.assertIn("工作目录已复制", app_js)
+        html = (Path(__file__).resolve().parents[1] / "static" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="media-viewer-copy-path"', html)
+        self.assertIn('$("#media-viewer-copy-path").dataset.copyPath = path', conversation)
+        self.assertIn("已复制完整路径", conversation)
+
+    def test_ctrl_b_focus_mode_collapses_both_sidebars(self):
+        core = (Path(__file__).resolve().parents[1] / "static" / "core.js").read_text(encoding="utf-8")
+        app_js = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text(encoding="utf-8")
+        styles = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(encoding="utf-8")
+        self.assertIn('localStorage.getItem("codex-partner-focus-mode") === "1"', core)
+        self.assertIn("function setFocusMode", core)
+        self.assertIn("function toggleFocusMode", core)
+        self.assertIn("focusRestoreLayout", core)
+        self.assertIn("sidebarOpen: sessionSidebarLayoutIsOpen()", core)
+        self.assertIn("setSessionSidebarOpen(restore.sidebarOpen !== false, false)", core)
+        self.assertIn("state.inspectorClosed = !restore.inspectorOpen", core)
+        self.assertIn("return state.focusMode ? false : sessionSidebarLayoutIsOpen()", core)
+        self.assertIn('event.key.toLowerCase() === "b"', app_js)
+        self.assertIn("toggleFocusMode()", app_js)
+        self.assertIn(".workspace-app.focus-mode > .session-sidebar", styles)
+        self.assertIn(".workspace-app.focus-mode > .inspector", styles)
+        self.assertIn(".workspace-app.focus-mode .message { width: min(1280px, 100%)", styles)
+        self.assertIn(".workspace-app.focus-mode .message-body", styles)
+        self.assertIn(".workspace-app.focus-mode .activity-group { max-width: 1280px", styles)
+        self.assertIn(".workspace-app.focus-mode .composer-dock", styles)
+
     def test_global_session_history_query_does_not_block_event_loop(self):
         def slow_query(*_args):
             time.sleep(0.2)
@@ -878,7 +978,7 @@ class RunningStateTests(unittest.TestCase):
             self.assertEqual((282, 320), image.size)
         self.assertIn('const DEFAULT_USER_AVATAR = "/default-user-avatar.webp?v=20260818"', core)
         self.assertIn('profile?.avatar_url || DEFAULT_USER_AVATAR', core)
-        self.assertIn('/core.js?v=20260825-fast-conversation-load', html)
+        self.assertIn('/core.js?v=20260831-focus-wide', html)
 
     def test_app_server_reads_large_json_messages_in_chunks(self):
         async def collect():
@@ -1038,11 +1138,57 @@ class RunningStateTests(unittest.TestCase):
             "ssh_host": "",
         }
         inputs = self.app.appserver_turn_inputs(task, "", include_goal_memory=True)
-        self.assertIn("Continue working toward the active thread goal.", inputs[0]["text"])
-        self.assertIn("call update_goal with status \"complete\"", inputs[0]["text"])
-        self.assertIn("do not create another variant", inputs[0]["text"])
+        self.assertEqual("/goal resume", inputs[0]["text"])
         self.assertNotIn(task["prompt"], inputs[0]["text"])
         self.assertNotIn("stale original prompt", inputs[0]["text"])
+
+    def test_normal_resume_does_not_replay_the_original_prompt(self):
+        task = {
+            "workspace": self.temp.name,
+            "prompt": "stale original prompt",
+            "context": "",
+            "goal": "",
+            "memory_mode": "enabled",
+            "ssh_host": "",
+        }
+        inputs = self.app.appserver_turn_inputs(task, "", continue_existing=True)
+        self.assertEqual("Continue from the previous turn.", inputs[0]["text"])
+        self.assertNotIn(task["prompt"], inputs[0]["text"])
+
+    def test_cli_goal_resume_is_exact_and_normal_resume_is_neutral(self):
+        task = {
+            "workspace": self.temp.name,
+            "prompt": "stale original prompt",
+            "context": "new Goal",
+            "goal": "current objective",
+            "yolo": False,
+            "model": "",
+            "reasoning_effort": "",
+        }
+        goal_cmd = self.app.command_for(task, None, resume_id="thread", include_goal=True)
+        normal_cmd = self.app.command_for(task, None, resume_id="thread", include_goal=False)
+        self.assertEqual("/goal resume", goal_cmd[-1])
+        self.assertEqual("Continue from the previous turn.", normal_cmd[-1])
+
+        yolo_cmd = self.app.command_for({**task, "yolo": True}, None, resume_id="thread", include_goal=False)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", yolo_cmd)
+        self.assertNotIn("--ask-for-approval", yolo_cmd)
+
+    def test_cli_yolo_flags_support_new_and_legacy_codex(self):
+        modern = mock.Mock(returncode=0, stdout="--dangerously-bypass-approvals-and-sandbox", stderr="")
+        legacy = mock.Mock(returncode=0, stdout="--ask-for-approval <never>", stderr="")
+        self.app.CODEX_EXEC_YOLO_FLAGS.clear()
+        with mock.patch.object(self.app.subprocess, "run", return_value=modern):
+            self.assertEqual(
+                ["--dangerously-bypass-approvals-and-sandbox"],
+                self.app.codex_exec_yolo_flags("modern-codex"),
+            )
+        self.app.CODEX_EXEC_YOLO_FLAGS.clear()
+        with mock.patch.object(self.app.subprocess, "run", return_value=legacy):
+            self.assertEqual(
+                ["--ask-for-approval", "never"],
+                self.app.codex_exec_yolo_flags("legacy-codex"),
+            )
 
     def test_attachment_frontend_uses_structured_appserver_inputs(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -1502,11 +1648,94 @@ class RunningStateTests(unittest.TestCase):
         self.assertEqual({"started": True}, result)
         self.assertNotIn(thread_id, self.app.compaction_waiters)
 
+    def test_compaction_helper_reports_failed_compaction_turn(self):
+        thread_id = "failed-compaction-thread"
+
+        class Client:
+            async def request(inner_self, method, params):
+                asyncio.get_running_loop().call_soon(
+                    asyncio.create_task,
+                    self.app.handle_appserver_notification("test", {
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": thread_id,
+                            "turn": {
+                                "status": "failed",
+                                "error": {"codexErrorInfo": "contextWindowExceeded"},
+                            },
+                        },
+                    }),
+                )
+                return {}
+
+        with self.assertRaisesRegex(RuntimeError, "contextWindowExceeded"):
+            asyncio.run(self.app.compact_codex_thread(Client(), thread_id))
+        self.assertNotIn(thread_id, self.app.compaction_waiters)
+
+    def test_overfull_remote_compaction_retries_with_local_compactor(self):
+        source = Path(self.app.__file__).read_text(encoding="utf-8")
+        self.assertIn('"--disable", "remote_compaction_v2", "app-server", "--stdio"', source)
+        self.assertIn("not is_context_window_error(exc)", source)
+        self.assertIn('"already has an active writer" not in str(candidate)', source)
+        self.assertIn("retrying the same client can never observe the lock release", source)
+        self.assertIn("Release that writer before starting the local-compactor process", source)
+
     def test_context_window_failure_compacts_and_continues_active_goal_without_auto_retry(self):
         source = Path(self.app.__file__).read_text(encoding="utf-8")
-        self.assertIn('"context_window_exceeded" in error.lower()', source)
+        self.assertIn("is_context_window_error(error)", source)
         self.assertIn("should_retry = context_recovered or", source)
-        self.assertIn("goal_continues = True", source)
+        self.assertIn('run_mode == "goal_resume"', source)
+
+    def test_context_window_error_accepts_codex_camel_case_payload(self):
+        self.assertTrue(self.app.is_context_window_error('{"codexErrorInfo":"contextWindowExceeded"}'))
+        self.assertTrue(self.app.is_context_window_error("Codex ran out of room in the model's context window"))
+        self.assertTrue(self.app.is_context_window_error("context_window_exceeded"))
+        self.assertFalse(self.app.is_context_window_error("network timeout"))
+
+    def test_thread_token_usage_without_turn_id_survives_timeline_projection(self):
+        event = {
+            "id": 99,
+            "task_id": "token-usage-thread",
+            "stream": "app-server",
+            "ts": self.app.now(),
+            "payload": json.dumps({
+                "type": "codex",
+                "method": "thread/tokenUsage/updated",
+                "params": {"tokenUsage": {"last": {"inputTokens": 4200}, "modelContextWindow": 16000}},
+            }),
+        }
+        rows = self.app.runtime_metric_events([event], 3)
+        self.assertEqual(1, len(rows))
+        self.assertEqual("metrics", rows[0]["stream"])
+        self.assertIn("thread/tokenUsage/updated", rows[0]["payload"])
+
+    def test_token_usage_marks_the_runtime_card_as_compacting(self):
+        core = (Path(__file__).resolve().parents[1] / "static" / "core.js").read_text(encoding="utf-8")
+        conversation = (Path(__file__).resolve().parents[1] / "static" / "conversation.js").read_text(encoding="utf-8")
+        self.assertIn('method === "thread/tokenusage/updated"', core)
+        self.assertIn('method === "thread/compacted"', core)
+        self.assertIn('livePhases.set(id, phase); renderTurnProgress();', conversation)
+        self.assertIn('livePhases.delete(id); renderTurnProgress();', conversation)
+
+    def test_fast_native_timeline_returns_token_usage_metrics(self):
+        source = Path(self.app.__file__).read_text(encoding="utf-8")
+        self.assertIn('metrics = runtime_metric_events(candidates)', source)
+        self.assertIn('"metrics": metrics, "fast": True', source)
+
+    def test_complete_goal_clears_stale_failure(self):
+        task_id = "complete-clears-stale-error"
+        self.make_task(task_id, "available")
+        self.app.db.execute(
+            "UPDATE tasks SET goal='done',goal_status='active',last_error='contextWindowExceeded' WHERE id=?",
+            (task_id,),
+        )
+        try:
+            self.app.persist_observed_goal_status(task_id, "complete", 12)
+            task = self.app.task_or_404(task_id)
+            self.assertEqual("", task["last_error"])
+            self.assertFalse(task["retry_forever"])
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
     def test_manual_message_does_not_change_active_goal_state(self):
         task = {"goal": "build the activity galaxy", "goal_status": "active", "retry_forever": 0}
@@ -2018,7 +2247,8 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
         self.assertIn('task = task_or_404(task["id"])\n        async with goal_sync_lock(task["id"]):', source)
         self.assertIn('async with goal_sync_lock(task["id"]):\n            task = task_or_404(task["id"])\n            goal_revision_at_start', source)
         self.assertIn('"objective": task["goal"]', source)
-        self.assertIn('"input": appserver_turn_inputs(task, message, include_goal_memory=run_mode == "goal_resume")', source)
+        self.assertIn('include_goal_memory=run_mode == "goal_resume"', source)
+        self.assertIn('continue_existing=mode in {"resume", "auto-retry"}', source)
         self.assertIn('await launch(task_id, "goal-resume")', source)
         self.assertIn('"goal-resume" if goal_auto_resume_enabled(latest)', source)
 
@@ -2053,8 +2283,8 @@ process.stdout.write(JSON.stringify(blocks.map(block => block.text)));
 
         conversation = (worker.parent / "conversation.js").read_text(encoding="utf-8")
         html = (worker.parent / "index.html").read_text(encoding="utf-8")
-        self.assertIn('/chat-worker.js?v=20260821-stream-markdown-preview', conversation)
-        self.assertIn('/conversation.js?v=20260825-fast-conversation-load', html)
+        self.assertIn('/chat-worker.js?v=20260831-focus-wide', conversation)
+        self.assertIn('/conversation.js?v=20260831-focus-wide', html)
 
     def test_worker_keeps_distinct_agent_items_in_separate_markdown_blocks(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -2177,6 +2407,25 @@ process.stdout.write(JSON.stringify(context.markdown({json.dumps(source)})));
         self.assertIn('target="_blank" rel="noopener noreferrer"', html)
         self.assertNotIn('href="javascript:', html)
         self.assertIn('href="#" data-chat-file="/home/ori/work/result.log" data-chat-kind="mention"', html)
+
+        encoded_path = "home/ori/jd/0826/qwen3.5-35b-a3b-en2cn-2000-c5%20%E6%80%A7%E8%83%BD%E5%88%86%E6%9E%90/EN2CN_2000_C5_H200_TP4_REPORT.md"
+        encoded_html_script = f"""
+const fs = require("fs");
+const path = require("path");
+const vm = require("vm");
+const staticRoot = {json.dumps(str(static))};
+const context = {{ console, atob, self: {{ postMessage() {{}} }} }};
+vm.createContext(context);
+context.importScripts = (...urls) => {{
+  for (const url of urls) vm.runInContext(fs.readFileSync(path.join(staticRoot, url), "utf8"), context, {{ filename: url }});
+}};
+vm.runInContext(fs.readFileSync(path.join(staticRoot, "chat-worker.js"), "utf8"), context);
+process.stdout.write(context.markdown({json.dumps(f'[report]({encoded_path})')}));
+"""
+        encoded_result = subprocess.run(["node", "-e", encoded_html_script], check=True, capture_output=True, text=True, encoding="utf-8")
+        encoded_html = encoded_result.stdout
+        self.assertIn('data-chat-file="/home/ori/jd/0826/qwen3.5-35b-a3b-en2cn-2000-c5 性能分析/EN2CN_2000_C5_H200_TP4_REPORT.md"', encoded_html)
+        self.assertNotIn("%20", encoded_html)
 
         for relative in (
             "vendor/markdown-it/markdown-it.min.js",
@@ -2506,7 +2755,7 @@ process.stdout.write(JSON.stringify(posts));
             manual_inputs = self.app.appserver_turn_inputs(task, "交互修复验证：只回答 OK")
             goal_inputs = self.app.appserver_turn_inputs(task, "继续", include_goal_memory=True)
         self.assertNotIn("<memory_context", manual_inputs[0]["text"])
-        self.assertIn("分析 MUSA kernel spill", goal_inputs[0]["text"])
+        self.assertEqual("/goal resume", goal_inputs[0]["text"])
         self.assertNotIn("使用多关系知识图谱", goal_inputs[0]["text"])
 
     def test_activity_history_expands_independently_from_message_history(self):
@@ -2562,7 +2811,7 @@ process.stdout.write(JSON.stringify(blocks));
         self.assertIn('data-activity-output-key="${esc(outputKey)}"', conversation)
         self.assertIn("Object.prototype.hasOwnProperty.call(state.activityOutputOpen, outputKey)", conversation)
         self.assertIn("state.activityOutputOpen[output.dataset.activityOutputKey] = output.open", conversation)
-        self.assertIn('/conversation.js?v=20260825-fast-conversation-load', html)
+        self.assertIn('/conversation.js?v=20260831-focus-wide', html)
 
     def test_message_history_skips_activity_only_pages(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -2618,7 +2867,7 @@ const cursors = [];
         self.assertIn("HistoryPagination.fetchEarlierTimelinePages", conversation)
         self.assertIn("messageTarget: 12, maxPages: 8", conversation)
         self.assertIn('/history-pagination.js?v=20260817-message-history', html)
-        self.assertIn('/conversation.js?v=20260825-fast-conversation-load', html)
+        self.assertIn('/conversation.js?v=20260831-focus-wide', html)
 
     def test_sent_browser_messages_follow_the_loaded_timeline_boundary(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -2651,7 +2900,7 @@ process.stdout.write(JSON.stringify({{ recent: bodies(recentEvents), older: bodi
         self.assertEqual(["currently running message", "old sent message", "current sent message"], payload["older"])
 
         conversation = (worker.parent / "conversation.js").read_text(encoding="utf-8")
-        self.assertIn('/chat-worker.js?v=20260821-stream-markdown-preview', conversation)
+        self.assertIn('/chat-worker.js?v=20260831-focus-wide', conversation)
 
     def test_metrics_user_event_does_not_hide_its_browser_message(self):
         worker = Path(__file__).resolve().parents[1] / "static" / "chat-worker.js"
@@ -3348,8 +3597,7 @@ process.stdout.write(JSON.stringify(browserMessages));
 
     def test_manual_turn_completion_honors_goal_start_takeover(self):
         source = Path(self.app.__file__).read_text(encoding="utf-8")
-        self.assertIn('and goal_should_run(goal_task)', source)
-        self.assertIn('launch_after_turn_cleanup(task["id"], "goal-resume"', source)
+        self.assertIn("resume_goal_after_cleanup = False", source)
 
     def test_goal_pause_pauses_goal_and_stops_conversation(self):
         task_id = "atomic-goal-pause"
@@ -3694,6 +3942,7 @@ process.stdout.write(JSON.stringify(browserMessages));
     def test_source_locations_open_the_real_text_file_and_target_line(self):
         source = (Path(__file__).resolve().parents[1] / "static" / "conversation.js").read_text(encoding="utf-8")
         self.assertIn("function chatFileReference(path)", source)
+        self.assertIn("decodeURIComponent(value)", source)
         self.assertIn("path: reference.path", source)
         self.assertIn('target.className = "media-viewer-target-line"', source)
         script = f"""
@@ -3709,6 +3958,7 @@ process.stdout.write(JSON.stringify([
   context.chatFileReference("/repo/install.sh:79"),
   context.chatFileReference("/repo/main.py:12:4"),
   context.chatFileReference("/repo/main.cc#L25C3"),
+  context.chatFileReference("home/ori/report%20files/result.md"),
   context.chatViewerKind("/repo/install.sh:79"),
   context.chatDownloadUrl("task", "/repo/install.sh:79")
 ]));
@@ -3718,8 +3968,9 @@ process.stdout.write(JSON.stringify([
         self.assertEqual({"path": "/repo/install.sh", "line": 79, "column": 0}, parsed[0])
         self.assertEqual({"path": "/repo/main.py", "line": 12, "column": 4}, parsed[1])
         self.assertEqual({"path": "/repo/main.cc", "line": 25, "column": 3}, parsed[2])
-        self.assertEqual("text", parsed[3])
-        self.assertIn("path=%2Frepo%2Finstall.sh", parsed[4])
+        self.assertEqual({"path": "/home/ori/report files/result.md", "line": 0, "column": 0}, parsed[3])
+        self.assertEqual("text", parsed[4])
+        self.assertIn("path=%2Frepo%2Finstall.sh", parsed[5])
 
     def test_legacy_staging_attachment_is_restored_to_session_workspace(self):
         task_id = "legacy-attachment-thread"
@@ -4300,8 +4551,8 @@ process.stdout.write(JSON.stringify([
         self.assertIn('disabled title="${esc(uiLabel("protectedSkillDelete"))}"', settings)
         self.assertIn(".panel-item button.danger-text:not(:disabled)", styles)
         self.assertNotIn(".panel-item button:last-child", styles)
-        self.assertIn('/styles.css?v=20260825-directed-ssh-login', html)
-        self.assertIn('/core.js?v=20260825-fast-conversation-load', html)
+        self.assertIn('/styles.css?v=20260831-focus-wide', html)
+        self.assertIn('/core.js?v=20260831-focus-wide', html)
         self.assertIn('/settings.js?v=20260825-directed-ssh-login', html)
 
     def test_provider_probe_status_and_endpoint_refresh(self):
@@ -4837,7 +5088,7 @@ process.stdout.write(JSON.stringify([
         worker_js = (static / "chat-worker.js").read_text(encoding="utf-8")
         self.assertIn("numeric < 1e12 ? numeric * 1000 : numeric", worker_js)
         self.assertIn("timestamp(a.event) - timestamp(b.event) || a.index - b.index", worker_js)
-        self.assertIn("payload.client_message_id || body || payload.item_id", worker_js)
+        self.assertIn('payload.client_message_id || payload.item_id', worker_js)
         self.assertIn("seenUserKeys.has(id)", worker_js)
         self.assertIn("seenUserBodies.get(body)", worker_js)
         self.assertIn("function openChatFileViewer", scripts)
@@ -4939,11 +5190,11 @@ process.stdout.write(JSON.stringify([
         self.assertIn('forkCreated ? "会话已复制，但打开副本失败" : "复制会话失败"', app_js)
         self.assertIn('uiLabel("sessionRenamed")', app_js)
         self.assertIn('uiLabel("sessionDuplicated")', app_js)
-        self.assertIn('/app.js?v=20260825-interaction-state-machine', html)
-        self.assertIn('/core.js?v=20260825-fast-conversation-load', html)
+        self.assertIn('/app.js?v=20260831-focus-wide', html)
+        self.assertIn('/core.js?v=20260831-focus-wide', html)
         self.assertIn('responseErrorMessage(response)', (static / "core.js").read_text(encoding="utf-8"))
         self.assertIn('/mascot-dance.js?v=20260816-game-sprites', html)
-        self.assertIn('/conversation.js?v=20260825-fast-conversation-load', html)
+        self.assertIn('/conversation.js?v=20260831-focus-wide', html)
         self.assertIn("/timeline?limit=120", conversation_js)
         self.assertIn("new Worker", conversation_js)
         self.assertIn("chatVirtualStart", conversation_js)
@@ -5104,6 +5355,23 @@ process.stdout.write(JSON.stringify([
         self.assertIn('[data-theme="wasteland"]', (static / "styles.css").read_text(encoding="utf-8"))
         self.assertIn("wastelandStandbyTip", core_js)
         self.assertIn("wasteland-scout-float", (static / "styles.css").read_text(encoding="utf-8"))
+        self.assertIn("wasteland-steam", (static / "styles.css").read_text(encoding="utf-8"))
+        self.assertIn("mascot-steam mascot-steam-a", (static / "core.js").read_text(encoding="utf-8"))
+        self.assertIn("decorateMascots();", (static / "app.js").read_text(encoding="utf-8"))
+        self.assertIn('id="crt-background"', html)
+        self.assertIn("crt-background.js?v=20260901-crt-shader", html)
+        self.assertIn("Same vignette shape", (static / "crt-background.js").read_text(encoding="utf-8"))
+        self.assertIn('powerPreference: "low-power"', (static / "crt-background.js").read_text(encoding="utf-8"))
+        self.assertIn("float glass =", (static / "crt-background.js").read_text(encoding="utf-8"))
+        self.assertIn("opacity: .92", (static / "styles.css").read_text(encoding="utf-8"))
+        self.assertIn(".chat-stream { background-color: #07150c82", (static / "styles.css").read_text(encoding="utf-8"))
+        self.assertIn(".conversation-shell { background: #07150ca8", (static / "styles.css").read_text(encoding="utf-8"))
+        self.assertIn("Softer phosphor text", (static / "styles.css").read_text(encoding="utf-8"))
+        self.assertIn(".message-content p { color: #9fd28e", (static / "styles.css").read_text(encoding="utf-8"))
+        self.assertIn("Hard readability cap", (static / "styles.css").read_text(encoding="utf-8"))
+        self.assertIn("Contrast correction", (static / "styles.css").read_text(encoding="utf-8"))
+        self.assertIn(".message-content, [data-theme=\"wasteland\"] .message-content p { color: #a1d0a0", (static / "styles.css").read_text(encoding="utf-8"))
+        self.assertIn(".message-content, [data-theme=\"wasteland\"] .message-content p { color: #91ba7a", (static / "styles.css").read_text(encoding="utf-8"))
         self.assertIn("mascotDanceSequence", (static / "app.js").read_text(encoding="utf-8"))
         self.assertIn("function triggerMascotDance", dance_js)
         self.assertIn("partner-game-entry", dance_css)
@@ -5204,12 +5472,12 @@ process.stdout.write(JSON.stringify([
         self.assertIn("restoreChatViewport", conversation_js)
         self.assertIn("chatIsNearBottom(stream)", conversation_js)
         self.assertIn("data-chat-block-index", conversation_js)
-        self.assertIn('/conversation.js?v=20260825-fast-conversation-load', html)
+        self.assertIn('/conversation.js?v=20260831-focus-wide', html)
         self.assertIn("state.selectedEvents = []; state.selectedMessages = []", conversation_js)
         self.assertIn("state.runtimeMetrics = { taskId: \"\", ttftMs: null", conversation_js)
-        self.assertIn('/app.js?v=20260825-interaction-state-machine', html)
+        self.assertIn('/app.js?v=20260831-focus-wide', html)
         self.assertNotIn('$("#composer-goal-meta").textContent', conversation_js)
-        self.assertIn('/styles.css?v=20260825-directed-ssh-login', html)
+        self.assertIn('/styles.css?v=20260831-focus-wide', html)
         self.assertIn('/vendor/katex/katex.min.css', html)
         self.assertIn('<span id="goal-run-label">暂停</span>', html)
         self.assertNotIn('id="goal-run-label" class="sr-only"', html)
@@ -5221,7 +5489,7 @@ process.stdout.write(JSON.stringify([
         self.assertIn(".exploration-node.selected .exploration-node-copy", styles)
         self.assertNotIn("renderSessionList(); renderConversation(); await loadWorkspace(\"\")", conversation_js)
         self.assertIn(".queued-messages { width: auto; height: auto; min-height: 0; max-height: none; align-self: stretch;", styles)
-        self.assertIn('/chat-worker.js?v=20260821-stream-markdown-preview', conversation_js)
+        self.assertIn('/chat-worker.js?v=20260831-focus-wide', conversation_js)
         self.assertIn('data-live="true" open', conversation_js)
         self.assertIn("activity-event.current::after", styles)
         self.assertIn("function renderActivityEvent", conversation_js)
@@ -5229,7 +5497,9 @@ process.stdout.write(JSON.stringify([
         self.assertIn('class="activity-output activity-output-long"', conversation_js)
         self.assertIn('… +${hidden} lines', conversation_js)
         self.assertIn("if (!activityEventIsVisible(item, active)) return", conversation_js)
-        self.assertIn('isWait ? "for background task"', conversation_js)
+        self.assertIn('isWait ? uiLabel("activityBackgroundTask")', conversation_js)
+        self.assertIn('uiLabel("activityCompleted")', conversation_js)
+        self.assertIn('const liveItemCandidate = liveActivity ?', conversation_js)
         self.assertIn('output && !isWait && !plan.length', conversation_js)
         self.assertIn('class="activity-plan"', conversation_js)
         self.assertIn('const protocolNoise = ["updated", "update", "diff", "output", "delta"', worker_js)
@@ -5274,7 +5544,7 @@ process.stdout.write(JSON.stringify([
         self.assertIn('const sessionList = $("#task-list")', conversation)
         self.assertIn("void selectSession(pointerSelectedSessionId)", conversation)
         self.assertIn('aria-current="${selected ? "true" : "false"}"', conversation)
-        self.assertIn('/conversation.js?v=20260825-fast-conversation-load', html)
+        self.assertIn('/conversation.js?v=20260831-focus-wide', html)
 
     def test_live_chat_rendering_coalesces_expensive_work(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -5301,8 +5571,8 @@ process.stdout.write(JSON.stringify([
         socket_start = conversation.index("if (openSocket) connectSocket(id)", select_start)
         timeline_wait = conversation.index("timeline = await timelinePromise", select_start)
         self.assertLess(socket_start, timeline_wait)
-        self.assertIn('/core.js?v=20260825-fast-conversation-load', html)
-        self.assertIn('/conversation.js?v=20260825-fast-conversation-load', html)
+        self.assertIn('/core.js?v=20260831-focus-wide', html)
+        self.assertIn('/conversation.js?v=20260831-focus-wide', html)
         styles = (static / "styles.css").read_text(encoding="utf-8")
         app_js = (static / "app.js").read_text(encoding="utf-8")
         self.assertNotIn("content-visibility: auto", styles)
@@ -5321,8 +5591,8 @@ process.stdout.write(JSON.stringify([
         self.assertIn("if (chatIsNearBottom(stream))", conversation)
         self.assertNotIn("stream.scrollTop = target * state.chatAverageHeight", conversation)
         self.assertIn("function syncPageVisibility", app_js)
-        self.assertIn('/styles.css?v=20260825-directed-ssh-login', html)
-        self.assertIn('/app.js?v=20260825-interaction-state-machine', html)
+        self.assertIn('/styles.css?v=20260831-focus-wide', html)
+        self.assertIn('/app.js?v=20260831-focus-wide', html)
 
     def test_optimistic_queue_messages_survive_authoritative_refresh(self):
         static = Path(__file__).resolve().parents[1] / "static"
@@ -5421,8 +5691,15 @@ process.stdout.write(JSON.stringify([
         self.assertIn('npm install --global --prefix /home/codex/.local "@openai/codex@${CODEX_VERSION}"', dockerfile)
         self.assertIn("CODEX_BIN=/home/codex/.local/bin/codex", dockerfile)
         self.assertIn("USER codex", dockerfile)
+        self.assertIn("bubblewrap", dockerfile)
         self.assertIn('ENTRYPOINT ["tini", "--"]', dockerfile)
         self.assertIn('CMD ["codex-partner"]', dockerfile)
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+        self.assertIn("--cap-add=SYS_ADMIN", readme)
+        self.assertIn("--security-opt seccomp=unconfined", readme)
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+        self.assertIn("--cap-add=SYS_ADMIN", readme)
+        self.assertIn("--security-opt seccomp=unconfined", readme)
 
     def test_codex_discovery_uses_path_then_vscode_then_official(self):
         cases = (
@@ -5529,6 +5806,7 @@ process.stdout.write(JSON.stringify([
     def test_large_text_and_markdown_viewer_exposes_complete_loading(self):
         conversation = (Path(__file__).resolve().parents[1] / "static" / "conversation.js").read_text(encoding="utf-8")
         styles = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(encoding="utf-8")
+        app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
         self.assertIn("const autoLoadLimit = 8 * 1024 * 1024", conversation)
         self.assertIn("media-viewer-progress", conversation)
         self.assertIn("media-viewer-load-all", conversation)
@@ -5537,6 +5815,19 @@ process.stdout.write(JSON.stringify([
         self.assertNotIn("已显示前 1 MB", conversation)
         self.assertIn("place-items: start stretch", styles)
         self.assertIn(".media-viewer-image { place-self: center", styles)
+        self.assertIn("white-space: pre; overflow-wrap: normal; word-break: normal", styles)
+        self.assertIn(".media-viewer-markdown .toastui-editor-contents pre { max-width: 100%; overflow-x: auto", styles)
+        self.assertIn("word-wrap: normal !important", styles)
+        self.assertIn("id=\"conversation-searchbar\"", (Path(__file__).resolve().parents[1] / "static" / "index.html").read_text(encoding="utf-8"))
+        self.assertIn("function refreshChatSearch", conversation)
+        self.assertIn("scrollIntoView({ block: \"center\"", conversation)
+        self.assertIn("conversation-search", (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text(encoding="utf-8"))
+        self.assertIn("def persist_native_thread_permissions", app_source)
+        self.assertIn('args.append("never" if yolo else "on-request")', app_source)
+        self.assertIn('persist_native_thread_permissions(result.get("codex_session_id") or task_id', app_source)
+        self.assertIn("def apply_native_thread_settings", app_source)
+        self.assertIn("task = apply_native_thread_settings(task, thread_id)", app_source)
+        self.assertIn("setChatSearchOpen(!bar || bar.hidden)", (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text(encoding="utf-8"))
 
 if __name__ == "__main__":
     unittest.main()

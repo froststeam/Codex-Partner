@@ -14,7 +14,7 @@ RUN python -m pip wheel --no-cache-dir --wheel-dir /wheels .
 FROM python:3.12-slim AS runtime
 
 ARG CODEX_VERSION=latest
-ARG APP_VERSION=0.0.3
+ARG APP_VERSION=0.0.14
 
 LABEL org.opencontainers.image.title="Codex Partner" \
       org.opencontainers.image.description="Self-hosted management for persistent Codex tasks" \
@@ -39,6 +39,7 @@ RUN apt-get update \
         nodejs \
         npm \
         openssh-client \
+        bubblewrap \
         tini \
     && useradd --create-home --uid 10001 --shell /bin/bash codex \
     && install -d -o codex -g codex \
