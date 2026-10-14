@@ -1,4 +1,4 @@
 """Codex Partner application package."""
 
 APP_NAME = "Codex Partner"
-APP_VERSION = "0.0.15"
+APP_VERSION = "0.0.16"

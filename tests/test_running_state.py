@@ -5644,18 +5644,17 @@ process.stdout.write(JSON.stringify([
         mutable = inspect.getsource(self.app.broadcast_task)
         self.assertIn('"foreign_writer_active"', mutable)
 
-    def test_browser_auth_login_dialog_accepts_a_custom_ssh_port(self):
+    def test_browser_auth_login_dialog_hides_and_auto_detects_ssh_port(self):
         root = Path(__file__).resolve().parents[1]
         static = root / "static"
         html = (static / "index.html").read_text(encoding="utf-8")
         core_js = (static / "core.js").read_text(encoding="utf-8")
-        self.assertIn('id="ssh-login-port"', html)
-        self.assertIn('name="port"', html)
-        self.assertIn('placeholder="22"', html)
+        self.assertNotIn('id="ssh-login-port"', html)
+        self.assertNotIn('name="port"', html)
         login_block = core_js[core_js.index("async function requestSSHLogin") : core_js.index("async function api")]
         self.assertNotIn("/api/auth/status", login_block)
-        self.assertIn("port: port && port.value ? Number(port.value) : null", login_block)
-        self.assertIn('localStorage.getItem("codexPartner.sshLoginPort")', core_js)
+        self.assertNotIn("port:", login_block)
+        self.assertNotIn('codexPartner.sshLoginPort', core_js)
         schema = (root / "codex_partner" / "schemas.py").read_text(encoding="utf-8")
         login_schema = schema[schema.index("class SSHLoginIn") : schema.index("class SkillIn")]
         self.assertIn("port: Optional[int] = Field(default=None, ge=1, le=65535)", login_schema)

@@ -476,8 +476,6 @@ const UI_LABELS = {
   authMessage: { zh: "使用这台服务器的 SSH 账户登录。密码只用于本次 SSH 验证，不会保存。", en: "Sign in with an SSH account on this server. The password is used only for this verification and is not stored.", fr: "Connectez-vous avec un compte SSH de ce serveur. Le mot de passe sert uniquement à cette vérification et n’est pas stocké.", ja: "このサーバーの SSH アカウントでログインします。パスワードは今回の認証にのみ使用され、保存されません。", ko: "이 서버의 SSH 계정으로 로그인하세요. 비밀번호는 이번 인증에만 사용되며 저장되지 않습니다." },
   sshUsername: { zh: "SSH 用户名", en: "SSH username", fr: "Nom d’utilisateur SSH", ja: "SSH ユーザー名", ko: "SSH 사용자 이름" },
   sshPassword: { zh: "SSH 密码", en: "SSH password", fr: "Mot de passe SSH", ja: "SSH パスワード", ko: "SSH 비밀번호" },
-  sshPort: { zh: "SSH 端口", en: "SSH port", fr: "Port SSH", ja: "SSH ポート", ko: "SSH 포트" },
-  sshPortHint: { zh: "默认 22，可按需修改。", en: "Defaults to 22; change it if needed.", fr: "22 par défaut ; modifiable si besoin.", ja: "既定は 22 です。必要に応じて変更してください。", ko: "기본값은 22이며 필요하면 변경하세요." },
   foreignWriterTitle: { zh: "线程被其他 Codex 进程占用", en: "Thread owned by another Codex process", fr: "Fil détenu par un autre processus Codex", ja: "スレッドは別の Codex プロセスが使用中", ko: "다른 Codex 프로세스가 스레드를 점유 중" },
   foreignWriterBadge: { zh: "无法接管", en: "Cannot take over", fr: "Prise en charge impossible", ja: "引き継ぎ不可", ko: "인계 불가" },
   foreignWriterBody: { zh: "Codex Partner 无法访问这个线程：它仍被下面这些进程以写入方式占用，重启或重试都不会生效。请关闭对应终端，或直接强制接管。", en: "Codex Partner cannot access this thread: the processes below still hold it open for writing, so restarts and retries cannot help. Close that terminal or take over by force.", fr: "Codex Partner ne peut pas accéder à ce fil : les processus ci-dessous le détiennent toujours en écriture. Fermez ce terminal ou forcez la prise en charge.", ja: "Codex Partner はこのスレッドにアクセスできません。以下のプロセスが書き込み用に保持しているため、再起動や再試行は効きません。ターミナルを閉じるか強制引き継ぎしてください。", ko: "Codex Partner가 이 스레드에 접근할 수 없습니다. 아래 프로세스가 쓰기용으로 점유 중이라 재시작이나 재시도로는 해결되지 않습니다. 해당 터미널을 닫거나 강제 인계하세요." },
@@ -744,34 +742,7 @@ function updateSSHLoginDialog() {
   $("#ssh-login-message").textContent = uiLabel("authMessage");
   $("#ssh-login-username-label").textContent = uiLabel("sshUsername");
   $("#ssh-login-password-label").textContent = uiLabel("sshPassword");
-  const portLabel = $("#ssh-login-port-label");
-  if (portLabel) portLabel.textContent = uiLabel("sshPort");
-  const portHint = $("#ssh-login-port-hint");
-  if (portHint) portHint.textContent = uiLabel("sshPortHint");
   $("#ssh-login-submit").textContent = uiLabel("connect");
-}
-
-function rememberedSSHLoginPort() {
-  try {
-    return localStorage.getItem("codexPartner.sshLoginPort") || "";
-  } catch (_ignored) {
-    return "";
-  }
-}
-
-function rememberSSHLoginPort(value) {
-  try {
-    const text = String(value ?? "").trim();
-    if (text) localStorage.setItem("codexPartner.sshLoginPort", text);
-    else localStorage.removeItem("codexPartner.sshLoginPort");
-  } catch (_ignored) {
-    /* storage unavailable: keep the field value only */
-  }
-}
-
-function prefillSSHLoginPort(input) {
-  const remembered = rememberedSSHLoginPort();
-  if (remembered) input.value = remembered;
 }
 
 async function requestSSHLogin() {
@@ -781,13 +752,11 @@ async function requestSSHLogin() {
     const form = $("#ssh-login-form");
     const username = $("#ssh-login-username");
     const password = $("#ssh-login-password");
-    const port = $("#ssh-login-port");
     const error = $("#ssh-login-error");
     const submit = $("#ssh-login-submit");
     updateSSHLoginDialog();
     error.textContent = "";
     password.value = "";
-    if (port) prefillSSHLoginPort(port);
     dialog.oncancel = event => event.preventDefault();
     form.onsubmit = async event => {
       event.preventDefault();
@@ -795,14 +764,12 @@ async function requestSSHLogin() {
       submit.disabled = true;
       error.textContent = "";
       try {
-        if (port) rememberSSHLoginPort(port.value);
         const response = await fetch("/api/auth/login", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             username: username.value.trim(),
             password: password.value,
-            port: port && port.value ? Number(port.value) : null,
           }),
         });
         const payload = await response.json().catch(() => ({}));
