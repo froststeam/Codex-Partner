@@ -173,10 +173,100 @@ def configured_port(name: str, default: int) -> int:
     return value
 
 
+def _valid_ssh_port(value: str) -> int | None:
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
+def _sshd_config_paths() -> list[Path]:
+    paths: list[Path] = []
+    configured = os.getenv("CODEX_DASHBOARD_SSHD_CONFIG", "").strip()
+    if configured:
+        paths.append(Path(configured).expanduser())
+    if platform.system() == "Windows":
+        program_data = Path(os.getenv("ProgramData", r"C:\ProgramData"))
+        paths.append(program_data / "ssh" / "sshd_config")
+    else:
+        paths.extend([Path("/etc/ssh/sshd_config"), Path("/etc/ssh/sshd_config.d")])
+        if platform.system() == "Linux":
+            paths.append(Path("/run/sshd"))
+    return paths
+
+
+def _config_port_values(path: Path, seen: set[Path] | None = None) -> list[tuple[Path, int]]:
+    seen = seen or set()
+    try:
+        resolved = path.expanduser().resolve()
+    except OSError:
+        return []
+    if resolved in seen:
+        return []
+    if resolved.is_dir():
+        values: list[tuple[Path, int]] = []
+        for child in sorted(resolved.glob("*.conf")):
+            values.extend(_config_port_values(child, seen))
+        return values
+    if not resolved.is_file():
+        return []
+    seen.add(resolved)
+    try:
+        lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    values = []
+    for line in lines:
+        try:
+            parts = shlex.split(line, comments=True, posix=not IS_WINDOWS)
+        except ValueError:
+            continue
+        if not parts:
+            continue
+        keyword = parts[0].lower()
+        if keyword == "port":
+            for raw_port in parts[1:]:
+                port = _valid_ssh_port(raw_port)
+                if port is not None:
+                    values.append((resolved, port))
+        elif keyword == "include":
+            for pattern in parts[1:]:
+                expanded = Path(pattern).expanduser()
+                if not expanded.is_absolute():
+                    expanded = resolved.parent / expanded
+                for match in sorted(glob.glob(str(expanded))):
+                    values.extend(_config_port_values(Path(match), seen))
+    return values
+
+
+def detect_auth_ssh_port() -> int:
+    """Detect the SSH port used to reach the current Partner process."""
+    if "CODEX_DASHBOARD_AUTH_SSH_PORT" in os.environ:
+        return configured_port("CODEX_DASHBOARD_AUTH_SSH_PORT", 22)
+
+    # OpenSSH exports the server-side port to every login session. This is
+    # the most reliable answer when NAT or multiple sshd instances are used.
+    for variable in ("SSH_CONNECTION", "SSH_CLIENT"):
+        parts = os.getenv(variable, "").split()
+        if parts:
+            port = _valid_ssh_port(parts[-1] if variable == "SSH_CONNECTION" else parts[-1])
+            if port is not None:
+                return port
+
+    values: list[tuple[Path, int]] = []
+    for path in _sshd_config_paths():
+        values.extend(_config_port_values(path))
+    if values:
+        values.sort(key=lambda item: ("codex" not in item[0].name.lower(), str(item[0]), item[1]))
+        return values[0][1]
+    return 22
+
+
 DASHBOARD_HOST = os.getenv("CODEX_DASHBOARD_HOST", "127.0.0.1").strip() or "127.0.0.1"
 validate_bind_auth(DASHBOARD_HOST, AUTH_MODE, "CODEX_DASHBOARD_AUTH" in os.environ)
 DASHBOARD_PORT = configured_port("CODEX_DASHBOARD_PORT", 8787)
-AUTH_SSH_PORT = configured_port("CODEX_DASHBOARD_AUTH_SSH_PORT", 22)
+AUTH_SSH_PORT = detect_auth_ssh_port()
 SSH_BIN = shutil.which("ssh") or "ssh"
 SSH_CONFIG = Path.home() / ".ssh/config"
 SSH_FIXED_HOST = os.getenv("CODEX_DASHBOARD_SSH_HOST", "").strip()
@@ -2425,16 +2515,76 @@ def workspace_hidden(path: Path) -> bool:
     return name in {".env", "credentials", "credentials.json", "secrets.json"} or path.suffix.lower() in {".key", ".pem", ".p12", ".pfx"}
 
 
+def normalize_ssh_host(value: str) -> str:
+    """Normalize a host field or an ``ssh ...`` command to a target."""
+    raw = value.strip()
+    try:
+        tokens = shlex.split(raw, comments=False, posix=True)
+    except ValueError as exc:
+        raise HTTPException(400, "Invalid SSH command") from exc
+    if not tokens or Path(tokens[0]).name.lower() not in {"ssh", "ssh.exe"}:
+        return raw
+    user = ""
+    port: int | None = None
+    target = ""
+    option_values = {
+        "-b", "-c", "-D", "-E", "-F", "-I", "-i", "-J", "-L", "-l",
+        "-m", "-o", "-p", "-R", "-S", "-W", "-w", "--config", "--port",
+    }
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if not token.startswith("-"):
+            target = token
+            break
+        if token in {"-p", "--port"}:
+            index += 1
+            if index >= len(tokens) or _valid_ssh_port(tokens[index]) is None:
+                raise HTTPException(400, "Invalid SSH port")
+            port = _valid_ssh_port(tokens[index])
+        elif token.startswith("-p") and token[2:].isdigit():
+            port = _valid_ssh_port(token[2:])
+        elif token in {"-l"}:
+            index += 1
+            if index >= len(tokens):
+                raise HTTPException(400, "Missing SSH user")
+            user = tokens[index]
+        elif token in option_values:
+            index += 1
+        index += 1
+    if not target:
+        raise HTTPException(400, "Missing SSH host")
+    if user and "@" not in target:
+        target = f"{user}@{target}"
+    if port is not None and ":" not in target.rsplit("@", 1)[-1]:
+        target = f"{target}:{port}"
+    return target
+
+
 def validate_ssh_host(host: str) -> str:
-    value = host.strip()
+    value = normalize_ssh_host(host)
     if not value or value.startswith("-") or not re.fullmatch(r"[A-Za-z0-9_.@%:+-]+", value):
         raise HTTPException(400, "Invalid SSH host alias")
     return value
 
 
-def ssh_config_aliases(path: Path = SSH_CONFIG, seen: Optional[set[Path]] = None) -> list[str]:
+def ssh_config_paths() -> list[Path]:
+    paths = [SSH_CONFIG]
+    if IS_WINDOWS:
+        paths.append(Path(os.getenv("ProgramData", r"C:\ProgramData")) / "ssh" / "ssh_config")
+    else:
+        paths.extend([Path("/etc/ssh/ssh_config"), Path("/etc/ssh/ssh_config.d")])
+    return paths
+
+
+def ssh_config_aliases(path: Optional[Path] = None, seen: Optional[set[Path]] = None) -> list[str]:
     """Return concrete Host aliases while following OpenSSH Include files."""
     seen = seen or set()
+    if path is None:
+        aliases: list[str] = []
+        for config_path in ssh_config_paths():
+            aliases.extend(ssh_config_aliases(config_path, seen))
+        return list(dict.fromkeys(aliases))
     try:
         resolved = path.expanduser().resolve()
     except OSError:
@@ -2459,7 +2609,7 @@ def ssh_config_aliases(path: Path = SSH_CONFIG, seen: Optional[set[Path]] = None
             for pattern in parts[1:]:
                 expanded = Path(pattern).expanduser()
                 if not expanded.is_absolute():
-                    expanded = Path.home() / ".ssh" / expanded
+                    expanded = resolved.parent / expanded
                 for match in sorted(glob.glob(str(expanded))):
                     aliases.extend(ssh_config_aliases(Path(match), seen))
         elif keyword == "host":

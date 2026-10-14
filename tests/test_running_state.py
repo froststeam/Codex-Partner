@@ -4004,6 +4004,29 @@ process.stdout.write(JSON.stringify([
             config.write_text(f"Include {included}\nHost direct-box other-box\n", encoding="utf-8")
             self.assertEqual(["build-box", "direct-box", "other-box"], self.app.ssh_config_aliases(config))
 
+    def test_ssh_command_normalizes_explicit_port_without_persisting_arguments(self):
+        self.assertEqual(
+            "root@10.20.35.9:62288",
+            self.app.validate_ssh_host("ssh -p 62288 root@10.20.35.9 123456"),
+        )
+
+    def test_auth_ssh_port_prefers_current_openssh_connection(self):
+        with mock.patch.dict(
+            self.app.os.environ,
+            {"SSH_CONNECTION": "192.168.4.82 36814 10.20.35.9 62288"},
+            clear=True,
+        ):
+            self.assertEqual(62288, self.app.detect_auth_ssh_port())
+
+    def test_auth_ssh_port_reads_sshd_config_when_not_in_login_environment(self):
+        with tempfile.TemporaryDirectory(dir=self.temp.name) as directory:
+            config = Path(directory) / "codex-62288.conf"
+            config.write_text("Port 62288\nListenAddress 0.0.0.0\n", encoding="utf-8")
+            with mock.patch.dict(self.app.os.environ, {}, clear=True), mock.patch.object(
+                self.app, "_sshd_config_paths", return_value=[config]
+            ):
+                self.assertEqual(62288, self.app.detect_auth_ssh_port())
+
     def test_ssh_failure_only_requests_password_for_authentication_errors(self):
         self.assertEqual("needs_password", self.app.ssh_failure_status("Permission denied (publickey,password)."))
         self.assertEqual("failed", self.app.ssh_failure_status("connect to host example port 22: Connection timed out"))
