@@ -985,6 +985,8 @@ native_history_cache: dict[str, dict[str, Any]] = {}
 native_history_locks: dict[str, asyncio.Lock] = {}
 runtime_metric_cache: dict[str, tuple[int, list[dict]]] = {}
 native_import_attempt_at = 0.0
+native_index_sync_at = 0.0
+native_index_seen_threads: set[str] = set()
 
 
 def appserver_key(provider: Optional[dict], task: Optional[dict] = None) -> str:
@@ -1215,7 +1217,7 @@ def persist_native_thread_model(thread_id: str, model: str) -> None:
         if "id" not in columns or "model" not in columns:
             conn.close()
             return
-        conn.execute("UPDATE threads SET model=? WHERE id=?", (model or "", thread_id))
+        conn.execute("UPDATE threads SET model=? WHERE id=? AND model IS NOT ?", (model or "", thread_id, model or ""))
         conn.commit()
         conn.close()
     except sqlite3.Error:
@@ -2444,6 +2446,27 @@ async def process_native_rollout_record(task_id: str, thread_id: str, record: di
     )
 
 
+def changed_rollout_rows(rows: list[dict], task_by_thread: dict, offsets: dict, active_tasks: set) -> tuple[list[dict], set[str]]:
+    """Stat idle rollouts in one worker call, keeping active-turn checks live."""
+    changed = []
+    live_paths = set()
+    for row in rows:
+        task_id = task_by_thread.get(row["thread_id"])
+        path = row["path"]
+        if not task_id or not path:
+            continue
+        live_paths.add(path)
+        if path not in offsets or task_id in active_tasks:
+            changed.append(row)
+            continue
+        try:
+            if os.stat(path).st_size != offsets[path]:
+                changed.append(row)
+        except OSError:
+            pass
+    return changed, live_paths
+
+
 async def refresh_native_rollouts() -> None:
     global native_import_attempt_at
     rows = await asyncio.to_thread(native_rollout_rows)
@@ -2454,10 +2477,17 @@ async def refresh_native_rollouts() -> None:
     if unknown and USE_APP_SERVER and loop_time - native_import_attempt_at >= 2:
         native_import_attempt_at = loop_time
         before = {task["id"] for task in tasks}
-        try:
-            await sync_native_threads()
-        except Exception:
-            pass
+        # thread/list intentionally omits some native threads (for example
+        # internal subagents). Their continued absence is not a new import.
+        # Keep checking for live exec writers below, without repeatedly
+        # rewriting the entire task index on the event loop.
+        unseen = set(unknown) - native_index_seen_threads
+        if unseen and loop_time - native_index_sync_at >= 60:
+            try:
+                await sync_native_threads()
+                native_index_seen_threads.update(unknown)
+            except Exception:
+                pass
         tasks = db.all("SELECT id,codex_session_id FROM tasks WHERE native=1 AND codex_session_id!=''")
         task_by_thread = {str(task["codex_session_id"]): task["id"] for task in tasks}
         for task in tasks:
@@ -2479,13 +2509,14 @@ async def refresh_native_rollouts() -> None:
             if task_id:
                 task_by_thread[row["thread_id"]] = task_id
                 await broadcast_overview(task_id, {"kind": "active_native_import"})
-    live_paths = set()
-    for row in rows:
+    changed, live_paths = await asyncio.to_thread(
+        changed_rollout_rows, rows, task_by_thread, dict(native_rollout_offsets), set(external_turns)
+    )
+    for row in changed:
         task_id = task_by_thread.get(row["thread_id"])
         path = row["path"]
         if not task_id or not path:
             continue
-        live_paths.add(path)
         if path not in native_rollout_offsets:
             offset, boundary, phase = await asyncio.to_thread(inspect_rollout_boundary, path)
             native_rollout_offsets[path] = offset
@@ -2551,7 +2582,11 @@ async def foreign_writer_watch_loop() -> None:
     while True:
         try:
             await asyncio.to_thread(refresh_foreign_writer_cache, True)
-            for row in db.all("SELECT * FROM tasks WHERE COALESCE(codex_session_id,'')!='' AND trashed=0"):
+            rows = await asyncio.to_thread(
+                db.all,
+                "SELECT id,codex_session_id,foreign_writer FROM tasks WHERE COALESCE(codex_session_id,'')!='' AND trashed=0",
+            )
+            for row in rows:
                 thread_id = str(row.get("codex_session_id") or "")
                 writers = foreign_writer_cache.get(thread_id, (0, []))[1]
                 stored = foreign_writer_state(row)
@@ -3430,9 +3465,12 @@ def native_stamp(value: Any, fallback: str) -> str:
 
 async def sync_native_threads() -> dict:
     """Import the local Codex thread index into the dashboard task index."""
+    global native_index_sync_at
     async with native_sync_lock:
         if not USE_APP_SERVER:
             return {"imported": 0, "updated": 0, "available": False}
+        native_index_sync_at = asyncio.get_running_loop().time()
+        observed_threads = await asyncio.to_thread(native_rollout_rows)
         provider_result = sync_native_providers()
         client = await appserver_for(None)
         threads: list[dict] = []
@@ -3458,6 +3496,9 @@ async def sync_native_threads() -> dict:
         providers = {row.get("model_provider"): row["id"] for row in db.all("SELECT id,model_provider FROM providers") if row.get("model_provider")}
         imported = updated = 0
         for thread in threads:
+            # Database calls below are synchronous. Let HTTP and websocket
+            # handlers run between rows even during a large explicit sync.
+            await asyncio.sleep(0)
             thread_id = str(thread.get("id") or "").strip()
             if not thread_id or thread.get("ephemeral"):
                 continue
@@ -3478,8 +3519,7 @@ async def sync_native_threads() -> dict:
             memory_mode = str(native_settings.get("memory_mode") or "enabled")
             provider_id = providers.get(model_provider)
             existing = db.one(
-                "SELECT id,name,name_revision,goal,goal_status,goal_tokens_used,goal_revision,status,"
-                "retry_forever,retry_explicit,provider_id,model FROM tasks WHERE codex_session_id=?",
+                "SELECT * FROM tasks WHERE codex_session_id=?",
                 (thread_id,),
             )
             if existing:
@@ -3491,21 +3531,27 @@ async def sync_native_threads() -> dict:
                 aligned_workspace = align_session_workspace(existing["id"], thread_id)
                 if aligned_workspace:
                     workspace = str(aligned_workspace)
-                existing_full = db.one("SELECT trashed FROM tasks WHERE id=?", (existing["id"],)) or {}
-                status = "trashed" if existing_full.get("trashed") else (existing["status"] if existing["status"] in {"running", "retrying", "queued", "stopped"} else ("archived" if archived else "available"))
+                status = "trashed" if existing.get("trashed") else (existing["status"] if existing["status"] in {"running", "retrying", "queued", "stopped"} else ("archived" if archived else "available"))
                 retry_forever = int(existing.get("retry_forever", 0)) if existing.get("retry_explicit") else 0
                 if int(existing.get("goal_revision") or 0) > 0:
                     objective = existing.get("goal", "")
                     goal_status = existing.get("goal_status", "none")
                     goal["tokensUsed"] = existing.get("goal_tokens_used", 0)
                 synced_title = existing.get("name") if int(existing.get("name_revision") or 0) > 0 else title[:160]
-                db.execute(
-                    "UPDATE tasks SET name=?,prompt=?,goal=?,workspace=?,model=?,provider_id=?,goal_status=?,goal_tokens_used=?,"
-                    "retry_forever=?,yolo=?,native=1,archived=?,memory_mode=?,status=?,updated_at=?,"
-                    "last_interaction_at=CASE WHEN COALESCE(last_interaction_at,'')<? THEN ? ELSE last_interaction_at END WHERE id=?",
-                    (synced_title, prompt, objective, workspace, model, provider_id, goal_status, int(goal.get("tokensUsed", 0) or 0),
-                     retry_forever, int(yolo), int(archived), memory_mode, status, updated_at, updated_at, updated_at, existing["id"]),
-                )
+                values = {
+                    "name": synced_title, "prompt": prompt, "goal": objective,
+                    "workspace": workspace, "model": model, "provider_id": provider_id,
+                    "goal_status": goal_status, "goal_tokens_used": int(goal.get("tokensUsed", 0) or 0),
+                    "retry_forever": retry_forever, "yolo": int(yolo), "native": 1,
+                    "archived": int(archived), "memory_mode": memory_mode,
+                    "status": status, "updated_at": updated_at,
+                    "last_interaction_at": max(existing.get("last_interaction_at") or "", updated_at),
+                }
+                if any(existing.get(key) != value for key, value in values.items()):
+                    db.execute(
+                        "UPDATE tasks SET " + ",".join(f"{key}=?" for key in values) + " WHERE id=?",
+                        (*values.values(), existing["id"]),
+                    )
                 persist_native_thread_model(thread_id, model)
                 task_id = existing["id"]
                 task_id = canonicalize_task_thread_id(task_id, thread_id)
@@ -3526,6 +3572,7 @@ async def sync_native_threads() -> dict:
                     "INSERT INTO sessions (id,task_id,status,attempt,provider_id,command,started_at,finished_at,exit_code,summary,codex_session_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (session_id, task_id, "imported", 0, model_provider or None, shlex.join([CODEX_BIN, "app-server", "thread/resume", thread_id]), created, updated_at, 0, "Imported from local Codex", thread_id),
                 )
+        native_index_seen_threads.update(row["thread_id"] for row in observed_threads)
         return {"imported": imported, "updated": updated, "available": True, "threads": len(threads), "providers": provider_result}
 
 
@@ -5075,10 +5122,30 @@ def safe_json(value: str) -> Any:
         return value
 
 
+# The sidebar only needs a searchable preview of the initial prompt. Native
+# exec threads can each contain hundreds of KB of instructions; selecting all
+# prompts made both /api/tasks and every overview reconnect send hundreds of
+# MB. The per-task endpoint continues to return the complete stored prompt.
+TASK_SUMMARY_SELECT = (
+    "SELECT id,name,substr(prompt,1,512) AS prompt,goal,workspace,status,yolo,"
+    "retry_forever,retry_explicit,provider_id,model,created_at,updated_at,"
+    "last_error,active_session_id,codex_session_id,goal_status,goal_tokens_used,"
+    "goal_revision,goal_updated_at,name_revision,native,archived,trashed,"
+    "trashed_at,trashed_reason,last_interaction_at,memory_mode,execution_source,"
+    "execution_turn_id,run_mode,reasoning_effort,service_tier,personality,"
+    "collaboration_mode,permission_profile,ssh_host,foreign_writer FROM tasks"
+)
+
+
 def task_summary(task_id: str) -> Optional[dict]:
-    row = db.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    row = db.one(TASK_SUMMARY_SELECT + " WHERE id=?", (task_id,))
     if not row:
         return None
+    return task_row_summary(row)
+
+
+def task_row_summary(row: dict) -> dict:
+    """Decorate an already loaded task without another database connection."""
     row["yolo"] = bool(row["yolo"])
     row["retry_forever"] = bool(row.get("retry_forever", 0))
     row["native"] = bool(row.get("native", 0))
@@ -5087,12 +5154,31 @@ def task_summary(task_id: str) -> Optional[dict]:
     row["goal_status"] = public_goal_status(row)
     row.pop("max_retries", None)
     row.pop("retry_count", None)
-    return attach_external_task_state(row, task_id)
+    return attach_external_task_state(row, row["id"])
 
 
 def all_task_summaries() -> list[dict]:
-    rows = db.all("SELECT id FROM tasks WHERE trashed=0 ORDER BY updated_at DESC")
-    return [summary for row in rows if (summary := task_summary(row["id"]))]
+    rows = db.all(TASK_SUMMARY_SELECT + " WHERE trashed=0 ORDER BY updated_at DESC")
+    return [task_row_summary(row) for row in rows]
+
+
+def sidebar_task_summaries(query: str = "") -> list[dict]:
+    """List metadata only; full prompts/goals belong to the selected task."""
+    sql = (
+        "SELECT id,name,status,workspace,provider_id,created_at,updated_at,foreign_writer "
+        "FROM tasks WHERE trashed=0"
+    )
+    args: tuple = ()
+    if query:
+        # Search the stored text without transferring every prompt to the browser.
+        sql += " AND (instr(lower(name),?) OR instr(lower(prompt),?) OR instr(lower(goal),?) OR instr(lower(workspace),?))"
+        args = (query.lower(),) * 4
+    rows = db.all(sql + " ORDER BY updated_at DESC", args)
+    for row in rows:
+        row["external_running"] = bool(external_turns.get(row["id"]))
+        row["foreign_writer_active"] = bool(row.pop("foreign_writer", ""))
+        row["_summary"] = True
+    return rows
 
 
 async def broadcast_overview(task_id: str, source: Optional[dict] = None) -> None:
@@ -6053,18 +6139,11 @@ async def overview(_: Any = Depends(auth)):
 
 
 @app.get("/api/tasks")
-async def list_tasks(_: Any = Depends(auth)):
-    rows = db.all("SELECT * FROM tasks WHERE trashed=0 ORDER BY updated_at DESC")
+async def list_tasks(_: Any = Depends(auth), compact: bool = False, q: str = ""):
+    if compact:
+        return await asyncio.to_thread(sidebar_task_summaries, q.strip())
+    rows = all_task_summaries()
     for r in rows:
-        r["yolo"] = bool(r["yolo"])
-        r["retry_forever"] = bool(r.get("retry_forever", 0))
-        r["native"] = bool(r.get("native", 0))
-        r["archived"] = bool(r.get("archived", 0))
-        r["trashed"] = bool(r.get("trashed", 0))
-        r["goal_status"] = public_goal_status(r)
-        r.pop("max_retries", None)
-        r.pop("retry_count", None)
-        attach_external_task_state(r, r["id"])
         r["interaction"] = derive_interaction_state(r)
     return rows
 
@@ -6885,7 +6964,12 @@ async def task_timeline(task_id: str, before: str = "", limit: int = 160, fast: 
             )
             rows = semantic_timeline_rows(candidates, limit)
             metrics = runtime_metric_events(candidates)
-            return {"items": list(reversed(rows)), "next_cursor": "", "has_more": True, "metrics": metrics, "fast": True}
+            items = sorted(rows, key=history_event_key)
+            next_cursor = ""
+            if items:
+                stamp, event_id = history_event_key(items[0])
+                next_cursor = encode_history_cursor({"kind": "native", "ts": stamp, "id": event_id})
+            return {"items": items, "next_cursor": next_cursor, "has_more": True, "metrics": metrics, "fast": True}
         events, metrics = await native_timeline_events(task)
         if cursor:
             if cursor.get("kind") != "native" or not isinstance(cursor.get("ts"), str):
@@ -7863,7 +7947,9 @@ async def overview_socket(websocket: WebSocket):
     overview_clients.add(websocket)
     overview_client_users[websocket] = session["username"]
     try:
-        await websocket.send_json({"type": "overview_snapshot", "tasks": all_task_summaries(), "profile": profile_snapshot(session["username"])})
+        compact = websocket.query_params.get("compact") == "1"
+        summaries = await asyncio.to_thread(sidebar_task_summaries if compact else all_task_summaries)
+        await websocket.send_json({"type": "overview_snapshot", "tasks": summaries, "profile": profile_snapshot(session["username"])})
         while True:
             incoming = await websocket.receive_json()
             if incoming.get("type") == "ping":

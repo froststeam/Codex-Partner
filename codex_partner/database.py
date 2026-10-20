@@ -186,6 +186,7 @@ class Database:
         for column, definition in task_migrations.items():
             if column not in task_columns:
                 connection.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_tasks_codex_session_id ON tasks(codex_session_id)")
         connection.execute(
             "UPDATE tasks SET goal_revision=CASE WHEN goal_revision=0 THEN 1 ELSE goal_revision END, "
             "goal_updated_at=CASE WHEN COALESCE(goal_updated_at,'')='' THEN updated_at ELSE goal_updated_at END "

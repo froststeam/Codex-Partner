@@ -1012,16 +1012,21 @@ function heartbeatRealtime() {
 }
 function statusLabel(value) { const keys = { running: "statusRunning", retrying: "statusRetrying", queued: "statusQueued", available: "statusAvailable", succeeded: "statusSucceeded", failed: "statusFailed", stopped: "statusStopped", archived: "statusArchived", trashed: "statusTrashed", imported: "statusImported" }; return keys[value] ? t(keys[value]) : value || t("unknown"); }
 function status(value) { return `<span class="status status-${esc(value)}"><i></i>${esc(statusLabel(value))}</span>`; }
+const shortDateFormats = new Map();
 function shortDate(value) {
   if (!value) return "";
   const date = new Date(value); if (Number.isNaN(date.valueOf())) return value;
   const delta = Date.now() - date.valueOf();
   const locale = state.language === "zh" ? "zh-CN" : state.language;
-  const relative = new Intl.RelativeTimeFormat(locale, { numeric: "auto", style: "short" });
+  if (!shortDateFormats.has(locale)) shortDateFormats.set(locale, {
+    relative: new Intl.RelativeTimeFormat(locale, { numeric: "auto", style: "short" }),
+    date: new Intl.DateTimeFormat(locale, { month: "short", day: "numeric" }),
+  });
+  const { relative, date: dateFormat } = shortDateFormats.get(locale);
   if (delta < 60_000) return relative.format(0, "second");
   if (delta < 3_600_000) return relative.format(-Math.floor(delta / 60_000), "minute");
   if (delta < 86_400_000) return relative.format(-Math.floor(delta / 3_600_000), "hour");
-  return date.toLocaleDateString(locale, { month: "short", day: "numeric" });
+  return dateFormat.format(date);
 }
 function eventValue(value) { try { return typeof value === "string" ? JSON.parse(value) : value; } catch (_) { return value; } }
 function eventText(value) {
@@ -1150,7 +1155,7 @@ function isUserEvent(event) { const payload = eventValue(event.payload); return 
 function isAssistantEvent(event) { const payload = eventValue(event.payload); return payload?.type === "agentMessage" || payload?.type === "agent_delta" || payload?.type === "commandResult" || event.stream === "assistant"; }
 function taskHasLiveExecution(task) { return ["running", "retrying"].includes(task?.status) || Boolean(task?.external_running); }
 function taskIsRunningGroup(task) { return taskHasLiveExecution(task) || task?.status === "queued"; }
-function taskMatches(task) { if (state.filter === "running" && !taskIsRunningGroup(task)) return false; if (state.filter !== "all" && state.filter !== "running" && task.status !== state.filter) return false; if (!state.query) return true; const haystack = `${task.name} ${task.prompt} ${task.goal} ${task.workspace}`.toLowerCase(); return haystack.includes(state.query.toLowerCase()); }
+function taskMatches(task) { if (state.filter === "running" && !taskIsRunningGroup(task)) return false; if (state.filter !== "all" && state.filter !== "running" && task.status !== state.filter) return false; if (!state.query || task._searchMatch === state.query) return true; const haystack = `${task.name} ${task.prompt} ${task.goal} ${task.workspace}`.toLowerCase(); return haystack.includes(state.query.toLowerCase()); }
 function taskSortName(task) { return String(task?.name || task?.prompt || task?.id || "").trim().toLocaleLowerCase() || String(task?.id || ""); }
 function taskSortTime(task) { return String(task?.updated_at || task?.created_at || ""); }
 function sortTasks(tasks) {
@@ -1171,7 +1176,8 @@ function mergeTask(task) {
 function mergeOverviewSnapshot(tasks) {
   const incoming = new Map(tasks.map(task => [task.id, task]));
   state.tasks = state.tasks.map(task => incoming.get(task.id) ? { ...task, ...incoming.get(task.id) } : task);
-  for (const task of tasks) if (!state.tasks.some(item => item.id === task.id)) state.tasks.push(task);
+  const existingIds = new Set(state.tasks.map(task => task.id));
+  for (const task of tasks) if (!existingIds.has(task.id)) { state.tasks.push(task); existingIds.add(task.id); }
 }
 function normalizeTaskMessage(message, current = null) {
   const id = message.id || message.message_id;
@@ -1235,8 +1241,13 @@ function scheduleRuntimeMetricsRefresh() {
 
 async function refresh(keepSelection = true) {
   try {
-    const [tasks, sessions, providers, skills, memories, health, commandData] = await Promise.all([api("/tasks"), Promise.resolve([]), api("/providers"), api("/skills"), api("/memories"), api("/health"), api("/commands"), loadUserProfile()]);
-    state.tasks = tasks; state.sessions = sessions; state.providers = providers; state.skills = skills; state.memories = memories.files || []; state.generatedMemories = memories.generated || []; state.commands = commandData.commands || []; state.defaultWorkspace = health.default_workspace || state.defaultWorkspace; renderCodexAvailability(health); renderConnectionStatus();
+    // Auxiliary panels should not delay showing the sidebar or opening a chat.
+    Promise.all([api("/skills"), api("/memories"), api("/commands"), loadUserProfile()]).then(([skills, memories, commands]) => {
+      state.skills = skills; state.memories = memories.files || []; state.generatedMemories = memories.generated || []; state.commands = commands.commands || [];
+      refreshOpenPanel();
+    }).catch(error => console.warn("Panel refresh failed", error));
+    const [tasks, providers, health] = await Promise.all([api("/tasks?compact=true"), api("/providers"), api("/health")]);
+    state.tasks = tasks; state.sessions = []; state.providers = providers; state.defaultWorkspace = health.default_workspace || state.defaultWorkspace; renderCodexAvailability(health); renderConnectionStatus();
     renderSessionList(); renderSidebarStats(); refreshOpenPanel();
     if (state.selectedId && !state.tasks.some(task => task.id === state.selectedId)) state.selectedId = null;
     if (!overviewSocket || overviewSocket.readyState === WebSocket.CLOSED) connectOverviewSocket();

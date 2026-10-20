@@ -1180,3 +1180,8 @@ body.codex-missing .workspace-app { height: calc(100vh - 114px); margin-top: 56p
   .turn-progress { transition: none; }
 }
 .page-hidden *, .page-hidden *::before, .page-hidden *::after { animation-play-state: paused !important; }
+
+/* Fixed row geometry keeps the virtual sidebar aligned with its scroll range. */
+.session-list { overflow-anchor: none; }
+.session-list .session-card { height: 40px; min-height: 40px; margin: 0; }
+.session-spacer-top, .session-spacer-bottom { pointer-events: none; flex-shrink: 0; }
