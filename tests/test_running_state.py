@@ -1171,6 +1171,40 @@ process.stdout.write(JSON.stringify(merged.map(event => ({{ stream: event.stream
             for task_id in ("overview-batch-a", "overview-batch-b"):
                 self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
+    def test_database_write_retries_locks_but_not_corruption(self):
+        from codex_partner.database import Database
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "retry.sqlite3", self.app.now)
+            database.execute("CREATE TABLE sample (value TEXT)")
+            real_connect = database.connect
+            state = {"failures": 2}
+
+            class LockedConnection:
+                def __init__(self, connection):
+                    self.connection = connection
+
+                def execute(self, sql, args=()):
+                    if sql.startswith("INSERT INTO sample") and state["failures"]:
+                        state["failures"] -= 1
+                        raise sqlite3.OperationalError("database is locked")
+                    return self.connection.execute(sql, args)
+
+                def __getattr__(self, name):
+                    return getattr(self.connection, name)
+
+            with mock.patch.object(database, "connect", side_effect=lambda: LockedConnection(real_connect())):
+                database.execute("INSERT INTO sample (value) VALUES (?)", ("saved",))
+            self.assertEqual("saved", database.one("SELECT value FROM sample")["value"])
+            self.assertEqual(0, state["failures"])
+
+            with mock.patch.object(
+                database, "connect", side_effect=sqlite3.OperationalError("disk I/O error")
+            ) as broken:
+                with self.assertRaises(sqlite3.OperationalError):
+                    database.execute("INSERT INTO sample (value) VALUES (?)", ("lost",))
+            self.assertEqual(1, broken.call_count)
+
     def test_task_list_preview_preserves_full_task_prompt(self):
         task_id = "large-prompt-summary"
         self.make_task(task_id, "available")
@@ -3644,6 +3678,24 @@ process.stdout.write(JSON.stringify(browserMessages));
             self.assertEqual("paused", result["goal_status"])
             self.assertIn("local Goal is saved", result["goal_sync_error"])
             self.assertEqual("new durable objective", self.app.task_or_404(task_id)["goal"])
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_goal_edit_remains_committed_when_appserver_setup_fails(self):
+        task_id = "goal-appserver-setup-failure"
+        self.make_task(task_id, "available")
+        self.app.db.execute("UPDATE tasks SET codex_session_id=? WHERE id=?", ("native-thread", task_id))
+        try:
+            with mock.patch.object(
+                self.app,
+                "appserver_for_task",
+                new=mock.AsyncMock(side_effect=RuntimeError("app-server is restarting")),
+            ):
+                result = asyncio.run(self.app.patch_goal(task_id, self.app.GoalPatch(objective="durable objective"), None))
+            self.assertEqual("durable objective", result["goal"])
+            self.assertEqual("paused", result["goal_status"])
+            self.assertEqual(1, result["goal_revision"])
+            self.assertIn("local Goal is saved", result["goal_sync_error"])
         finally:
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 

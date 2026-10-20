@@ -6421,12 +6421,17 @@ async def _patch_goal(task_id: str, payload: GoalPatch) -> dict:
         thread_id = latest_codex_session(task)
         remote_goal: dict[str, Any] = {}
         if thread_id and (payload.objective is not None or payload.status is not None):
-            binding = app_thread_bindings.get(task_id)
-            client = app_servers.get(binding[0]) if binding else None
-            if not client:
-                client, _provider = await appserver_for_task(task)
-                await ensure_thread_loaded(task, client)
             try:
+                # Local persistence above is authoritative. App-server
+                # discovery/loading is part of the best-effort remote sync;
+                # it must be inside this guard because a stopped/restarting
+                # Codex daemon used to turn a successful local save into HTTP
+                # 500 before the existing request try block was reached.
+                binding = app_thread_bindings.get(task_id)
+                client = app_servers.get(binding[0]) if binding else None
+                if not client:
+                    client, _provider = await appserver_for_task(task)
+                    await ensure_thread_loaded(task, client)
                 if not objective.strip():
                     await client.request("thread/goal/clear", {"threadId": thread_id})
                 else:
