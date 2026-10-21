@@ -446,7 +446,7 @@ class RunningStateTests(unittest.TestCase):
         core = (Path(__file__).resolve().parents[1] / "static" / "core.js").read_text(encoding="utf-8")
         refresh = core[core.index("async function refresh(") : core.index("async function refreshSelectedConversation")]
         self.assertNotIn('api("/sessions")', refresh)
-        self.assertIn("Promise.resolve([])", refresh)
+        self.assertIn("state.sessions = []", refresh)
 
     def test_terminal_switch_keeps_each_task_socket_and_output_buffer(self):
         conversation = (Path(__file__).resolve().parents[1] / "static" / "conversation.js").read_text(encoding="utf-8")
@@ -917,6 +917,13 @@ process.stdout.write(JSON.stringify(merged.map(event => ({{ stream: event.stream
             result = asyncio.run(self.app.task_timeline(task_id, limit=120, fast=True, _=None))
             self.assertTrue(result["fast"])
             self.assertEqual(["commandExecution", "agentMessage"], [json.loads(row["payload"])["type"] for row in result["items"]])
+            cursor = self.app.decode_history_cursor(result["next_cursor"])
+            self.assertEqual("native", cursor["kind"])
+            self.assertEqual(result["items"][0]["ts"], cursor["ts"])
+            older = {**result["items"][0], "id": "older", "ts": "2026-08-18T08:00:00+00:00"}
+            with mock.patch.object(self.app, "native_timeline_events", new=mock.AsyncMock(return_value=([older, *result["items"]], []))):
+                previous = asyncio.run(self.app.task_timeline(task_id, before=result["next_cursor"], _=None))
+            self.assertEqual([older], previous["items"])
         finally:
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
@@ -1124,6 +1131,95 @@ process.stdout.write(JSON.stringify(merged.map(event => ({{ stream: event.stream
             self.app.db.execute("DELETE FROM events WHERE task_id=?", (thread_id,))
             self.app.db.execute("DELETE FROM sessions WHERE task_id=?", (thread_id,))
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (thread_id,))
+
+    def test_unlisted_native_thread_does_not_repeat_full_sync(self):
+        thread_id = "internal-thread-not-listed"
+        rows = [{"thread_id": thread_id, "path": "/missing/internal-rollout.jsonl"}]
+        sync = mock.AsyncMock(return_value={"imported": 0})
+
+        async def refresh_twice():
+            await self.app.refresh_native_rollouts()
+            # Expire both intervals: unchanged unknown IDs must still not
+            # trigger another index sync, but live writer discovery must run.
+            self.app.native_import_attempt_at = 0
+            self.app.native_index_sync_at = 0
+            await self.app.refresh_native_rollouts()
+
+        with mock.patch.object(self.app, "USE_APP_SERVER", True), \
+             mock.patch.object(self.app, "native_import_attempt_at", 0), \
+             mock.patch.object(self.app, "native_index_sync_at", 0), \
+             mock.patch.object(self.app, "native_index_seen_threads", set()), \
+             mock.patch.object(self.app, "native_rollout_rows", return_value=rows), \
+             mock.patch.object(self.app, "sync_native_threads", sync), \
+             mock.patch.object(self.app, "rollout_writer_pid_map", return_value={}) as writers:
+            asyncio.run(refresh_twice())
+        sync.assert_awaited_once()
+        self.assertEqual(2, writers.call_count)
+
+    def test_overview_loads_task_rows_in_one_query(self):
+        self.make_task("overview-batch-a", "available")
+        self.make_task("overview-batch-b", "available")
+        try:
+            with mock.patch.object(self.app, "attach_external_task_state", side_effect=lambda row, _: row), \
+                 mock.patch.object(self.app.db, "one", wraps=self.app.db.one) as one, \
+                 mock.patch.object(self.app.db, "all", wraps=self.app.db.all) as all_rows:
+                summaries = self.app.all_task_summaries()
+            self.assertTrue({"overview-batch-a", "overview-batch-b"} <= {row["id"] for row in summaries})
+            all_rows.assert_called_once()
+            one.assert_not_called()
+        finally:
+            for task_id in ("overview-batch-a", "overview-batch-b"):
+                self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_task_list_preview_preserves_full_task_prompt(self):
+        task_id = "large-prompt-summary"
+        self.make_task(task_id, "available")
+        prompt = "完整提示词" * 20000
+        self.app.db.execute("UPDATE tasks SET prompt=? WHERE id=?", (prompt, task_id))
+        try:
+            rows = asyncio.run(self.app.list_tasks())
+            summary = next(row for row in rows if row["id"] == task_id)
+            self.assertEqual(prompt[:512], summary["prompt"])
+            self.assertEqual(prompt[:512], self.app.task_summary(task_id)["prompt"])
+            self.assertEqual(prompt, self.app.task_or_404(task_id)["prompt"])
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_compact_sidebar_omits_details_but_searches_full_prompt(self):
+        task_id = "compact-search-task"
+        self.make_task(task_id, "available")
+        prompt = "hidden prompt " * 20000 + "literal%_needle"
+        goal = "complete goal " * 10000
+        self.app.db.execute("UPDATE tasks SET prompt=?,goal=? WHERE id=?", (prompt, goal, task_id))
+        try:
+            rows = asyncio.run(self.app.list_tasks(compact=True, q="literal%_needle"))
+            self.assertEqual([task_id], [row["id"] for row in rows])
+            self.assertTrue(rows[0]["_summary"])
+            self.assertNotIn("prompt", rows[0])
+            self.assertNotIn("goal", rows[0])
+            self.assertLess(len(json.dumps(rows)), 2000)
+            task = self.app.task_or_404(task_id)
+            self.assertEqual(prompt, task["prompt"])
+            self.assertEqual(goal, task["goal"])
+            self.assertEqual([], asyncio.run(self.app.list_tasks(compact=True, q="absent%_needle")))
+        finally:
+            self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def test_rollout_batch_skips_idle_files_but_checks_active_and_truncated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = []
+            offsets = {}
+            mapping = {}
+            for name in ("idle", "active", "appended", "truncated", "new"):
+                path = Path(directory) / name
+                path.write_bytes(b"record\n")
+                rows.append({"thread_id": name, "path": str(path)})
+                mapping[name] = name
+                if name != "new":
+                    offsets[str(path)] = 100 if name == "truncated" else 0 if name == "appended" else path.stat().st_size
+            changed, live = self.app.changed_rollout_rows(rows, mapping, offsets, {"active"})
+            self.assertEqual({"active", "appended", "truncated", "new"}, {row["thread_id"] for row in changed})
+            self.assertEqual({row["path"] for row in rows}, live)
 
     def test_native_sync_preserves_dashboard_model_and_name_overrides(self):
         task_id = f"native-model-{time.time_ns()}"
@@ -5878,7 +5974,7 @@ process.stdout.write(JSON.stringify([
         self.assertIn('event.code === "KeyN"', app_js)
         self.assertIn('event.code === "KeyP"', app_js)
         self.assertIn('event.code === "KeyC"', app_js)
-        self.assertIn("scrollIntoView({ block: \"nearest\" })", conversation_js)
+        self.assertIn("function scrollSessionIntoView(id)", conversation_js)
         self.assertIn("chatSnapToBottom", conversation_js)
         self.assertIn("captureChatViewport", conversation_js)
         self.assertIn("restoreChatViewport", conversation_js)

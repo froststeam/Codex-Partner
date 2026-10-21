@@ -578,7 +578,7 @@ $("#message-input").addEventListener("keydown", async event => {
   if (event.key === "Enter" && event.altKey && !event.ctrlKey) { event.preventDefault(); await submitMessage("steer"); return; }
   if (event.key === "Enter" && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) { event.preventDefault(); $("#message-form").requestSubmit(); }
 });
-$("#session-search").addEventListener("input", event => { state.query = event.target.value.trim(); renderSessionList(); });
+$("#session-search").addEventListener("input", event => { searchSessions(event.target.value.trim()); });
 $("#attach-button").onclick = () => $("#attach-file").click();
 $("#theme-toggle").onclick = toggleTheme;
 $("#attach-file").multiple = true;

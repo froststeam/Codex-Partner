@@ -30,14 +30,100 @@ function renderSidebarStats() {
   const title = running.length ? `${t("statusRunning")} ${running.length} ${t("sessions")}${queued.length ? ` · ${t("statusQueued")} ${queued.length}` : ""}` : `${t("statusQueued")} ${queued.length} ${t("sessions")}`;
   summary.innerHTML = `<div class="running-summary-head"><span class="live-dot"></span><strong>${title}</strong></div><div class="running-summary-list">${live.slice(0, 4).map(task => `<button data-session-id="${esc(task.id)}"><span>${esc(task.name || "Codex 会话")}</span><small>${esc(statusLabel(task.status))}${task.provider_id ? ` · ${esc(state.providers.find(provider => provider.id === task.provider_id)?.name || task.provider_id)}` : ""}</small></button>`).join("")}</div>${live.length > 4 ? `<small class="running-summary-more">还有 ${live.length - 4} 个活动会话</small>` : ""}`;
 }
+const SESSION_ROW_HEIGHT = 40;
+const SESSION_OVERSCAN = 8;
+let sessionListTasks = [];
+let sessionListFilterKey = "";
+let sessionListFrame = 0;
+let sessionSearchTimer = 0;
+let sessionSearchController = null;
+let sessionSearchQuery = "";
+let sessionSearchResults = [];
 function renderSessionList() {
-  const list = $("#task-list"); const tasks = sortTasks(state.tasks.filter(taskMatches));
+  const list = $("#task-list");
+  const filterKey = `${state.filter}:${state.query}`;
+  if (filterKey !== sessionListFilterKey) { list.scrollTop = 0; sessionListFilterKey = filterKey; }
+  const source = state.query && state.query === sessionSearchQuery ? sessionSearchResults : state.tasks;
+  sessionListTasks = sortTasks(source.filter(taskMatches));
+  renderSessionWindow();
+}
+function renderSessionWindow() {
+  const list = $("#task-list");
+  const tasks = sessionListTasks;
   if (!tasks.length) { list.innerHTML = `<div class="empty">${state.query ? "没有匹配的会话" : "还没有 Codex 会话"}</div>`; return; }
-  list.innerHTML = tasks.map(task => { const active = taskIsRunningGroup(task); const selected = task.id === state.selectedId; const name = task.name || t("sessions"); const ownerActive = Boolean(task.foreign_writer_active); const stateText = statusLabel(task.status); const cardTitle = ownerActive ? `${name} · ${stateText} · ${uiLabel("foreignWriterSessionTitle")}` : `${name} · ${stateText}`; return `<button class="session-card ${selected ? "selected" : ""} ${active ? "running" : "paused"} ${ownerActive ? "foreign-owned" : ""}" data-session-id="${esc(task.id)}" title="${esc(cardTitle)}" aria-label="${esc(cardTitle)}" aria-current="${selected ? "true" : "false"}"><span class="session-card-body"><strong title="${esc(name)}">${esc(name)}</strong><time class="session-card-time">${esc(shortDate(task.updated_at))}</time></span>${ownerActive ? `<span class="session-owner-badge" title="${esc(uiLabel("foreignWriterSessionTitle"))}" aria-label="${esc(uiLabel("foreignWriterSessionTitle"))}">🔒 ${esc(uiLabel("foreignWriterShort"))}</span>` : ""}</button>`; }).join("");
+  const height = list.clientHeight || 600;
+  const maxScroll = Math.max(0, tasks.length * SESSION_ROW_HEIGHT - height);
+  if (list.scrollTop > maxScroll) list.scrollTop = maxScroll;
+  const start = Math.max(0, Math.floor(list.scrollTop / SESSION_ROW_HEIGHT) - SESSION_OVERSCAN);
+  const end = Math.min(tasks.length, Math.ceil((list.scrollTop + height) / SESSION_ROW_HEIGHT) + SESSION_OVERSCAN);
+  const visible = tasks.slice(start, end);
+  let top = list.querySelector('.session-spacer-top');
+  let bottom = list.querySelector('.session-spacer-bottom');
+  if (!top || !bottom) {
+    list.replaceChildren();
+    top = document.createElement('div'); top.className = 'session-spacer-top'; top.setAttribute('aria-hidden', 'true');
+    bottom = document.createElement('div'); bottom.className = 'session-spacer-bottom'; bottom.setAttribute('aria-hidden', 'true');
+    list.append(top, bottom);
+  }
+  top.style.height = `${start * SESSION_ROW_HEIGHT}px`;
+  bottom.style.height = `${(tasks.length - end) * SESSION_ROW_HEIGHT}px`;
+  const cards = new Map([...list.querySelectorAll('.session-card')].map(node => [node.dataset.sessionId, node]));
+  const wanted = new Set(visible.map(task => task.id));
+  for (const [id, node] of cards) if (!wanted.has(id)) node.remove();
+  let cursor = top.nextElementSibling;
+  const minute = Math.floor(Date.now() / 60000);
+  for (const [offset, task] of visible.entries()) {
+    const active = taskIsRunningGroup(task); const selected = task.id === state.selectedId; const name = task.name || t("sessions"); const ownerActive = Boolean(task.foreign_writer_active); const stateText = statusLabel(task.status); const cardTitle = ownerActive ? `${name} · ${stateText} · ${uiLabel("foreignWriterSessionTitle")}` : `${name} · ${stateText}`;
+    const signature = JSON.stringify([active, selected, name, ownerActive, stateText, task.updated_at, state.language, minute]);
+    let card = cards.get(task.id);
+    if (!card || card._sessionSignature !== signature) {
+      const markup = `<button class="session-card ${selected ? "selected" : ""} ${active ? "running" : "paused"} ${ownerActive ? "foreign-owned" : ""}" data-session-id="${esc(task.id)}" title="${esc(cardTitle)}" aria-label="${esc(cardTitle)}" aria-current="${selected ? "true" : "false"}"><span class="session-card-body"><strong title="${esc(name)}">${esc(name)}</strong><time class="session-card-time">${esc(shortDate(task.updated_at))}</time></span>${ownerActive ? `<span class="session-owner-badge" title="${esc(uiLabel("foreignWriterSessionTitle"))}" aria-label="${esc(uiLabel("foreignWriterSessionTitle"))}">🔒 ${esc(uiLabel("foreignWriterShort"))}</span>` : ""}</button>`;
+      const template = document.createElement("template"); template.innerHTML = markup;
+      const replacement = template.content.firstElementChild; replacement._sessionSignature = signature;
+      if (card && card.isConnected) { if (cursor === card) cursor = replacement; card.replaceWith(replacement); }
+      card = replacement;
+    }
+    card.setAttribute('aria-posinset', String(start + offset + 1));
+    card.setAttribute('aria-setsize', String(tasks.length));
+    if (card !== cursor) list.insertBefore(card, cursor);
+    cursor = card.nextElementSibling;
+  }
+}
+function scheduleSessionWindow() {
+  if (sessionListFrame) return;
+  sessionListFrame = requestAnimationFrame(() => { sessionListFrame = 0; renderSessionWindow(); });
+}
+function searchSessions(query) {
+  state.query = query;
+  clearTimeout(sessionSearchTimer);
+  sessionSearchController?.abort();
+  sessionSearchQuery = ""; sessionSearchResults = [];
+  renderSessionList();
+  if (!query) return;
+  const controller = new AbortController(); sessionSearchController = controller;
+  sessionSearchTimer = setTimeout(async () => {
+    try {
+      const rows = await api(`/tasks?compact=true&q=${encodeURIComponent(query)}`, { signal: controller.signal });
+      if (state.query !== query || controller.signal.aborted) return;
+      sessionSearchQuery = query; sessionSearchResults = rows.map(task => ({ ...task, _searchMatch: query }));
+      renderSessionList();
+    } catch (error) { if (error.name !== 'AbortError') console.warn('Session search failed', error); }
+  }, 150);
 }
 
 let pointerSelectedSessionId = "";
 const sessionList = $("#task-list");
+sessionList?.addEventListener('scroll', scheduleSessionWindow, { passive: true });
+if (sessionList && typeof ResizeObserver === 'function') new ResizeObserver(scheduleSessionWindow).observe(sessionList);
+sessionList?.addEventListener('keydown', event => {
+  if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+  const card = event.target.closest('.session-card'); if (!card) return;
+  const current = sessionListTasks.findIndex(task => task.id === card.dataset.sessionId);
+  const index = event.key === 'Home' ? 0 : event.key === 'End' ? sessionListTasks.length - 1 : Math.max(0, Math.min(sessionListTasks.length - 1, current + (event.key === 'ArrowDown' ? 1 : -1)));
+  const id = sessionListTasks[index]?.id; if (!id) return;
+  event.preventDefault(); scrollSessionIntoView(id);
+  [...sessionList.querySelectorAll('.session-card')].find(node => node.dataset.sessionId === id)?.focus({ preventScroll: true });
+});
 sessionList?.addEventListener("pointerdown", event => {
   if (event.pointerType !== "mouse" || event.button !== 0) return;
   const card = event.target.closest(".session-card[data-session-id]");
@@ -56,8 +142,12 @@ sessionList?.addEventListener("click", event => {
   pointerSelectedSessionId = "";
 });
 function scrollSessionIntoView(id) {
-  const card = $$(".session-card").find(node => node.dataset.sessionId === id);
-  card?.scrollIntoView({ block: "nearest" });
+  const index = sessionListTasks.findIndex(task => task.id === id);
+  if (index < 0) return;
+  const list = $("#task-list"); const top = index * SESSION_ROW_HEIGHT;
+  if (top < list.scrollTop) list.scrollTop = top;
+  else if (top + SESSION_ROW_HEIGHT > list.scrollTop + list.clientHeight) list.scrollTop = top + SESSION_ROW_HEIGHT - list.clientHeight;
+  renderSessionWindow();
 }
 function stopQueueSync() {
   clearInterval(queueSyncTimer);
@@ -128,7 +218,7 @@ async function selectSession(id, openSocket = true) {
   }
   state.selectedId = id; localStorage.setItem("codex-dashboard-session", id);
   if (previousId !== id) restoreComposerDraft(id);
-  const task = state.tasks.find(item => item.id === id);
+  const task = state.tasks.find(item => item.id === id) || sessionSearchResults.find(item => item.id === id);
   if (task) state.selectedTask = task;
   const cached = conversationSnapshots.get(id);
   if (cached) {
@@ -185,8 +275,12 @@ async function selectSession(id, openSocket = true) {
     state.historyCursor = full.next_cursor || ""; state.historyHasMore = Boolean(full.has_more);
     renderChat();
   }).catch(error => { if (error.name !== "AbortError") console.warn("timeline refresh failed", error); });
-  if (typeof requestIdleCallback === "function") requestIdleCallback(refreshFullTimeline, { timeout: 2500 });
-  else setTimeout(refreshFullTimeline, 250);
+  // Older native history is fetched when the user pages back. Loading an
+  // entire multi-month thread after every switch caused second-long stalls.
+  if (!(timeline.items || []).length) {
+    if (typeof requestIdleCallback === "function") requestIdleCallback(refreshFullTimeline, { timeout: 2500 });
+    else setTimeout(refreshFullTimeline, 250);
+  }
   $("#empty-conversation").hidden = true; $("#conversation-view").hidden = false;
   if (wasEmpty && window.innerWidth >= 861) state.inspectorClosed = false;
   setInspectorOpen(window.innerWidth >= 861 && !state.inspectorClosed);
@@ -196,6 +290,7 @@ async function selectSession(id, openSocket = true) {
 }
 function renderConversation(renderMessages = true) {
   const task = state.selectedTask; if (!task) return;
+  $("#conversation-view").inert = Boolean(task._summary);
   const title = String(task.name || t("sessions"));
   const titleNode = $("#conversation-name");
   const titleToggle = $("#conversation-title-toggle");
@@ -209,6 +304,11 @@ function renderConversation(renderMessages = true) {
   const workspace = task.workspace || "";
   const location = task.ssh_host ? `${task.ssh_host} · ` : "";
   $("#conversation-subtitle").textContent = `${location}${workspace} · ${uiLabel("threadId")} ${threadId || "—"}`;
+  if (task._summary) {
+    $("#goal-bar").hidden = true;
+    renderChat();
+    return;
+  }
   const composerSettings = composerModelCache.get(`${task.id}:${task.provider_id || "default"}`) || {};
   renderComposerModelSelect(task, Array.isArray(composerSettings) ? composerSettings : composerSettings.models || []);
   renderComposerEffortSelect(task, Array.isArray(composerSettings) ? "" : composerSettings.reasoning_effort || task.reasoning_effort || "");
@@ -1602,7 +1702,7 @@ function connectOverviewSocket() {
   if (overviewSocket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(overviewSocket.readyState)) return;
   if (realtimeChannels.overview !== "reconnecting") setRealtimeChannel("overview", "connecting");
   const scheme = location.protocol === "https:" ? "wss" : "ws";
-  overviewSocket = new WebSocket(`${scheme}://${location.host}/ws/overview`);
+  overviewSocket = new WebSocket(`${scheme}://${location.host}/ws/overview?compact=1`);
   overviewSocket.onopen = () => { noteRealtime("overview"); setRealtimeChannel("overview", "live"); };
   overviewSocket.onmessage = event => {
     noteRealtime("overview"); setRealtimeChannel("overview", "live");
@@ -1640,7 +1740,7 @@ function connectOverviewSocket() {
       if (state.selectedId === data.task.id && state.selectedTask) {
         const workspaceChanged = Boolean(data.task.workspace && data.task.workspace !== state.selectedTask.workspace);
         if (workspaceChanged) resetWorkspaceBrowser();
-        state.selectedTask = { ...state.selectedTask, ...data.task };
+        state.selectedTask = { ...state.selectedTask, ...data.task, _summary: false };
         renderConversation();
         if (workspaceChanged) loadWorkspace("");
       }
@@ -1677,7 +1777,7 @@ function connectSocket(id, reconnect = false) {
     noteRealtime("task"); setRealtimeChannel("task", "live");
     const data = JSON.parse(event.data);
     if (data.type === "snapshot" && state.selectedId === id) {
-      state.selectedTask = { ...state.selectedTask, ...(data.task || {}) };
+      state.selectedTask = { ...state.selectedTask, ...(data.task || {}), _summary: false };
       if (data.messages) replaceTaskMessages(data.messages);
       state.pendingApprovals = data.pending_requests || [];
       renderConversation();
