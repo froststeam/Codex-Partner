@@ -17,7 +17,11 @@ def main() -> int:
     summary = Path(os.environ["GITHUB_STEP_SUMMARY"]) if os.getenv("GITHUB_STEP_SUMMARY") else None
     if summary:
         summary.write_text(output.read_text(encoding="utf-8")[-12000:], encoding="utf-8")
-    print(output.read_text(encoding="utf-8"), end="")
+    text = output.read_text(encoding="utf-8")
+    print(text, end="")
+    if not result.wasSuccessful():
+        details = text[-6000:].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::error file=tests/run_tests.py,line=1::{details}")
     return 0 if result.wasSuccessful() else 1
 
 
