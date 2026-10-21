@@ -102,7 +102,7 @@ py -m codex_partner
 ## Docker
 
 ```bash
-docker build -t codex-partner:0.0.17 .
+docker build -t codex-partner:0.0.18 .
 docker run -d --name codex-partner \
   -p 8787:8787 \
   --cap-add=SYS_ADMIN \
@@ -113,7 +113,7 @@ docker run -d --name codex-partner \
   -v codex-partner-data:/var/lib/codex-partner \
   -v codex-home:/home/codex/.codex \
   -v codex-workspace:/workspace \
-  codex-partner:0.0.17
+  codex-partner:0.0.18
 docker exec -it codex-partner codex login
 ```
 
