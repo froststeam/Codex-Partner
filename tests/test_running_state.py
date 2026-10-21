@@ -6,6 +6,7 @@ import inspect
 import io
 import json
 import os
+import platform
 import re
 import sqlite3
 import sys
@@ -310,7 +311,8 @@ class RunningStateTests(unittest.TestCase):
         booted.mkdir(exist_ok=True)
         bus = root / "bus"
 
-        with mock.patch.object(persistent_appserver.shutil, "which", return_value="/usr/bin/systemctl"):
+        with mock.patch.object(persistent_appserver.shutil, "which", return_value="/usr/bin/systemctl"), \
+             mock.patch.object(persistent_appserver.platform, "system", return_value="Linux"):
             # systemctl/systemd-run exist, but PID 1 is not systemd: unsupported.
             with mock.patch.object(persistent_appserver, "SYSTEMD_BOOT_DIR", root / "missing"):
                 self.assertFalse(persistent_appserver.supported())
@@ -324,6 +326,8 @@ class RunningStateTests(unittest.TestCase):
                  mock.patch.object(persistent_appserver, "session_bus_path", return_value=bus):
                 self.assertTrue(persistent_appserver.supported())
         with mock.patch.object(persistent_appserver.shutil, "which", return_value=None):
+            self.assertFalse(persistent_appserver.supported())
+        if platform.system() != "Linux":
             self.assertFalse(persistent_appserver.supported())
 
     def test_appserver_startup_error_ignores_turn_failures(self):
