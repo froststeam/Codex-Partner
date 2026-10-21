@@ -5218,23 +5218,41 @@ async def close_terminal_session(terminal_id: str) -> None:
         except OSError:
             pass
     if pid:
-        try:
-            os.killpg(pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
+        terminate_terminal_process(pid)
+        await wait_terminal_process(pid)
+
+
+def terminate_terminal_process(pid: int, force: bool = False) -> None:
+    """Terminate a local terminal child on POSIX and Windows."""
+    try:
+        if IS_WINDOWS:
+            os.kill(pid, signal.SIGTERM if not force else signal.SIGKILL)
+        else:
+            os.killpg(pid, signal.SIGKILL if force else signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+async def wait_terminal_process(pid: int) -> None:
+    """Wait briefly without requiring POSIX waitpid on Windows."""
+    if IS_WINDOWS:
         for _ in range(20):
             try:
-                finished, _ = os.waitpid(pid, os.WNOHANG)
-            except ChildProcessError:
-                break
-            if finished:
-                break
+                os.kill(pid, 0)
+            except (ProcessLookupError, PermissionError, OSError):
+                return
             await asyncio.sleep(0.02)
-        else:
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+        terminate_terminal_process(pid, force=True)
+        return
+    for _ in range(20):
+        try:
+            finished, _ = os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            return
+        if finished:
+            return
+        await asyncio.sleep(0.02)
+    terminate_terminal_process(pid, force=True)
 
 
 def set_terminal_size(fd: int, cols: int, rows: int) -> None:

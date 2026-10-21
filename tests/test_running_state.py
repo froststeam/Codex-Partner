@@ -3101,6 +3101,17 @@ process.stdout.write(JSON.stringify(browserMessages));
             self.app.clear_external_turns(task_id)
             self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
+    def test_terminal_process_cleanup_has_posix_and_windows_paths(self):
+        source = inspect.getsource(self.app.close_terminal_session)
+        helper = inspect.getsource(self.app.terminate_terminal_process)
+        waiter = inspect.getsource(self.app.wait_terminal_process)
+        self.assertIn("terminate_terminal_process(pid)", source)
+        self.assertIn("IS_WINDOWS", helper)
+        self.assertIn("os.killpg", helper)
+        self.assertIn("os.kill(pid", helper)
+        self.assertIn("waitpid", waiter)
+        self.assertIn("os.kill(pid, 0)", waiter)
+
     def test_confirmed_terminal_takeover_stops_terminal_then_queues_message(self):
         task_id = "terminal-takeover-thread"
         self.make_task(task_id, "running")
