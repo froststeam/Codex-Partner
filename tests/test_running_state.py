@@ -5645,6 +5645,13 @@ process.stdout.write(JSON.stringify([
         self.assertEqual("", self.app.db.one("SELECT foreign_writer FROM tasks WHERE id=?", (task_id,))["foreign_writer"])
         self.app.db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
+    def test_external_writer_detection_has_a_non_linux_process_fallback(self):
+        source = inspect.getsource(self.app.rollout_writer_pid_map)
+        label_source = inspect.getsource(self.app.process_command_label)
+        self.assertIn("psutil.process_iter", source)
+        self.assertIn("platform.system() != \"Linux\"", source)
+        self.assertIn("psutil.Process(pid).cmdline()", label_source)
+
     def test_proactive_scan_ignores_app_server_transports(self):
         thread_id = "foreign-writer-appserver"
         lock = self.app.thread_writer_lock_path(thread_id)

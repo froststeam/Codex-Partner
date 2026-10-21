@@ -36,6 +36,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Optional
 
+try:
+    import psutil
+except ImportError:  # pragma: no cover - optional fallback for minimal installs
+    psutil = None
+
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.middleware.gzip import GZipMiddleware
@@ -1696,6 +1701,18 @@ def rollout_writer_pid_map(paths: Iterable[str], refresh: bool = False) -> dict[
             unresolved.add(target)
     if not unresolved:
         return writers
+    if psutil is not None and platform.system() != "Linux":
+        for process in psutil.process_iter(["pid", "open_files"]):
+            try:
+                for opened in process.info.get("open_files") or []:
+                    target = os.path.realpath(opened.path)
+                    if target in unresolved:
+                        writers[target].add(int(process.info["pid"]))
+            except (OSError, psutil.Error, TypeError, ValueError):
+                continue
+        for target in unresolved:
+            rollout_writer_cache[target] = (stamp, writers[target])
+        return writers
     try:
         processes = os.scandir("/proc")
     except OSError:
@@ -1789,6 +1806,11 @@ def dashboard_process_pids() -> set[int]:
 
 def process_command_label(pid: int, limit: int = 200) -> str:
     """Read one process command line as a short single-line label."""
+    if psutil is not None and platform.system() != "Linux":
+        try:
+            return " ".join(psutil.Process(pid).cmdline())[:limit]
+        except (OSError, psutil.Error):
+            return ""
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-partner"
-version = "0.0.18"
+version = "0.0.19"
 description = "A self-hosted web interface for managing persistent Codex tasks."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,6 +21,7 @@ classifiers = [
   "Topic :: Software Development :: User Interfaces",
 ]
 dependencies = [
+    "psutil>=5.9",
   "fastapi>=0.110",
   "uvicorn[standard]>=0.27",
   "websockets>=13.0",
