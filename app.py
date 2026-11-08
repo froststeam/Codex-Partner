@@ -9048,7 +9048,22 @@ async def supervise_operation(task: dict, session_id: str, cmd: list[str]) -> No
         assert process.stdout
         async for raw in process.stdout:
             line = raw.decode(errors="replace").rstrip("\n")
-            db.execute("INSERT INTO events (session_id,ts,stream,payload) VALUES (?,?,?,?)", (session_id, now(), "stdout", json.dumps(safe_json(line), ensure_ascii=False)))
+            stamp = now()
+            payload = safe_json(line)
+            db.execute(
+                "INSERT INTO events (session_id,ts,stream,payload) VALUES (?,?,?,?)",
+                (session_id, stamp, "stdout", json.dumps(payload, ensure_ascii=False)),
+            )
+            await broadcast_task(
+                task_id,
+                {
+                    "type": "event",
+                    "session_id": session_id,
+                    "stream": "stdout",
+                    "payload": payload,
+                    "ts": stamp,
+                },
+            )
         code = await process.wait()
         db.execute("UPDATE sessions SET status=?, finished_at=?, exit_code=?, summary=? WHERE id=?", ("succeeded" if code == 0 else "failed", now(), code, "Codex operation completed" if code == 0 else f"exit code {code}", session_id))
         db.execute(
