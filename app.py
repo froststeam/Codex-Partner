@@ -1801,6 +1801,14 @@ def dashboard_process_pids() -> set[int]:
     }
     roots.update(client.daemon_pid for client in app_servers.values() if getattr(client, "daemon_pid", 0))
     roots.update(int(session.get("pid") or 0) for session in terminal_sessions.values())
+    # Direct `codex exec` turns are tracked in `running`, not in app_servers.
+    # Include them so their own thread writer is not misreported as a foreign
+    # Codex process while the dashboard is supervising the turn.
+    roots.update(
+        process.pid
+        for process in running.values()
+        if process and process.returncode is None
+    )
     return process_tree_pids({pid for pid in roots if pid}) | {os.getpid()}
 
 
