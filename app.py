@@ -3832,7 +3832,15 @@ async def handle_appserver_notification(server_key: str, message: dict) -> None:
     stamp = now()
     if duplicate_live_event(task_id, payload):
         return
-    db.execute("INSERT INTO events (session_id,ts,stream,payload) VALUES (?,?,?,?)", (session_id, stamp, "app-server", json.dumps(payload, ensure_ascii=False)))
+    # Streamed agent deltas are broadcast live and reconstructed into the
+    # final assistant message by the app-server client. Persisting every
+    # delta creates millions of rows and makes the dashboard database grow
+    # without bound, so keep only durable lifecycle/content events.
+    if payload.get("type") != "agent_delta":
+        db.execute(
+            "INSERT INTO events (session_id,ts,stream,payload) VALUES (?,?,?,?)",
+            (session_id, stamp, "app-server", json.dumps(payload, ensure_ascii=False)),
+        )
     runtime_metric_cache.pop(task_id, None)
     await broadcast_task(task_id, {"type": "event", "session_id": session_id, "stream": "app-server", "payload": payload, "ts": stamp})
 
@@ -5110,8 +5118,6 @@ def turn_settings(task: dict, provider: Optional[dict], sandbox_policy: dict) ->
 def command_for(task: dict, provider: Optional[dict], resume_id: str = "", prompt_override: str = "", include_goal: bool = True) -> list[str]:
     # Codex has no literal --yolo flag; these are its current equivalent.
     cmd = [CODEX_BIN, "exec"]
-    if resume_id:
-        cmd.append("resume")
     cmd += ["--json", "--color", "never", "--skip-git-repo-check"]
     if task["yolo"]:
         cmd += codex_exec_yolo_flags()
@@ -5120,6 +5126,10 @@ def command_for(task: dict, provider: Optional[dict], resume_id: str = "", promp
     if provider and provider.get("profile"):
         cmd += ["--profile", provider["profile"]]
     cmd += ["-C", task["workspace"]]
+    # `resume` is a subcommand; all exec-level flags must precede it on
+    # current Codex CLI versions (including --model, --profile, and -C).
+    if resume_id:
+        cmd.append("resume")
     if resume_id:
         cmd.append(resume_id)
     if include_goal and not prompt_override:
@@ -6461,12 +6471,17 @@ async def _patch_goal(task_id: str, payload: GoalPatch) -> dict:
         thread_id = latest_codex_session(task)
         remote_goal: dict[str, Any] = {}
         if thread_id and (payload.objective is not None or payload.status is not None):
-            binding = app_thread_bindings.get(task_id)
-            client = app_servers.get(binding[0]) if binding else None
-            if not client:
-                client, _provider = await appserver_for_task(task)
-                await ensure_thread_loaded(task, client)
             try:
+                # Local persistence above is authoritative. App-server
+                # discovery/loading is part of the best-effort remote sync;
+                # it must be inside this guard because a stopped/restarting
+                # Codex daemon used to turn a successful local save into HTTP
+                # 500 before the existing request try block was reached.
+                binding = app_thread_bindings.get(task_id)
+                client = app_servers.get(binding[0]) if binding else None
+                if not client:
+                    client, _provider = await appserver_for_task(task)
+                    await ensure_thread_loaded(task, client)
                 if not objective.strip():
                     await client.request("thread/goal/clear", {"threadId": thread_id})
                 else:
@@ -7605,7 +7620,17 @@ async def supervise(task: dict, session_id: str, providers: list[Optional[dict]]
                 env.pop("OPENAI_BASE_URL", None)
             else:
                 spawn_cmd = prepare_subprocess_command(spawn_cmd)
-            process = await asyncio.create_subprocess_exec(*spawn_cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env)
+            process = await asyncio.create_subprocess_exec(
+                *spawn_cmd,
+                cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+                # Codex resume can emit a large JSON event; the default
+                # StreamReader limit raises LimitOverrunError before the
+                # process has a chance to complete.
+                limit=64 * 1024 * 1024,
+            )
             async with running_lock:
                 running[task_id] = process
             if message_id:
@@ -9050,13 +9075,35 @@ async def supervise_operation(task: dict, session_id: str, cmd: list[str]) -> No
             cwd = None
         else:
             spawn_cmd = prepare_subprocess_command(spawn_cmd)
-        process = await asyncio.create_subprocess_exec(*spawn_cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=os.environ.copy())
+        process = await asyncio.create_subprocess_exec(
+            *spawn_cmd,
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=os.environ.copy(),
+            limit=64 * 1024 * 1024,
+        )
         async with running_lock:
             running[task_id] = process
         assert process.stdout
         async for raw in process.stdout:
             line = raw.decode(errors="replace").rstrip("\n")
-            db.execute("INSERT INTO events (session_id,ts,stream,payload) VALUES (?,?,?,?)", (session_id, now(), "stdout", json.dumps(safe_json(line), ensure_ascii=False)))
+            stamp = now()
+            payload = safe_json(line)
+            db.execute(
+                "INSERT INTO events (session_id,ts,stream,payload) VALUES (?,?,?,?)",
+                (session_id, stamp, "stdout", json.dumps(payload, ensure_ascii=False)),
+            )
+            await broadcast_task(
+                task_id,
+                {
+                    "type": "event",
+                    "session_id": session_id,
+                    "stream": "stdout",
+                    "payload": payload,
+                    "ts": stamp,
+                },
+            )
         code = await process.wait()
         db.execute("UPDATE sessions SET status=?, finished_at=?, exit_code=?, summary=? WHERE id=?", ("succeeded" if code == 0 else "failed", now(), code, "Codex operation completed" if code == 0 else f"exit code {code}", session_id))
         db.execute(

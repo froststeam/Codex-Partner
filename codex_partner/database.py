@@ -2,9 +2,14 @@
 
 import sqlite3
 import threading
+import time
 from contextlib import closing
 from pathlib import Path
 from typing import Callable, Optional
+
+
+class DatabaseIntegrityError(RuntimeError):
+    """The dashboard database cannot safely persist writes."""
 
 
 class Database:
@@ -21,15 +26,27 @@ class Database:
             pass
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, check_same_thread=False, timeout=5)
+        connection = sqlite3.connect(self.path, check_same_thread=False, timeout=15)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=5000")
+        connection.execute("PRAGMA busy_timeout=15000")
         connection.execute("PRAGMA foreign_keys=ON")
         return connection
 
     def initialize(self) -> None:
         with self.lock, closing(self.connect()) as connection:
-            connection.execute("PRAGMA journal_mode=WAL")
+            try:
+                connection.execute("PRAGMA journal_mode=WAL")
+                check = [row[0] for row in connection.execute("PRAGMA quick_check(1)")]
+            except sqlite3.DatabaseError as exc:
+                raise DatabaseIntegrityError(
+                    f"Dashboard database {self.path} cannot be opened safely: {exc}. "
+                    "Restore or rebuild the database before starting the service."
+                ) from exc
+            if check != ["ok"]:
+                raise DatabaseIntegrityError(
+                    f"Dashboard database {self.path} failed PRAGMA quick_check: {check[:5]}. "
+                    "Restore or rebuild the database before starting the service."
+                )
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS tasks (
@@ -285,6 +302,18 @@ class Database:
             return [dict(row) for row in connection.execute(sql, args).fetchall()]
 
     def execute(self, sql: str, args: tuple = ()) -> None:
-        with self.lock, closing(self.connect()) as connection:
-            connection.execute(sql, args)
-            connection.commit()
+        delays = (0.0, 0.05, 0.2, 0.5)
+        with self.lock:
+            for attempt, delay in enumerate(delays):
+                if delay:
+                    time.sleep(delay)
+                try:
+                    with closing(self.connect()) as connection:
+                        connection.execute(sql, args)
+                        connection.commit()
+                    return
+                except sqlite3.OperationalError as exc:
+                    message = str(exc).lower()
+                    transient = "locked" in message or "busy" in message
+                    if not transient or attempt == len(delays) - 1:
+                        raise
