@@ -1854,7 +1854,17 @@ function connectSocket(id, reconnect = false) {
   nextSocket.onclose = event => {
     if (socket === nextSocket) socket = null;
     if (state.selectedId !== id) { setRealtimeChannel("task", "idle"); return; }
-    if (event.code === 4401) { requestSSHLogin().then(ok => { if (ok && state.selectedId === id) connectSocket(id, true); }); return; }
+    if (event.code === 4401 || event.code === 1006) {
+      // A reverse proxy reports an unauthenticated WebSocket handshake as
+      // 1006/403 rather than the server's 4401 close code. Check HTTP auth
+      // and open the login dialog instead of silently reconnecting forever.
+      fetch("/api/auth/status").then(response => {
+        if (response.status === 401) return requestSSHLogin().then(ok => { if (ok && state.selectedId === id) connectSocket(id, true); });
+        if (state.selectedId === id) connectSocket(id, true);
+        return null;
+      }).catch(() => { if (state.selectedId === id) connectSocket(id, true); });
+      return;
+    }
     if (socketPaused) { setRealtimeChannel("task", "paused"); return; }
     setRealtimeChannel("task", "reconnecting");
     socketReconnectTimer = setTimeout(() => connectSocket(id, true), 900);
