@@ -616,6 +616,9 @@ def is_provider_failure(exc: Exception) -> bool:
 
 
 db = Database(DB_PATH, now)
+db.execute(
+    "CREATE TABLE IF NOT EXISTS auth_sessions (token TEXT PRIMARY KEY, username TEXT NOT NULL, expires_at REAL NOT NULL)"
+)
 activity_graph_store = ActivityGraphStore(db)
 
 
@@ -4445,10 +4448,17 @@ async def supervise_appserver_turn(
 
 def active_auth_session(token: str) -> Optional[dict[str, Any]]:
     session = auth_sessions.get(token)
+    if not session and token:
+        row = db.one("SELECT username, expires_at FROM auth_sessions WHERE token=?", (token,))
+        if row:
+            session = {"username": row["username"], "expires_at": float(row["expires_at"])}
+            auth_sessions[token] = session
     if not session:
         return None
     if float(session.get("expires_at", 0)) <= time.time():
         auth_sessions.pop(token, None)
+        if token:
+            db.execute("DELETE FROM auth_sessions WHERE token=?", (token,))
         return None
     return session
 
@@ -5981,7 +5991,12 @@ async def ssh_login(payload: SSHLoginIn, request: Request):
         raise HTTPException(401, "SSH username or password is incorrect")
     login_throttle.clear(client)
     token = secrets.token_urlsafe(32)
-    auth_sessions[token] = {"username": username, "expires_at": time.time() + AUTH_SESSION_TTL}
+    expires_at = time.time() + AUTH_SESSION_TTL
+    auth_sessions[token] = {"username": username, "expires_at": expires_at}
+    db.execute(
+        "INSERT OR REPLACE INTO auth_sessions (token,username,expires_at) VALUES (?,?,?)",
+        (token, username, expires_at),
+    )
     response = JSONResponse({"authenticated": True, "username": username})
     response.set_cookie(
         AUTH_COOKIE,
@@ -6000,6 +6015,7 @@ async def ssh_logout(request: Request, response: Response):
     token = request.cookies.get(AUTH_COOKIE, "")
     if token:
         auth_sessions.pop(token, None)
+        db.execute("DELETE FROM auth_sessions WHERE token=?", (token,))
     response.delete_cookie(AUTH_COOKIE, path="/", samesite="strict")
     return {"authenticated": False}
 
@@ -6834,6 +6850,23 @@ def semantic_timeline_rows(rows: list[dict], limit: int = 0) -> list[dict]:
                 continue
             if str((payload or {}).get("type") or "").lower() in TIMELINE_SEMANTIC_TYPES:
                 result.append(event)
+        elif event.get("stream") == "stdout":
+            # Direct `codex exec` turns persist structured JSON on stdout.
+            # Include their semantic item events when a task is reopened;
+            # otherwise switching away and back hides the newest messages
+            # even though the live WebSocket received them.
+            try:
+                payload = event.get("payload") if isinstance(event.get("payload"), dict) else json.loads(event.get("payload") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            event_type = str(payload.get("type") or "").lower()
+            item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
+            item_type = str(item.get("type") or "").lower().replace("_", "")
+            if event_type in {"item.completed", "item.started", "turn.started", "turn.completed", "thread.started", "error"}:
+                if not item_type or item_type in TIMELINE_SEMANTIC_TYPES:
+                    result.append(event)
         if limit and len(result) >= limit:
             break
     return result
