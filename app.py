@@ -2682,7 +2682,15 @@ async def refresh_live_external_turn(task_id: str) -> bool:
     writers = await asyncio.to_thread(native_rollout_writer_pids, path, True)
     if not writers:
         return False
-    await apply_external_turn_boundary(task_id, thread_id, boundary, phase, initial=True, path=path)
+    try:
+        await apply_external_turn_boundary(task_id, thread_id, boundary, phase, initial=True, path=path)
+    except sqlite3.IntegrityError:
+        # A one-shot dashboard turn can finish between boundary inspection
+        # and this synchronous refresh. Do not turn a harmless observer race
+        # into HTTP 500 for a user message; the normal supervisor owns the
+        # durable session settlement.
+        clear_external_turns(task_id)
+        return False
     return bool(external_turns.get(task_id))
 
 
