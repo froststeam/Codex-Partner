@@ -5864,7 +5864,17 @@ async def enqueue_task_message(task_id: str, body: str, client_message_id: Optio
 
 async def terminal_turn_active(task_id: str) -> bool:
     """Refresh and report a terminal-owned turn without confusing dashboard work."""
-    await refresh_live_external_turn(task_id)
+    # A direct `codex exec` turn is a Partner-owned writer even though it
+    # writes the same native rollout files as a terminal. Do not rescan the
+    # rollout before accepting a browser message: the observer can win a
+    # completion race and incorrectly return `terminal_turn_active` (or hit
+    # a transient foreign-key boundary) for the very process we supervise.
+    if dashboard_owns_task(task_id):
+        return False
+    try:
+        await refresh_live_external_turn(task_id)
+    except sqlite3.IntegrityError:
+        return False
     return bool(refresh_external_primary(task_id)) and not dashboard_owns_task(task_id)
 
 
