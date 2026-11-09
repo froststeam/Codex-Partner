@@ -5869,7 +5869,11 @@ async def terminal_turn_active(task_id: str) -> bool:
     # rollout before accepting a browser message: the observer can win a
     # completion race and incorrectly return `terminal_turn_active` (or hit
     # a transient foreign-key boundary) for the very process we supervise.
-    if dashboard_owns_task(task_id):
+    task = task_or_404(task_id)
+    if dashboard_owns_task(task_id) or (
+        task.get("status") in {"running", "retrying"}
+        and task.get("execution_source") == "dashboard"
+    ):
         return False
     try:
         await refresh_live_external_turn(task_id)
