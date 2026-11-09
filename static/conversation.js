@@ -265,13 +265,13 @@ async function selectSession(id, openSocket = true) {
     throw error;
   }
   if (requestId !== state.sessionRequestId || state.selectedId !== id) return;
-  state.selectedEvents = [...(timeline.items || []), ...(timeline.metrics || [])];
+  state.selectedEvents = [...(timeline.items || []), ...(timeline.metrics || [])].filter(isConversationTimelineEvent);
   state.historyCursor = timeline.next_cursor || ""; state.historyHasMore = Boolean(timeline.has_more);
   state.chatSnapToBottom = !cached;
   renderConversation();
   const refreshFullTimeline = () => api(`/tasks/${encodeURIComponent(id)}/timeline?limit=120`, { signal: controller.signal }).then(full => {
     if (requestId !== state.sessionRequestId || state.selectedId !== id) return;
-    state.selectedEvents = [...(full.items || []), ...(full.metrics || [])];
+    state.selectedEvents = [...(full.items || []), ...(full.metrics || [])].filter(isConversationTimelineEvent);
     state.historyCursor = full.next_cursor || ""; state.historyHasMore = Boolean(full.has_more);
     renderChat();
   }).catch(error => { if (error.name !== "AbortError") console.warn("timeline refresh failed", error); });
@@ -754,6 +754,21 @@ function renderChat() {
     chatBuildQueued = false;
     if (rebuild) scheduleRenderChat();
   };
+}
+
+function isConversationTimelineEvent(event) {
+  // Direct exec JSON includes command/file/tool lifecycle items. They are
+  // useful for live diagnostics but should not be replayed as chat messages
+  // after switching sessions.
+  if (event?.stream !== "stdout") return true;
+  let payload = event?.payload;
+  if (typeof payload === "string") {
+    try { payload = JSON.parse(payload); } catch (_) { return true; }
+  }
+  if (!payload || typeof payload !== "object") return true;
+  const type = String(payload.type || "").toLowerCase().replace(/_/g, ".");
+  const itemType = String(payload.item?.type || "").toLowerCase().replace(/_/g, "");
+  return type === "error" || (type === "item.completed" && ["usermessage", "agentmessage", "assistantmessage"].includes(itemType));
 }
 
 function isTokenUsageProtocol(payload) {
@@ -1820,7 +1835,7 @@ function connectSocket(id, reconnect = false) {
       const tokenUsage = isTokenUsageProtocol(data.payload);
       if (!protocolNoise || tokenUsage) {
         const timelineEvent = { session_id: data.session_id, ts: data.ts, stream: data.stream, payload: JSON.stringify(data.payload) };
-        state.selectedEvents.push(timelineEvent);
+        if (isConversationTimelineEvent(timelineEvent)) state.selectedEvents.push(timelineEvent);
         if (!state.explorationPrecomputed && !protocolNoise && state.explorationEvents.length) {
           state.explorationEvents.push(timelineEvent); state.explorationLoadedEventCount = state.explorationEvents.length;
           if (isExplorationRelevantPayload(data.payload)) { state.explorationRevision += 1; state.explorationNeedsSync = true; }
