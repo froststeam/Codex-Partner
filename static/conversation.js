@@ -1758,7 +1758,7 @@ function connectOverviewSocket() {
   overviewSocket.onerror = () => setRealtimeChannel("overview", "reconnecting");
   overviewSocket.onclose = event => {
     overviewSocket = null;
-    if (event.code === 4401) { requestSSHLogin().then(ok => { if (ok) connectOverviewSocket(); }); return; }
+    if (event.code === 4401 || event.code === 1006) { requestSSHLogin().then(ok => { if (ok) connectOverviewSocket(); }); return; }
     setRealtimeChannel("overview", "reconnecting");
     clearTimeout(overviewReconnectTimer);
     overviewReconnectTimer = setTimeout(() => { if (document.visibilityState !== "hidden") connectOverviewSocket(); }, 1200);
@@ -1971,7 +1971,7 @@ function connectTerminal(taskId, reconnect = false) {
     terminalSockets.delete(taskId);
     if (terminalSocket === nextSocket) terminalSocket = null;
     const stillOpen = $("#terminal-window").classList.contains("open") && terminalTaskId === taskId;
-    if (event.code === 4401) { requestSSHLogin().then(ok => { if (ok && stillOpen) connectTerminal(taskId, true); }); return; }
+    if (event.code === 4401 || event.code === 1006) { requestSSHLogin().then(ok => { if (ok && stillOpen) connectTerminal(taskId, true); }); return; }
     if (!terminalShouldReconnect || !stillOpen) { setRealtimeChannel("terminal", terminalShouldReconnect ? "idle" : "closed"); return; }
     terminalStatus(uiLabel("terminalReconnecting"), "reconnecting"); setRealtimeChannel("terminal", "reconnecting");
     const delay = Math.min(5000, 700 * (2 ** terminalReconnectAttempt));

@@ -6861,12 +6861,20 @@ def semantic_timeline_rows(rows: list[dict], limit: int = 0) -> list[dict]:
                 continue
             if not isinstance(payload, dict):
                 continue
-            event_type = str(payload.get("type") or "").lower()
+            event_type = str(payload.get("type") or "").lower().replace("_", ".")
             item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
             item_type = str(item.get("type") or "").lower().replace("_", "")
-            if event_type in {"item.completed", "item.started", "turn.started", "turn.completed", "thread.started", "error"}:
-                if not item_type or item_type in TIMELINE_SEMANTIC_TYPES:
-                    result.append(event)
+            # codex exec --json emits every tool lifecycle event on stdout.
+            # The chat timeline is a conversation surface, so replaying
+            # command/file/tool items here makes a reopened session appear to
+            # contain only calls. Keep durable user/assistant text and errors;
+            # live tool progress remains available through the websocket
+            # activity surface.
+            if event_type == "error" or (
+                event_type == "item.completed"
+                and item_type in {"usermessage", "agentmessage", "assistantmessage"}
+            ):
+                result.append(event)
         if limit and len(result) >= limit:
             break
     return result
