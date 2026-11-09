@@ -1871,13 +1871,13 @@ function connectSocket(id, reconnect = false) {
     if (state.selectedId !== id) { setRealtimeChannel("task", "idle"); return; }
     if (event.code === 4401 || event.code === 1006) {
       // A reverse proxy reports an unauthenticated WebSocket handshake as
-      // 1006/403 rather than the server's 4401 close code. Check HTTP auth
-      // and open the login dialog instead of silently reconnecting forever.
-      fetch("/api/auth/status").then(response => {
-        if (response.status === 401) return requestSSHLogin().then(ok => { if (ok && state.selectedId === id) connectSocket(id, true); });
-        if (state.selectedId === id) connectSocket(id, true);
-        return null;
-      }).catch(() => { if (state.selectedId === id) connectSocket(id, true); });
+      // 1006/403 rather than the server's 4401 close code. Always surface the
+      // login dialog here; a 200 HTTP status does not prove that the proxy
+      // forwarded the cookie on the WebSocket upgrade.
+      requestSSHLogin().then(ok => {
+        if (ok && state.selectedId === id) connectSocket(id, true);
+      });
+
       return;
     }
     if (socketPaused) { setRealtimeChannel("task", "paused"); return; }
