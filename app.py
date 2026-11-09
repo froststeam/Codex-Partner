@@ -738,6 +738,77 @@ def reconcile_legacy_interaction_states() -> None:
     )
 
 
+STALE_DASHBOARD_TURN_GRACE_SECONDS = 45
+
+
+def stale_dashboard_task_ids() -> list[str]:
+    """Find dashboard turns whose supervisor disappeared without settling state.
+
+    A dashboard restart can leave a task marked ``running`` even though its
+    one-shot ``codex exec`` child has exited.  The normal native rollout scan
+    is intentionally disabled on the large emergency database, so keep this
+    check narrow: only dashboard-owned active sessions and only after a grace
+    period. A live rollout writer is authoritative and prevents false recovery.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=STALE_DASHBOARD_TURN_GRACE_SECONDS)
+    rows = db.all(
+        "SELECT id,codex_session_id,ssh_host,updated_at FROM tasks "
+        "WHERE trashed=0 AND status IN ('running','retrying') "
+        "AND execution_source='dashboard' AND active_session_id IS NOT NULL "
+        "ORDER BY updated_at LIMIT 200"
+    )
+    stale: list[str] = []
+    for row in rows:
+        try:
+            updated = datetime.fromisoformat(str(row.get("updated_at") or "").replace("Z", "+00:00"))
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=timezone.utc)
+            if updated >= cutoff:
+                continue
+        except (TypeError, ValueError):
+            continue
+        task_id = str(row.get("id") or "")
+        if not task_id or row.get("ssh_host") or dashboard_owns_task(task_id):
+            continue
+        thread_id = str(row.get("codex_session_id") or "")
+        path = native_rollout_path(thread_id) if thread_id else ""
+        if path and native_rollout_writer_pids(path, refresh=True):
+            continue
+        stale.append(task_id)
+    return stale
+
+
+async def stale_dashboard_turn_watch_loop() -> None:
+    """Recover orphaned dashboard turns and wake their durable message queue."""
+    while True:
+        try:
+            for task_id in await asyncio.to_thread(stale_dashboard_task_ids):
+                task = task_or_404(task_id)
+                stamp = now()
+                active_session = task.get("active_session_id")
+                if active_session:
+                    db.execute(
+                        "UPDATE sessions SET status='failed',finished_at=COALESCE(finished_at,?),"
+                        "exit_code=COALESCE(exit_code,1),summary='Dashboard supervisor disappeared' WHERE id=? AND status IN ('running','retrying')",
+                        (stamp, active_session),
+                    )
+                should_resume = bool(task.get("goal") and goal_auto_resume_enabled(task))
+                db.execute(
+                    "UPDATE tasks SET status=?,active_session_id=NULL,execution_source='',execution_turn_id='',run_mode='',"
+                    "last_error=?,updated_at=? WHERE id=? AND status IN ('running','retrying')",
+                    ("queued" if should_resume else "failed", "Recovered an orphaned dashboard turn", stamp, task_id),
+                )
+                await broadcast_task(task_id, {"type": "task_status", "task": task_or_404(task_id), "source": {"kind": "stale_turn_recovery"}})
+                await broadcast_overview(task_id, {"kind": "stale_turn_recovery"})
+                if should_resume:
+                    schedule_task_drain(task_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        await asyncio.sleep(10)
+
+
 def partner_update_snapshot() -> dict[str, Any]:
     state = load_partner_update_state(PARTNER_UPDATE_STATE_PATH)
     installed = installed_partner_version(APP_VERSION) or APP_VERSION
@@ -854,6 +925,7 @@ async def lifespan(_: FastAPI):
     foreign_writer_task: Optional[asyncio.Task] = None
     inactive_trash_task: Optional[asyncio.Task] = None
     activity_graph_task: Optional[asyncio.Task] = None
+    stale_turn_task: Optional[asyncio.Task] = None
     reconcile_task_session_ids()
     try:
         await sync_native_threads()
@@ -876,6 +948,7 @@ async def lifespan(_: FastAPI):
     except Exception:
         # Retention cleanup is best effort and must never block the dashboard.
         pass
+    stale_turn_task = asyncio.create_task(stale_dashboard_turn_watch_loop())
     seed_activity_graph_builds()
     activity_graph_task = asyncio.create_task(activity_graph_worker_loop())
     partner_update_worker = asyncio.create_task(partner_auto_update_loop())
@@ -915,6 +988,9 @@ async def lifespan(_: FastAPI):
         if inactive_trash_task:
             inactive_trash_task.cancel()
             await asyncio.gather(inactive_trash_task, return_exceptions=True)
+        if stale_turn_task:
+            stale_turn_task.cancel()
+            await asyncio.gather(stale_turn_task, return_exceptions=True)
         if activity_graph_task:
             activity_graph_task.cancel()
             await asyncio.gather(activity_graph_task, return_exceptions=True)
@@ -6864,7 +6940,7 @@ def semantic_timeline_rows(rows: list[dict], limit: int = 0) -> list[dict]:
             event_type = str(payload.get("type") or "").lower().replace("_", ".")
             item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
             item_type = str(item.get("type") or "").lower().replace("_", "")
-            # codex exec --json emits every tool lifecycle event on stdout.
+            # `codex exec --json` emits every tool lifecycle event on stdout.
             # The chat timeline is a conversation surface, so replaying
             # command/file/tool items here makes a reopened session appear to
             # contain only calls. Keep durable user/assistant text and errors;
